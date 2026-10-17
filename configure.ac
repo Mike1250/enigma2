@@ -71,6 +71,32 @@ AC_ARG_WITH(boxtype,
 AC_SUBST(BOXTYPE)
 AC_DEFINE_UNQUOTED(BOXTYPE,"$BOXTYPE",[box type])
 
+dnl OpenBH DreamOne/DreamTwo - stage 1 of native Amlogic port.
+dnl This configures the target and legacy ioctl guards; the
+dnl transport-stream parser/decoder backend still needs porting.
+AC_ARG_WITH([amlogic],
+    [AS_HELP_STRING([--with-amlogic], [enable DreamNextGen Amlogic (dreamone/dreamtwo)])],
+    [enable_amlogic="$withval"], [enable_amlogic=auto])
+AS_IF([test "x$enable_amlogic" = "xauto"], [
+    case "$BOXTYPE" in
+        dreamone|dreamtwo) enable_amlogic=yes ;;
+        *) enable_amlogic=no ;;
+    esac
+])
+AS_IF([test "x$enable_amlogic" = "xyes"], [
+    case "$BOXTYPE" in
+        dreamone|dreamtwo) ;;
+        *) AC_MSG_ERROR([Amlogic target currently limited to DreamOne/DreamTwo]) ;;
+    esac
+    AC_DEFINE([DREAMNEXTGEN], [1], [DreamNextGen Amlogic Dreambox])
+    AC_DEFINE([AMLOGIC], [1], [Amlogic hardware])
+], [
+    AS_IF([test "x$enable_amlogic" != "xno"],
+        [AC_MSG_ERROR([--with-amlogic must be yes or no])])
+])
+AM_CONDITIONAL([DREAMNEXTGEN], [test "x$enable_amlogic" = "xyes"])
+
+
 AC_ARG_WITH(machinebuild,
 	[  --with-machinebuild=NAME machine build [[none,atemeo5200,atemeo6000...]]],
 	[MACHINEBUILD="$withval"],[MACHINEBUILD="atemeo5200"])
