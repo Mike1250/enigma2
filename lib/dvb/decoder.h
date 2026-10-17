@@ -3,6 +3,9 @@
 
 #include <lib/base/object.h>
 #include <lib/dvb/demux.h>
+#ifdef DREAMNEXTGEN
+#include <lib/base/ebase.h>
+#endif
 
 class eSocketNotifier;
 
@@ -40,6 +43,14 @@ private:
 	sigc::signal<void(struct iTSMPEGDecoder::videoEvent)> m_event;
 	int m_width, m_height, m_framerate, m_aspect, m_progressive, m_gamma;
 	static int readApiSize(int fd, int &xres, int &yres, int &aspect);
+#ifdef DREAMNEXTGEN
+	// Amlogic does not always report DVB video events. Poll /sys until the
+	// first valid frame metadata arrives, without blocking the main loop.
+	ePtr<eTimer> m_amlogic_attributes_timer;
+	bool m_amlogic_size_sent;
+	unsigned int m_amlogic_poll_count;
+	void pollAmlogicVideoAttributes();
+#endif
 public:
 	enum { UNKNOWN = -1, MPEG2, MPEG4_H264, VC1 = 3, MPEG4_Part2, VC1_SM, MPEG1, H265_HEVC, AVS = 16, AVS2 = 40 };
 	eDVBVideo(eDVBDemux *demux, int dev, bool fcc_enable=false);
