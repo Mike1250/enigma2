@@ -24,6 +24,8 @@
 #include <errno.h>
 #ifdef DREAMNEXTGEN
 #include <mutex>
+#include <cstdlib>
+#include <cstring>
 #endif
 
 #include <lib/dvb/fccdecoder.h>
@@ -535,7 +537,15 @@ int eDVBVideo::startPid(int pid, int type)
 
 	if (m_fd >= 0)
 	{
-		freeze();  // why freeze here?!? this is a problem when only a pid change is requested... because of the unfreeze logic in Decoder::setState
+#ifdef DREAMNEXTGEN
+		// Optional A/B test for delayed video after zapping. By default retain
+		// OpenBH's original VIDEO_FREEZE -> VIDEO_PLAY sequence.
+		const char *skipStartFreeze = getenv("OPENBH_AMLOGIC_SKIP_VIDEO_START_FREEZE");
+		if (!(skipStartFreeze && strcmp(skipStartFreeze, "1") == 0))
+			freeze();
+#else
+		freeze();
+#endif
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_PLAY ", m_dev);
 		if (OPENBH_VIDEO_IOCTL(m_fd, VIDEO_PLAY) < 0)
 			eDebugNoNewLine("failed: %m\n");

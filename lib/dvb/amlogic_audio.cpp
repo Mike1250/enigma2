@@ -8,6 +8,7 @@
  */
 #include <lib/dvb/amlogic_audio.h>
 #ifdef DREAMNEXTGEN
+#include <lib/dvb/volume.h>
 
 #include <alsa/asoundlib.h>
 extern "C" {
@@ -18,6 +19,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cerrno>
 #include <cstdio>
@@ -46,8 +48,8 @@ static void audioLog(const char *format, ...)
     va_start(args, format);
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
-    fprintf(stderr, "[OpenBH-AMLAUDIO-V3] %s\n", message);
-    FILE *log = fopen("/tmp/openbh_amlogic_audio_v3.log", "a");
+    fprintf(stderr, "[OpenBH-AMLAUDIO-V4] %s\n", message);
+    FILE *log = fopen("/tmp/openbh_amlogic_audio_v4.log", "a");
     if (log) {
         time_t now = time(nullptr);
         fprintf(log, "%lld %s\n", (long long)now, message);
@@ -58,10 +60,33 @@ static void notice(const char *text, int v = 0)
 {
     audioLog("%s (%d)", text, v);
 }
-static bool enableOptionalVideoPtsGuard()
+static bool enableVideoSync()
 {
-    const char *value = getenv("OPENBH_AMLOGIC_AVSYNC_GUARD");
-    return value && strcmp(value, "1") == 0;
+    // Enable by default: V3's unrestricted PCM could run ahead of the video.
+    // Disable for an A/B comparison with OPENBH_AMLOGIC_AVSYNC=0.
+    const char *value = getenv("OPENBH_AMLOGIC_AVSYNC");
+    return !value || strcmp(value, "0") != 0;
+}
+static bool enableSoftwareVolume()
+{
+    const char *value = getenv("OPENBH_AMLOGIC_SOFTWARE_VOLUME");
+    return !value || strcmp(value, "0") != 0;
+}
+// PTS is a 33-bit 90-kHz counter. Preserve correct differences over wrap.
+static int64_t ptsDelta(int64_t a, int64_t b)
+{
+    constexpr int64_t wrap = (1LL << 33);
+    constexpr int64_t half = wrap / 2;
+    int64_t d = (a - b) & (wrap - 1);
+    return (d >= half) ? (d - wrap) : d;
+}
+static long envLong(const char *name, long fallback, long minimum, long maximum)
+{
+    const char *value = getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = nullptr;
+    long ret = strtol(value, &end, 10);
+    return (end && !*end && ret >= minimum && ret <= maximum) ? ret : fallback;
 }
 static AVCodecID codecForType(int type)
 {
@@ -89,11 +114,16 @@ static int64_t pesPts(const uint8_t *p)
 class AudioWorker
 {
 public:
-    AudioWorker(int type, int videoDev, std::atomic<int64_t> &pts)
+    AudioWorker(int type, int videoDev, std::atomic<int64_t> &pts,
+                std::atomic<bool> &stopRequested)
       : ctx(nullptr), parser(nullptr), swr(nullptr), pcm(nullptr),
         videoFd(-1), lastPts(-1), pidPts(AV_NOPTS_VALUE), outRate(48000),
-        ptsRef(pts), decodedFrames(0), pcmFramesWritten(0), xruns(0),
-        writeErrors(0), ptsDrops(0), videoPtsGuard(enableOptionalVideoPtsGuard())
+        ptsRef(pts), stopFlag(stopRequested), decodedFrames(0), pcmFramesWritten(0),
+        xruns(0), writeErrors(0), ptsDrops(0), syncWaits(0), syncWaitMs(0),
+        syncEnabled(enableVideoSync()), softwareVolume(enableSoftwareVolume()),
+        lastAppliedVolume(-1), lastAppliedMute(false),
+        createdAt(std::chrono::steady_clock::now()),
+        syncBypassUntil(createdAt)
     {
         AVCodecID codec = codecForType(type);
         const AVCodec *implementation = codec != AV_CODEC_ID_NONE ? avcodec_find_decoder(codec) : nullptr;
@@ -115,7 +145,7 @@ public:
         }
         char videoName[64];
         snprintf(videoName, sizeof(videoName), "/dev/dvb/adapter0/video%d", videoDev);
-        if (videoPtsGuard)
+        if (syncEnabled)
             videoFd = ::open(videoName, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         // DreamTwo/OpenATV-style direct ALSA PCM device (TDM-B, card 0/device 0).
         // Override with OPENBH_AMLOGIC_ALSA_DEVICE for diagnosis if needed.
@@ -127,8 +157,9 @@ public:
             audioLog("ALSA open %s failed: %s", selected, snd_strerror(rc));
             return;
         }
-        // Increase the playback buffer to tolerate scheduling jitter.
-        // Keep the known-working 160-ms configuration as fallback.
+        // Retain V3's stable 350-ms ALSA buffer but avoid an immediate start
+        // with only one tiny decoded frame. Reduce for channel-zap testing via
+        // OPENBH_AMLOGIC_ALSA_LATENCY_US=250000 if the receiver permits it.
         unsigned int latency = 350000;
         const char *latencyEnv = getenv("OPENBH_AMLOGIC_ALSA_LATENCY_US");
         if (latencyEnv && *latencyEnv) {
@@ -153,13 +184,30 @@ public:
             return;
         }
         snd_pcm_uframes_t bufferFrames = 0, periodFrames = 0;
-        if (snd_pcm_get_params(pcm, &bufferFrames, &periodFrames) == 0)
-            audioLog("opened %s, rate=%u, buffer=%lu, period=%lu frames, video_pts_guard=%d",
+        if (snd_pcm_get_params(pcm, &bufferFrames, &periodFrames) == 0) {
+            // Start only after 120 ms of audio are queued. This prevents
+            // the 2-3 initial underruns observed with auto-start-on-first-period.
+            snd_pcm_sw_params_t *params;
+            snd_pcm_sw_params_alloca(&params);
+            if (snd_pcm_sw_params_current(pcm, params) == 0) {
+                const snd_pcm_uframes_t requested = (snd_pcm_uframes_t)(outRate * 120 / 1000);
+                const snd_pcm_uframes_t threshold =
+                    std::max(periodFrames, std::min(requested,
+                             bufferFrames > periodFrames ? bufferFrames - periodFrames : bufferFrames));
+                if (snd_pcm_sw_params_set_start_threshold(pcm, params, threshold) == 0 &&
+                    snd_pcm_sw_params(pcm, params) == 0)
+                    audioLog("ALSA startup threshold=%lu frames", (unsigned long)threshold);
+            }
+            audioLog("opened %s, rate=%u, buffer=%lu, period=%lu frames, avsync=%d, softvol=%d",
                      selected, outRate, (unsigned long)bufferFrames,
-                     (unsigned long)periodFrames, (int)videoPtsGuard);
-        else
-            audioLog("opened %s, rate=%u, video_pts_guard=%d", selected, outRate,
-                     (int)videoPtsGuard);
+                     (unsigned long)periodFrames, (int)syncEnabled, (int)softwareVolume);
+        } else {
+            audioLog("opened %s, rate=%u, avsync=%d", selected, outRate, (int)syncEnabled);
+        }
+        // A nonblocking PCM write lets channel-change stop() flush instantly
+        // instead of joining a thread stuck waiting for a full ALSA buffer.
+        if (snd_pcm_nonblock(pcm, 1) < 0)
+            audioLog("ALSA nonblocking mode unavailable; zap flush may be delayed");
     }
     ~AudioWorker()
     {
@@ -178,10 +226,14 @@ public:
         snd_pcm_sframes_t available = pcm ? snd_pcm_avail_update(pcm) : -1;
         audioLog("stats ts=%llu payload=%llu reads=%llu pes=%llu cc_gaps=%llu dup=%llu "
                  "poll_empty=%llu decoded=%llu pcm_frames=%llu xruns=%llu "
-                 "write_errors=%llu pts_drops=%llu alsa_state=%s avail=%ld",
+                 "write_errors=%llu pts_drops=%llu sync_waits=%llu sync_wait_ms=%llu "
+                 "sync_timeouts=%llu "
+                 "volume=%d mute=%d alsa_state=%s avail=%ld",
                  tsPackets, payloadPackets, reads, pesStarts, ccGaps, duplicatedPackets,
                  pollTimeouts, decodedFrames, pcmFramesWritten, xruns, writeErrors,
-                 ptsDrops, pcm ? snd_pcm_state_name(snd_pcm_state(pcm)) : "NONE",
+                 ptsDrops, syncWaits, syncWaitMs, syncTimeouts,
+                 lastAppliedVolume, (int)lastAppliedMute,
+                 pcm ? snd_pcm_state_name(snd_pcm_state(pcm)) : "NONE",
                  (long)available);
     }
     void reset()
@@ -196,6 +248,8 @@ public:
         swr_free(&swr);
         lastPts = -1;
         pidPts = AV_NOPTS_VALUE;
+        createdAt = std::chrono::steady_clock::now();
+        syncBypassUntil = createdAt;
     }
     void setPts(int64_t value) { if (value >= 0) pidPts = value; }
     void submit(const uint8_t *data, int size)
@@ -263,32 +317,98 @@ private:
         int frames = swr_convert(swr, &dst, capacity, src, frame->nb_samples);
         if (frames <= 0) return;
 
-        // The earlier V1/V2 video-PTS guard discarded all decoded PCM when
-        // the two independent clocks differed by >500ms. On DreamTwo it can
-        // cause 2-3 second cyclic silences despite valid input audio.
-        // Continuous PCM is now the safe default. Re-enable the experimental
-        // guard only with OPENBH_AMLOGIC_AVSYNC_GUARD=1 for A/B testing.
-        if (videoPtsGuard) {
-            uint64_t videoPts = 0;
-            if (videoFd >= 0 && lastPts >= 0 &&
-                ::ioctl(videoFd, VIDEO_GET_PTS, &videoPts) == 0 && videoPts) {
-                int64_t delta = lastPts - (int64_t)videoPts;
-                if (delta < -45000) {
-                    ++ptsDrops;
-                    lastPts += (int64_t)frame->nb_samples * 90000 / inputRate;
-                    return;
+        // PCM volume/mute: the GUI changes eDVBVolumecontrol, while the new
+        // hw:0,0 output bypasses the old /dev/dvb/adapter*/audio* volume ioctl.
+        // Apply the active Enigma2 level directly to the decoded PCM instead.
+        // This is intentionally limited to the DREAMNEXTGEN DVB audio worker.
+        if (softwareVolume) {
+            eDVBVolumecontrol *volume = eDVBVolumecontrol::getInstance();
+            if (volume) {
+                const int level = std::max(0, std::min(100, volume->getVolume()));
+                const bool muted = volume->isMuted();
+                if (level != lastAppliedVolume || muted != lastAppliedMute) {
+                    audioLog("software volume=%d mute=%d", level, (int)muted);
+                    lastAppliedVolume = level;
+                    lastAppliedMute = muted;
                 }
-                if (delta > 9000 && delta < 45000)
-                    usleep((useconds_t)std::min((int64_t)80000,
-                                                  delta * 1000000 / 90000));
+                const int gain = muted ? 0 : level;
+                for (int i = 0; i < frames * 2; ++i) {
+                    const int32_t v = (int32_t)pcmData[(size_t)i] * gain / 100;
+                    pcmData[(size_t)i] = (int16_t)v;
+                }
             }
+        }
+
+        // A/V sync: audio PTS is the timestamp of the *next queued sample*.
+        // Video PTS is the frame being presented. Do not send the PCM far
+        // ahead of the video. Account for samples already queued in ALSA.
+        // Unlike V1/V2, NEVER discard entire audio frames because PTS differs:
+        // that caused periodic 2-3s silences. Also wait for first valid VPTS
+        // on channel changes to prevent old/new audio leading black video.
+        if (syncEnabled && videoFd >= 0 && lastPts >= 0 &&
+            std::chrono::steady_clock::now() >= syncBypassUntil) {
+            auto now = std::chrono::steady_clock::now();
+            auto startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - createdAt).count();
+            const long startupWaitMaxMs = envLong("OPENBH_AMLOGIC_STARTUP_WAIT_MS", 3500, 0, 10000);
+            const long maxLeadMs = envLong("OPENBH_AMLOGIC_MAX_AUDIO_LEAD_MS", 65, 0, 500);
+            int64_t waitedMs = 0;
+            while (!stopFlag.load()) {
+                uint64_t videoPts = 0;
+                const bool haveVideo = (::ioctl(videoFd, VIDEO_GET_PTS, &videoPts) == 0 &&
+                                        videoPts != 0 && videoPts != UINT64_MAX);
+                if (!haveVideo) {
+                    // Gate the initial audio until a picture has a valid PTS,
+                    // but allow audio-only/radio and unsupported video ioctls.
+                    if (startupMs >= startupWaitMaxMs) break;
+                } else {
+                    snd_pcm_sframes_t queued = 0;
+                    if (snd_pcm_delay(pcm, &queued) < 0 || queued < 0)
+                        queued = 0;
+                    const int64_t ahead90k = ptsDelta(lastPts, (int64_t)videoPts) -
+                             (int64_t)queued * 90000 / outRate;
+                    if (ahead90k <= maxLeadMs * 90 || ahead90k < -900000)
+                        break;  // already aligned, or clocks from different epochs
+                    // If a frozen video PTS lasts too long, avoid deadlocking
+                    // the audio-demux reader and filling the kernel TS buffer.
+                    if (waitedMs >= 900) {
+                        ++syncTimeouts;
+                        // Do not repeatedly wait 900 ms on *every* audio
+                        // frame if the video clock freezes or is mismatched.
+                        // Fall back to V3's continuous PCM for five seconds.
+                        syncBypassUntil = std::chrono::steady_clock::now() +
+                                          std::chrono::seconds(5);
+                        audioLog("AV sync wait capped: audio ahead=%lldms; pacing bypass 5s", (long long)(ahead90k / 90));
+                        break;
+                    }
+                }
+                usleep(10000);
+                waitedMs += 10;
+                startupMs += 10;
+            }
+            if (waitedMs > 0) {
+                ++syncWaits;
+                syncWaitMs += (unsigned long long)waitedMs;
+            }
+            if (stopFlag.load()) return;
         }
         int offset = 0;
         int recoveryTries = 0;
-        while (offset < frames) {
+        auto lastProgress = std::chrono::steady_clock::now();
+        while (offset < frames && !stopFlag.load()) {
             snd_pcm_sframes_t n = snd_pcm_writei(pcm, pcmData.data() + offset * 2,
                                                  (snd_pcm_uframes_t)(frames - offset));
             if (n == -EINTR) continue;
+            if (n == -EAGAIN) {
+                if (std::chrono::steady_clock::now() - lastProgress >
+                    std::chrono::milliseconds(700)) {
+                    ++writeErrors;
+                    audioLog("ALSA nonblocking write timed out (700 ms)");
+                    break;
+                }
+                usleep(4000);
+                continue;
+            }
             if (n < 0) {
                 if (n == -EPIPE || n == -ESTRPIPE) ++xruns;
                 int recovered = snd_pcm_recover(pcm, (int)n, 1);
@@ -302,6 +422,7 @@ private:
             if (n == 0) break;
             recoveryTries = 0;
             offset += (int)n;
+            lastProgress = std::chrono::steady_clock::now();
             pcmFramesWritten += (unsigned long long)n;
         }
         ++decodedFrames;
@@ -319,12 +440,21 @@ private:
     int64_t lastPts, pidPts;
     unsigned int outRate;
     std::atomic<int64_t> &ptsRef;
+    std::atomic<bool> &stopFlag;
     unsigned long long decodedFrames;
     unsigned long long pcmFramesWritten;
     unsigned long long xruns;
     unsigned long long writeErrors;
     unsigned long long ptsDrops;
-    bool videoPtsGuard;
+    unsigned long long syncWaits;
+    unsigned long long syncWaitMs;
+    unsigned long long syncTimeouts = 0;
+    bool syncEnabled;
+    bool softwareVolume;
+    int lastAppliedVolume;
+    bool lastAppliedMute;
+    std::chrono::steady_clock::time_point createdAt;
+    std::chrono::steady_clock::time_point syncBypassUntil;
 };
 }
 
@@ -355,6 +485,8 @@ int OpenBHAmlogicAudio::start(int audioPid, int enigmaAudioType)
 void OpenBHAmlogicAudio::stop()
 {
     if (!m_started) return;
+    // Signal the worker before stopping the PID. Nonblocking ALSA writes and
+    // bounded sync waits let the destructor drop queued old-channel PCM.
     m_stop.store(true);
     pthread_join(m_thread, nullptr);
     m_started = false;
@@ -368,7 +500,7 @@ void *OpenBHAmlogicAudio::runThread(void *arg)
 }
 void OpenBHAmlogicAudio::run()
 {
-    AudioWorker worker(m_type, m_videoDev, m_pts);
+    AudioWorker worker(m_type, m_videoDev, m_pts, m_stop);
     if (!worker.ready()) { notice("ALSA/FFmpeg worker init failed"); return; }
     // TSDEMUX_TAP returns multiplexed TS, not elementary-stream PCM.
     std::vector<uint8_t> input;
