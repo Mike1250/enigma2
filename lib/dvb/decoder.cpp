@@ -1,8 +1,12 @@
+#include <enigma2_config.h>
 #include <lib/base/cfile.h>
 #include <lib/base/ebase.h>
 #include <lib/base/eerror.h>
 #include <lib/base/wrappers.h>
 #include <lib/dvb/decoder.h>
+#ifdef DREAMNEXTGEN
+#include <lib/dvb/amlogic_audio.h>
+#endif
 #ifdef HAVE_EGL
 #include <lib/gdi/egl/gegldc.h>
 #endif
@@ -18,6 +22,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <errno.h>
+#ifdef DREAMNEXTGEN
+#include <mutex>
+#include <cstdlib>
+#include <cstring>
+#endif
 
 #include <lib/dvb/fccdecoder.h>
 
@@ -33,6 +42,22 @@
 #ifndef VIDEO_GET_FRAME_RATE
 #define VIDEO_GET_FRAME_RATE _IOR('o', 56, unsigned int)
 #endif
+
+#ifdef DREAMNEXTGEN
+// The Amlogic vdec can deadlock when multiple threads issue VIDEO_*
+// ioctls concurrently. Serialize ioctl operations on its video node.
+static std::mutex s_openbh_amlogic_video_ioctl_mutex;
+template<typename... Args>
+static int openbhAmlogicVideoIoctl(int fd, unsigned long request, Args... args)
+{
+	std::lock_guard<std::mutex> lock(s_openbh_amlogic_video_ioctl_mutex);
+	return ::ioctl(fd, request, args...);
+}
+#define OPENBH_VIDEO_IOCTL(...) openbhAmlogicVideoIoctl(__VA_ARGS__)
+#else
+#define OPENBH_VIDEO_IOCTL(...) ::ioctl(__VA_ARGS__)
+#endif
+
 
 /* A decoder device (video/audio) node can still be held by a just-stopped
  * hardware sink for a while after that sink's owner believes it has released
@@ -79,6 +104,9 @@ DEFINE_REF(eDVBAudio);
 
 eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 	:m_demux(demux), m_dev(dev)
+#ifdef DREAMNEXTGEN
+	, m_amlogicAudio(nullptr)
+#endif
 {
 	char filename[128] = {};
 	sprintf(filename, "/dev/dvb/adapter%d/audio%d", demux ? demux->adapter : 0, dev);
@@ -97,10 +125,17 @@ eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 		m_fd_demux = -1;
 	}
 
+#ifdef DREAMNEXTGEN
+	if (m_fd_demux >= 0)
+		m_amlogicAudio = new OpenBHAmlogicAudio(m_fd_demux, dev);
+#endif
+
+#ifndef DREAMNEXTGEN
 	if (m_fd >= 0)
 	{
 		::ioctl(m_fd, AUDIO_SELECT_SOURCE, demux ? AUDIO_SOURCE_DEMUX : AUDIO_SOURCE_HDMI);
 	}
+#endif
 }
 
 int eDVBAudio::startPid(int pid, int type)
@@ -112,7 +147,11 @@ int eDVBAudio::startPid(int pid, int type)
 
 		pes.pid      = pid;
 		pes.input    = DMX_IN_FRONTEND;
+#ifdef DREAMNEXTGEN
+		pes.output   = DMX_OUT_TSDEMUX_TAP;
+#else
 		pes.output   = DMX_OUT_DECODER;
+#endif
 		switch (m_dev)
 		{
 		case 0:
@@ -129,6 +168,12 @@ int eDVBAudio::startPid(int pid, int type)
 			break;
 		}
 		pes.flags    = 0;
+#ifdef DREAMNEXTGEN
+		// OpenATV DreamNextGen uses a 2 MB TSDEMUX_TAP audio buffer.
+		// Reduces overflow when FFmpeg/ALSA briefly stalls under load.
+		if (::ioctl(m_fd_demux, DMX_SET_BUFFER_SIZE, 2 * 1024 * 1024) < 0)
+			eWarning("[eDVBAudio%d] 2MB audio buffer request failed: %m", m_dev);
+#endif
 		eDebugNoNewLineStart("[eDVBAudio%d] DMX_SET_PES_FILTER pid=0x%04x ", m_dev, pid);
 		if (::ioctl(m_fd_demux, DMX_SET_PES_FILTER, &pes) < 0)
 		{
@@ -145,6 +190,13 @@ int eDVBAudio::startPid(int pid, int type)
 		eDebugNoNewLine("ok\n");
 	}
 
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) {
+		int result = m_amlogicAudio->start(pid, type);
+		if (result < 0)
+			eWarning("[OpenBH-AMLAUDIO] start failed for PID 0x%x type %d: %d", pid, type, result);
+	}
+#else
 	if (m_fd >= 0)
 	{
 		int bypass = 0;
@@ -193,11 +245,15 @@ int eDVBAudio::startPid(int pid, int type)
 		else
 			eDebugNoNewLine("ok\n");
 	}
+#endif // DREAMNEXTGEN
 	return 0;
 }
 
 void eDVBAudio::stop()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) m_amlogicAudio->stop();
+#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_STOP ", m_dev);
@@ -218,6 +274,9 @@ void eDVBAudio::stop()
 
 void eDVBAudio::flush()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) m_amlogicAudio->flush();
+#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_CLEAR_BUFFER ", m_dev);
@@ -230,6 +289,9 @@ void eDVBAudio::flush()
 
 void eDVBAudio::freeze()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) m_amlogicAudio->pause(true);
+#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_PAUSE ", m_dev);
@@ -242,6 +304,9 @@ void eDVBAudio::freeze()
 
 void eDVBAudio::unfreeze()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) m_amlogicAudio->pause(false);
+#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_CONTINUE ", m_dev);
@@ -273,6 +338,12 @@ void eDVBAudio::setChannel(int channel)
 
 int eDVBAudio::getPTS(pts_t &now)
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio && m_amlogicAudio->pts() >= 0) {
+		now = m_amlogicAudio->pts();
+		return 0;
+	}
+#endif
 	if (m_fd >= 0)
 	{
 		if (::ioctl(m_fd, AUDIO_GET_PTS, &now) < 0)
@@ -283,6 +354,10 @@ int eDVBAudio::getPTS(pts_t &now)
 
 eDVBAudio::~eDVBAudio()
 {
+#ifdef DREAMNEXTGEN
+	delete m_amlogicAudio;
+	m_amlogicAudio = nullptr;
+#endif
 	unfreeze();  // why unfreeze here... but not unfreeze video in ~eDVBVideo ?!?
 	if (m_fd >= 0)
 		::close(m_fd);
@@ -298,6 +373,9 @@ int eDVBVideo::m_close_invalidates_attributes = -1;
 eDVBVideo::eDVBVideo(eDVBDemux *demux, int dev, bool fcc_enable)
 	: m_demux(demux), m_dev(dev), m_fcc_enable(fcc_enable),
 	m_width(-1), m_height(-1), m_framerate(-1), m_aspect(-1), m_progressive(-1), m_gamma(-1)
+#ifdef DREAMNEXTGEN
+	, m_amlogic_size_sent(false), m_amlogic_poll_count(0)
+#endif
 {
 	char filename[128] = {};
 	sprintf(filename, "/dev/dvb/adapter%d/video%d", demux ? demux->adapter : 0, dev);
@@ -324,10 +402,12 @@ eDVBVideo::eDVBVideo(eDVBDemux *demux, int dev, bool fcc_enable)
 		m_fd_demux = -1;
 	}
 
+#ifndef DREAMNEXTGEN
 	if (m_fd >= 0)
 	{
 		::ioctl(m_fd, VIDEO_SELECT_SOURCE, demux ? VIDEO_SOURCE_DEMUX : VIDEO_SOURCE_HDMI);
 	}
+#endif
 
 	if (m_close_invalidates_attributes < 0)
 	{
@@ -348,6 +428,14 @@ eDVBVideo::eDVBVideo(eDVBDemux *demux, int dev, bool fcc_enable)
 		readApiSize(m_fd, m_width, m_height, m_aspect);
 		m_close_invalidates_attributes = (m_width == -1) ? 1 : 0;
 	}
+#ifdef DREAMNEXTGEN
+	if (m_dev == 0 && m_fd >= 0)
+	{
+		m_amlogic_attributes_timer = eTimer::create(eApp);
+		CONNECT(m_amlogic_attributes_timer->timeout, eDVBVideo::pollAmlogicVideoAttributes);
+		m_amlogic_attributes_timer->start(500, true);
+	}
+#endif
 }
 
 // not finally values i think.. !!
@@ -401,7 +489,7 @@ int eDVBVideo::startPid(int pid, int type)
 		}
 
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_SET_STREAMTYPE %d - ", m_dev, streamtype);
-		if (::ioctl(m_fd, VIDEO_SET_STREAMTYPE, streamtype) < 0)
+		if (OPENBH_VIDEO_IOCTL(m_fd, VIDEO_SET_STREAMTYPE, streamtype) < 0)
 			eDebugNoNewLine("failed: %m\n");
 		else
 			eDebugNoNewLine("ok\n");
@@ -449,9 +537,17 @@ int eDVBVideo::startPid(int pid, int type)
 
 	if (m_fd >= 0)
 	{
-		freeze();  // why freeze here?!? this is a problem when only a pid change is requested... because of the unfreeze logic in Decoder::setState
+#ifdef DREAMNEXTGEN
+		// Optional A/B test for delayed video after zapping. By default retain
+		// OpenBH's original VIDEO_FREEZE -> VIDEO_PLAY sequence.
+		const char *skipStartFreeze = getenv("OPENBH_AMLOGIC_SKIP_VIDEO_START_FREEZE");
+		if (!(skipStartFreeze && strcmp(skipStartFreeze, "1") == 0))
+			freeze();
+#else
+		freeze();
+#endif
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_PLAY ", m_dev);
-		if (::ioctl(m_fd, VIDEO_PLAY) < 0)
+		if (OPENBH_VIDEO_IOCTL(m_fd, VIDEO_PLAY) < 0)
 			eDebugNoNewLine("failed: %m\n");
 		else
 			eDebugNoNewLine("ok\n");
@@ -476,7 +572,7 @@ void eDVBVideo::stop()
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_STOP ", m_dev);
-		if (::ioctl(m_fd, VIDEO_STOP, 1) < 0)
+		if (OPENBH_VIDEO_IOCTL(m_fd, VIDEO_STOP, 1) < 0)
 			eDebugNoNewLine("failed: %m\n");
 		else
 			eDebugNoNewLine("ok\n");
@@ -488,7 +584,7 @@ void eDVBVideo::flush()
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_CLEAR_BUFFER ", m_dev);
-		if (::ioctl(m_fd, VIDEO_CLEAR_BUFFER) < 0)
+		if (OPENBH_VIDEO_IOCTL(m_fd, VIDEO_CLEAR_BUFFER) < 0)
 			eDebugNoNewLine("failed: %m\n");
 		else
 			eDebugNoNewLine("ok\n");
@@ -500,7 +596,7 @@ void eDVBVideo::freeze()
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_FREEZE ", m_dev);
-		if (::ioctl(m_fd, VIDEO_FREEZE) < 0)
+		if (OPENBH_VIDEO_IOCTL(m_fd, VIDEO_FREEZE) < 0)
 			eDebugNoNewLine("failed: %m\n");
 		else
 			eDebugNoNewLine("ok\n");
@@ -511,8 +607,31 @@ void eDVBVideo::unfreeze()
 {
 	if (m_fd >= 0)
 	{
+#ifdef DREAMNEXTGEN
+		// The Amlogic display plane can remain blanked after trick-play;
+		// re-enable it only when transitioning back into video playback.
+		if (m_dev == 0)
+		{
+			char state = 0;
+			int fd = ::open("/sys/class/video/disable_video", O_RDONLY | O_CLOEXEC);
+			if (fd >= 0)
+			{
+				ssize_t n = ::read(fd, &state, 1);
+				::close(fd);
+				if (n == 1 && state == '1')
+				{
+					fd = ::open("/sys/class/video/disable_video", O_WRONLY | O_CLOEXEC);
+					if (fd >= 0)
+					{
+						(void)::write(fd, "0", 1);
+						::close(fd);
+					}
+				}
+			}
+		}
+#endif
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_CONTINUE ", m_dev);
-		if (::ioctl(m_fd, VIDEO_CONTINUE) < 0)
+		if (OPENBH_VIDEO_IOCTL(m_fd, VIDEO_CONTINUE) < 0)
 			eDebugNoNewLine("failed: %m\n");
 		else
 			eDebugNoNewLine("ok\n");
@@ -524,7 +643,7 @@ int eDVBVideo::setSlowMotion(int repeat)
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_SLOWMOTION %d ", m_dev, repeat);
-		int ret = ::ioctl(m_fd, VIDEO_SLOWMOTION, repeat);
+		int ret = OPENBH_VIDEO_IOCTL(m_fd, VIDEO_SLOWMOTION, repeat);
 		if (ret < 0)
 			eDebugNoNewLine("failed: %m\n");
 		else
@@ -539,7 +658,7 @@ int eDVBVideo::setFastForward(int skip)
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_FAST_FORWARD %d ", m_dev, skip);
-		int ret = ::ioctl(m_fd, VIDEO_FAST_FORWARD, skip);
+		int ret = OPENBH_VIDEO_IOCTL(m_fd, VIDEO_FAST_FORWARD, skip);
 		if (ret < 0)
 			eDebugNoNewLine("failed: %m\n");
 		else
@@ -553,7 +672,7 @@ int eDVBVideo::getPTS(pts_t &now)
 {
 	if (m_fd >= 0)
 	{
-		int ret = ::ioctl(m_fd, VIDEO_GET_PTS, &now);
+		int ret = OPENBH_VIDEO_IOCTL(m_fd, VIDEO_GET_PTS, &now);
 		if (ret < 0)
 			eDebug("[eDVBVideo%d] VIDEO_GET_PTS failed: %m", m_dev);
 		return ret;
@@ -563,6 +682,10 @@ int eDVBVideo::getPTS(pts_t &now)
 
 eDVBVideo::~eDVBVideo()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogic_attributes_timer)
+		m_amlogic_attributes_timer->stop();
+#endif
 	if (m_fd >= 0)
 		::close(m_fd);
 	if (m_fd_demux >= 0)
@@ -583,7 +706,7 @@ void eDVBVideo::video_event(int)
 		if (retval <= 0) break;
 		struct video_event evt = {};
 		eDebugNoNewLineStart("[eDVBVideo%d] VIDEO_GET_EVENT ", m_dev);
-		if (::ioctl(m_fd, VIDEO_GET_EVENT, &evt) < 0)
+		if (OPENBH_VIDEO_IOCTL(m_fd, VIDEO_GET_EVENT, &evt) < 0)
 		{
 			eDebugNoNewLine("failed: %m\n");
 			break;
@@ -634,11 +757,73 @@ void eDVBVideo::video_event(int)
 #endif
 				/* emit */ m_event(event);
 			}
+#ifdef DREAMNEXTGEN
+			else if (evt.type == 64 /* VIDEO_DISCONTINUE_DETECTED */)
+			{
+				// Match the Amlogic vdec recovery used by OpenATV.
+				eDebugNoNewLine("Amlogic video discontinuity; restart decoder\n");
+				flush();
+				if (m_fd >= 0 && OPENBH_VIDEO_IOCTL(m_fd, VIDEO_PLAY) < 0)
+					eDebug("[eDVBVideo] VIDEO_PLAY recovery failed: %m");
+			}
+#endif
 			else
 				eDebugNoNewLine("unhandled DVBAPI Video Event %d\n", evt.type);
 		}
 	}
 }
+
+#ifdef DREAMNEXTGEN
+void eDVBVideo::pollAmlogicVideoAttributes()
+{
+	if (!m_amlogic_attributes_timer)
+		return;
+	++m_amlogic_poll_count;
+	int w = -1, h = -1, fps = -1, progressive = -1;
+	CFile::parseInt(&w, "/sys/class/video/frame_width");
+	CFile::parseInt(&h, "/sys/class/video/frame_height");
+	CFile::parseInt(&fps, "/proc/stb/vmpeg/0/frame_rate");
+	CFile::parseInt(&progressive, "/proc/stb/vmpeg/0/progressive");
+	bool changed = false;
+	if (w > 0 && h > 0 && (!m_amlogic_size_sent || w != m_width || h != m_height))
+	{
+		m_width = w;
+		m_height = h;
+		iTSMPEGDecoder::videoEvent event = {};
+		event.type = iTSMPEGDecoder::videoEvent::eventSizeChanged;
+		event.width = w;
+		event.height = h;
+		event.aspect = m_aspect >= 0 ? m_aspect : 3;
+		m_event(event);
+		m_amlogic_size_sent = true;
+		changed = true;
+	}
+	if (fps > 0 && fps != m_framerate)
+	{
+		m_framerate = fps;
+		iTSMPEGDecoder::videoEvent event = {};
+		event.type = iTSMPEGDecoder::videoEvent::eventFrameRateChanged;
+		event.framerate = fps;
+		m_event(event);
+		changed = true;
+	}
+	if ((progressive == 0 || progressive == 1) && progressive != m_progressive)
+	{
+		m_progressive = progressive;
+		iTSMPEGDecoder::videoEvent event = {};
+		event.type = iTSMPEGDecoder::videoEvent::eventProgressiveChanged;
+		event.progressive = progressive;
+		m_event(event);
+		changed = true;
+	}
+	const bool ready = w > 0 && h > 0 && fps > 0 &&
+		(progressive == 0 || progressive == 1);
+	if (ready && m_amlogic_size_sent && !changed)
+		m_amlogic_attributes_timer->stop();
+	else
+		m_amlogic_attributes_timer->start(m_amlogic_poll_count < 10 ? 500 : 2000, true);
+}
+#endif
 
 RESULT eDVBVideo::connectEvent(const sigc::slot<void(struct iTSMPEGDecoder::videoEvent)> &event, ePtr<eConnection> &conn)
 {
@@ -656,11 +841,31 @@ int eDVBVideo::readApiSize(int fd, int &xres, int &yres, int &aspect)
 		aspect = size.aspect_ratio == 0 ? 2 : 3;  // convert dvb api to etsi
 		return 0;
 	}
+#ifdef DREAMNEXTGEN
+	// DreamOne/DreamTwo can expose frame size through sysfs before the
+	// DVB-API VIDEO_GET_SIZE ioctl is available.
+	int w = -1, h = -1;
+	CFile::parseInt(&w, "/sys/class/video/frame_width");
+	CFile::parseInt(&h, "/sys/class/video/frame_height");
+	if (w > 0 && h > 0)
+	{
+		xres = w;
+		yres = h;
+		aspect = 3;
+		return 0;
+	}
+#endif
 	return -1;
 }
 
 int eDVBVideo::getWidth()
 {
+#ifdef DREAMNEXTGEN
+	int value = -1;
+	CFile::parseInt(&value, "/sys/class/video/frame_width");
+	if (value > 0)
+		m_width = value;
+#endif
 	/* when closing the video device invalidates the attributes, we can rely on VIDEO_EVENTs */
 	if (!m_close_invalidates_attributes)
 	{
@@ -672,6 +877,12 @@ int eDVBVideo::getWidth()
 
 int eDVBVideo::getHeight()
 {
+#ifdef DREAMNEXTGEN
+	int value = -1;
+	CFile::parseInt(&value, "/sys/class/video/frame_height");
+	if (value > 0)
+		m_height = value;
+#endif
 	/* when closing the video device invalidates the attributes, we can rely on VIDEO_EVENTs */
 	if (!m_close_invalidates_attributes)
 	{
@@ -701,7 +912,11 @@ int eDVBVideo::getProgressive()
 		{
 			char tmp[64] = {};
 			sprintf(tmp, "/proc/stb/vmpeg/%d/progressive", m_dev);
+#ifdef DREAMNEXTGEN
+			CFile::parseInt(&m_progressive, tmp);
+#else
 			CFile::parseIntHex(&m_progressive, tmp);
+#endif
 		}
 	}
 	return m_progressive;
@@ -716,7 +931,7 @@ int eDVBVideo::getFrameRate()
 		{
 			if (m_fd >= 0)
 			{
-				::ioctl(m_fd, VIDEO_GET_FRAME_RATE, &m_framerate);
+				OPENBH_VIDEO_IOCTL(m_fd, VIDEO_GET_FRAME_RATE, &m_framerate);
 			}
 		}
 	}
@@ -794,6 +1009,8 @@ int eDVBPCR::startPid(int pid)
 
 void eDVBPCR::stop()
 {
+	if (m_fd_demux < 0)
+		return;
 	eDebugNoNewLineStart("[eDVBPCR%d] DEMUX_STOP ", m_dev);
 	if (::ioctl(m_fd_demux, DMX_STOP) < 0)
 		eDebugNoNewLine("failed: %m\n");
