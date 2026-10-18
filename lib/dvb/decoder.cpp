@@ -166,6 +166,12 @@ int eDVBAudio::startPid(int pid, int type)
 			break;
 		}
 		pes.flags    = 0;
+#ifdef DREAMNEXTGEN
+		// OpenATV DreamNextGen uses a 2 MB TSDEMUX_TAP audio buffer.
+		// Reduces overflow when FFmpeg/ALSA briefly stalls under load.
+		if (::ioctl(m_fd_demux, DMX_SET_BUFFER_SIZE, 2 * 1024 * 1024) < 0)
+			eWarning("[eDVBAudio%d] 2MB audio buffer request failed: %m", m_dev);
+#endif
 		eDebugNoNewLineStart("[eDVBAudio%d] DMX_SET_PES_FILTER pid=0x%04x ", m_dev, pid);
 		if (::ioctl(m_fd_demux, DMX_SET_PES_FILTER, &pes) < 0)
 		{

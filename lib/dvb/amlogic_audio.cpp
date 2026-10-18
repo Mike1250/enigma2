@@ -21,6 +21,8 @@ extern "C" {
 #include <cstddef>
 #include <cerrno>
 #include <cstdio>
+#include <cstdarg>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -35,9 +37,31 @@ extern "C" {
 #endif
 
 namespace {
+// Small, bounded diagnostic log kept on the receiver's /tmp filesystem.
+// The normal OpenBH/OpenATV/Pure2 driver paths are not involved.
+static void audioLog(const char *format, ...)
+{
+    char message[640];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    fprintf(stderr, "[OpenBH-AMLAUDIO-V3] %s\n", message);
+    FILE *log = fopen("/tmp/openbh_amlogic_audio_v3.log", "a");
+    if (log) {
+        time_t now = time(nullptr);
+        fprintf(log, "%lld %s\n", (long long)now, message);
+        fclose(log);
+    }
+}
 static void notice(const char *text, int v = 0)
 {
-    fprintf(stderr, "[OpenBH-AMLAUDIO] %s (%d)\n", text, v);
+    audioLog("%s (%d)", text, v);
+}
+static bool enableOptionalVideoPtsGuard()
+{
+    const char *value = getenv("OPENBH_AMLOGIC_AVSYNC_GUARD");
+    return value && strcmp(value, "1") == 0;
 }
 static AVCodecID codecForType(int type)
 {
@@ -68,7 +92,8 @@ public:
     AudioWorker(int type, int videoDev, std::atomic<int64_t> &pts)
       : ctx(nullptr), parser(nullptr), swr(nullptr), pcm(nullptr),
         videoFd(-1), lastPts(-1), pidPts(AV_NOPTS_VALUE), outRate(48000),
-        ptsRef(pts), decodedFrames(0)
+        ptsRef(pts), decodedFrames(0), pcmFramesWritten(0), xruns(0),
+        writeErrors(0), ptsDrops(0), videoPtsGuard(enableOptionalVideoPtsGuard())
     {
         AVCodecID codec = codecForType(type);
         const AVCodec *implementation = codec != AV_CODEC_ID_NONE ? avcodec_find_decoder(codec) : nullptr;
@@ -90,7 +115,8 @@ public:
         }
         char videoName[64];
         snprintf(videoName, sizeof(videoName), "/dev/dvb/adapter0/video%d", videoDev);
-        videoFd = ::open(videoName, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (videoPtsGuard)
+            videoFd = ::open(videoName, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         // DreamTwo/OpenATV-style direct ALSA PCM device (TDM-B, card 0/device 0).
         // Override with OPENBH_AMLOGIC_ALSA_DEVICE for diagnosis if needed.
         const char *selected = getenv("OPENBH_AMLOGIC_ALSA_DEVICE");
@@ -98,21 +124,42 @@ public:
         fprintf(stderr, "[OpenBH-AMLAUDIO] opening ALSA device %s (S16_LE, 2 ch, %u Hz)\n", selected, outRate);
         int rc = snd_pcm_open(&pcm, selected, SND_PCM_STREAM_PLAYBACK, 0);
         if (rc < 0) {
-            fprintf(stderr, "[OpenBH-AMLAUDIO] open %s failed: %s\n", selected, snd_strerror(rc));
-            // Do not silently fall back to /etc/asound.conf's 'default',
-            // which may route PCM back to card 0/device 2.
-        }
-        if (rc < 0 || !pcm) {
-            notice("ALSA unavailable", rc);
+            audioLog("ALSA open %s failed: %s", selected, snd_strerror(rc));
             return;
+        }
+        // Increase the playback buffer to tolerate scheduling jitter.
+        // Keep the known-working 160-ms configuration as fallback.
+        unsigned int latency = 350000;
+        const char *latencyEnv = getenv("OPENBH_AMLOGIC_ALSA_LATENCY_US");
+        if (latencyEnv && *latencyEnv) {
+            char *tail = nullptr;
+            long proposed = strtol(latencyEnv, &tail, 10);
+            if (tail && !*tail && proposed >= 100000 && proposed <= 1000000)
+                latency = (unsigned int)proposed;
         }
         rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
                                 SND_PCM_ACCESS_RW_INTERLEAVED, 2,
-                                outRate, 1, 160000);
-        if (rc < 0) {
-            fprintf(stderr, "[OpenBH-AMLAUDIO] snd_pcm_set_params: %s\n", snd_strerror(rc));
-            snd_pcm_close(pcm); pcm = nullptr;
+                                outRate, 1, latency);
+        if (rc < 0 && latency != 160000) {
+            audioLog("ALSA latency %u us rejected (%s); retry 160000 us", latency, snd_strerror(rc));
+            rc = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
+                                     SND_PCM_ACCESS_RW_INTERLEAVED, 2,
+                                     outRate, 1, 160000);
         }
+        if (rc < 0) {
+            audioLog("ALSA parameters failed: %s", snd_strerror(rc));
+            snd_pcm_close(pcm);
+            pcm = nullptr;
+            return;
+        }
+        snd_pcm_uframes_t bufferFrames = 0, periodFrames = 0;
+        if (snd_pcm_get_params(pcm, &bufferFrames, &periodFrames) == 0)
+            audioLog("opened %s, rate=%u, buffer=%lu, period=%lu frames, video_pts_guard=%d",
+                     selected, outRate, (unsigned long)bufferFrames,
+                     (unsigned long)periodFrames, (int)videoPtsGuard);
+        else
+            audioLog("opened %s, rate=%u, video_pts_guard=%d", selected, outRate,
+                     (int)videoPtsGuard);
     }
     ~AudioWorker()
     {
@@ -123,6 +170,20 @@ public:
         avcodec_free_context(&ctx);
     }
     bool ready() const { return ctx && parser && pcm; }
+    void logStats(unsigned long long tsPackets, unsigned long long payloadPackets,
+                  unsigned long long ccGaps, unsigned long long duplicatedPackets,
+                  unsigned long long pesStarts, unsigned long long reads,
+                  unsigned long long pollTimeouts)
+    {
+        snd_pcm_sframes_t available = pcm ? snd_pcm_avail_update(pcm) : -1;
+        audioLog("stats ts=%llu payload=%llu reads=%llu pes=%llu cc_gaps=%llu dup=%llu "
+                 "poll_empty=%llu decoded=%llu pcm_frames=%llu xruns=%llu "
+                 "write_errors=%llu pts_drops=%llu alsa_state=%s avail=%ld",
+                 tsPackets, payloadPackets, reads, pesStarts, ccGaps, duplicatedPackets,
+                 pollTimeouts, decodedFrames, pcmFramesWritten, xruns, writeErrors,
+                 ptsDrops, pcm ? snd_pcm_state_name(snd_pcm_state(pcm)) : "NONE",
+                 (long)available);
+    }
     void reset()
     {
         if (pcm) { snd_pcm_drop(pcm); snd_pcm_prepare(pcm); }
@@ -202,33 +263,46 @@ private:
         int frames = swr_convert(swr, &dst, capacity, src, frame->nb_samples);
         if (frames <= 0) return;
 
-        // Best-effort A/V alignment. This is not a replacement for OpenATV's
-        // full clock/avsync_core implementation. Nonblocking video PTS ioctl.
-        uint64_t videoPts = 0;
-        if (videoFd >= 0 && lastPts >= 0 &&
-            ::ioctl(videoFd, VIDEO_GET_PTS, &videoPts) == 0 && videoPts) {
-            int64_t delta = lastPts - (int64_t)videoPts;
-            if (delta < -45000) { // audio >500ms late: discard stale PCM
-                lastPts += (int64_t)frame->nb_samples * 90000 / inputRate;
-                return;
+        // The earlier V1/V2 video-PTS guard discarded all decoded PCM when
+        // the two independent clocks differed by >500ms. On DreamTwo it can
+        // cause 2-3 second cyclic silences despite valid input audio.
+        // Continuous PCM is now the safe default. Re-enable the experimental
+        // guard only with OPENBH_AMLOGIC_AVSYNC_GUARD=1 for A/B testing.
+        if (videoPtsGuard) {
+            uint64_t videoPts = 0;
+            if (videoFd >= 0 && lastPts >= 0 &&
+                ::ioctl(videoFd, VIDEO_GET_PTS, &videoPts) == 0 && videoPts) {
+                int64_t delta = lastPts - (int64_t)videoPts;
+                if (delta < -45000) {
+                    ++ptsDrops;
+                    lastPts += (int64_t)frame->nb_samples * 90000 / inputRate;
+                    return;
+                }
+                if (delta > 9000 && delta < 45000)
+                    usleep((useconds_t)std::min((int64_t)80000,
+                                                  delta * 1000000 / 90000));
             }
-            if (delta > 9000 && delta < 45000) // audio slightly ahead
-                usleep((useconds_t)std::min((int64_t)80000, delta * 1000000 / 90000));
         }
         int offset = 0;
+        int recoveryTries = 0;
         while (offset < frames) {
             snd_pcm_sframes_t n = snd_pcm_writei(pcm, pcmData.data() + offset * 2,
-                                                  (snd_pcm_uframes_t)(frames - offset));
-            if (n == -EPIPE || n == -ESTRPIPE) {
-                snd_pcm_prepare(pcm);
-                continue;
-            }
+                                                 (snd_pcm_uframes_t)(frames - offset));
+            if (n == -EINTR) continue;
             if (n < 0) {
-                fprintf(stderr, "[OpenBH-AMLAUDIO] ALSA write: %s\n", snd_strerror((int)n));
+                if (n == -EPIPE || n == -ESTRPIPE) ++xruns;
+                int recovered = snd_pcm_recover(pcm, (int)n, 1);
+                if (recovered >= 0 && ++recoveryTries <= 3)
+                    continue;
+                ++writeErrors;
+                audioLog("ALSA write error %ld (%s), recover=%d",
+                         (long)n, snd_strerror((int)n), recovered);
                 break;
             }
             if (n == 0) break;
+            recoveryTries = 0;
             offset += (int)n;
+            pcmFramesWritten += (unsigned long long)n;
         }
         ++decodedFrames;
         if (lastPts >= 0) {
@@ -245,7 +319,12 @@ private:
     int64_t lastPts, pidPts;
     unsigned int outRate;
     std::atomic<int64_t> &ptsRef;
-    unsigned int decodedFrames;
+    unsigned long long decodedFrames;
+    unsigned long long pcmFramesWritten;
+    unsigned long long xruns;
+    unsigned long long writeErrors;
+    unsigned long long ptsDrops;
+    bool videoPtsGuard;
 };
 }
 
@@ -297,6 +376,9 @@ void OpenBHAmlogicAudio::run()
     bool havePes = false;
     uint8_t lastCC = 0;
     bool haveCC = false;
+    unsigned long long tsPackets = 0, payloadPackets = 0, ccGaps = 0;
+    unsigned long long duplicatedPackets = 0, pesStarts = 0, reads = 0, pollTimeouts = 0;
+    time_t lastStats = time(nullptr);
     uint8_t buf[188 * 128];
     while (!m_stop.load()) {
         if (m_flush.exchange(false)) {
@@ -308,10 +390,15 @@ void OpenBHAmlogicAudio::run()
         if (m_paused.load()) { usleep(20000); continue; }
         pollfd pfd = {m_demuxFd, POLLIN | POLLERR | POLLHUP, 0};
         int r = ::poll(&pfd, 1, 100);
-        if (r <= 0 || !(pfd.revents & POLLIN)) continue;
-        ssize_t got = ::read(m_demuxFd, buf, sizeof(buf));
-        if (got <= 0) continue;
-        input.insert(input.end(), buf, buf + got);
+        if (r <= 0 || !(pfd.revents & POLLIN)) {
+            ++pollTimeouts;
+        } else {
+            ssize_t got = ::read(m_demuxFd, buf, sizeof(buf));
+            if (got > 0) {
+                ++reads;
+                input.insert(input.end(), buf, buf + got);
+            }
+        }
         size_t pos = 0;
         while (input.size() - pos >= 188) {
             if (input[pos] != 0x47) { ++pos; continue; }
@@ -319,16 +406,32 @@ void OpenBHAmlogicAudio::run()
             if (input.size() - pos >= 376 && input[pos + 188] != 0x47) { ++pos; continue; }
             const uint8_t *ts = input.data() + pos;
             pos += 188;
+            ++tsPackets;
             int pid = ((ts[1] & 0x1f) << 8) | ts[2];
             if (pid != m_pid || (ts[1] & 0x80)) continue;
             int afc = (ts[3] >> 4) & 3;
             if (afc != 1 && afc != 3) continue;
             uint8_t cc = ts[3] & 0x0f;
             bool pusi = (ts[1] & 0x40) != 0;
+            bool discontinuity = afc == 3 && ts[4] >= 1 &&
+                                 (ts[5] & 0x80) != 0;
+            if (discontinuity) {
+                haveCC = false;
+                havePes = false;
+            }
+            if (haveCC && cc == lastCC) {
+                // A duplicate payload TS packet must not reset the decoder.
+                ++duplicatedPackets;
+                continue;
+            }
             if (haveCC && cc != (uint8_t)((lastCC + 1) & 15)) {
-                havePes = false; worker.reset();
+                ++ccGaps;
+                // Discard only the damaged PES remainder. Do NOT drop/prepare
+                // ALSA or flush the whole codec on a transient TS gap.
+                havePes = false;
             }
             lastCC = cc; haveCC = true;
+            ++payloadPackets;
             int offset = 4;
             if (afc == 3) offset += 1 + ts[4];
             if (offset >= 188) continue;
@@ -343,12 +446,22 @@ void OpenBHAmlogicAudio::run()
                     worker.setPts(pesPts(ts + offset + 9));
                 offset += headerLen;
                 havePes = true;
+                ++pesStarts;
             }
             if (havePes && offset < 188)
                 worker.submit(ts + offset, 188 - offset);
         }
         if (pos) input.erase(input.begin(), input.begin() + (std::ptrdiff_t)pos);
-        if (input.size() > 256 * 1024) { input.clear(); havePes = false; }
+        if (input.size() > 256 * 1024) {
+            input.clear(); havePes = false; haveCC = false;
+            audioLog("TS buffer overflow: dropped incomplete packet sequence");
+        }
+        time_t now = time(nullptr);
+        if (now - lastStats >= 5) {
+            worker.logStats(tsPackets, payloadPackets, ccGaps, duplicatedPackets,
+                            pesStarts, reads, pollTimeouts);
+            lastStats = now;
+        }
     }
 }
 #endif // DREAMNEXTGEN
