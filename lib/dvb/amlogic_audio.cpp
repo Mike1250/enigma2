@@ -91,15 +91,16 @@ public:
         char videoName[64];
         snprintf(videoName, sizeof(videoName), "/dev/dvb/adapter0/video%d", videoDev);
         videoFd = ::open(videoName, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        // DreamTwo/OpenATV-style direct ALSA PCM device (TDM-B, card 0/device 0).
+        // Override with OPENBH_AMLOGIC_ALSA_DEVICE for diagnosis if needed.
         const char *selected = getenv("OPENBH_AMLOGIC_ALSA_DEVICE");
-        if (!selected || !*selected) selected = "plughw:0,2";
-        // Amlogic DreamTwo PCM HDMI is usually TDM-C (card0/dev2).
+        if (!selected || !*selected) selected = "hw:0,0";
+        fprintf(stderr, "[OpenBH-AMLAUDIO] opening ALSA device %s (S16_LE, 2 ch, %u Hz)\n", selected, outRate);
         int rc = snd_pcm_open(&pcm, selected, SND_PCM_STREAM_PLAYBACK, 0);
         if (rc < 0) {
             fprintf(stderr, "[OpenBH-AMLAUDIO] open %s failed: %s\n", selected, snd_strerror(rc));
-            if (!getenv("OPENBH_AMLOGIC_ALSA_DEVICE")) {
-                rc = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
-            }
+            // Do not silently fall back to /etc/asound.conf's 'default',
+            // which may route PCM back to card 0/device 2.
         }
         if (rc < 0 || !pcm) {
             notice("ALSA unavailable", rc);
