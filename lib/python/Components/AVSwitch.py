@@ -1,4 +1,5 @@
 from os import path
+import re
 
 from enigma import eAVSwitch, eDVBVolumecontrol, getDesktop
 
@@ -6,6 +7,57 @@ from Components.config import ConfigEnableDisable, ConfigNothing, ConfigSelectio
 from Components.SystemInfo import SystemInfo
 from Tools.CList import CList
 from Tools.Directories import fileCheck, fileReadLine, fileWriteLine, isPluginInstalled
+
+
+# On DreamOne/DreamTwo the Amlogic display sysfs reports mode names such as
+# "1080p50hz". Older Enigma2 AVSwitch tables expect "1080p50", while the
+# /proc/stb/video/videomode_choices compatibility file can be absent or empty.
+_AMLOGIC_MODE_PATTERN = re.compile(r"^(480|576|720|1080|2160)([pi])(24|25|30|50|60|100|120)hz$", re.I)
+
+
+def _amlogicReadMode(pathname):
+    try:
+        with open(pathname, "r") as stream:
+            return stream.read().strip()
+    except (OSError, IOError):
+        return ""
+
+
+def _amlogicHardwareModes():
+    # The display node and HDMI capabilities must exist. Never synthesize
+    # unsupported outputs or override the legacy path on non-Amlogic devices.
+    if not path.exists("/sys/class/display/mode"):
+        return [], ""
+    current = _amlogicReadMode("/sys/class/display/mode").lower()
+    caps = _amlogicReadMode("/sys/class/amhdmitx/amhdmitx0/disp_cap")
+    # Certain Amlogic revisions expose disp_cap2 as the capability list.
+    if not caps:
+        caps = _amlogicReadMode("/sys/class/amhdmitx/amhdmitx0/disp_cap2")
+    result = []
+    for line in caps.splitlines():
+        token = line.strip().split()[0].rstrip("*").lower() if line.strip() else ""
+        if _AMLOGIC_MODE_PATTERN.fullmatch(token) and token not in result:
+            result.append(token)
+    if not result and _AMLOGIC_MODE_PATTERN.fullmatch(current):
+        # Safe, limited recovery with only the *current* working HDMI mode.
+        result.append(current)
+    return result, current
+
+
+def _amlogicBuildModeTables(nativeModes):
+    highLevelRates = {}
+    for native in nativeModes:
+        matched = _AMLOGIC_MODE_PATTERN.fullmatch(native)
+        if not matched:
+            continue
+        resolution, scan, hzText = matched.groups()
+        hz = int(hzText)
+        base = resolution + scan
+        # The original Enigma2 GUI uses 2160p30 for the <=30Hz family.
+        if base == "2160p" and hz <= 30:
+            base = "2160p30"
+        highLevelRates.setdefault(base, {})[f"{hz}Hz"] = {hz: native}
+    return highLevelRates
 
 config.av = ConfigSubsection()
 
@@ -84,16 +136,42 @@ class AVSwitch:
 		self.on_hotplug = CList()
 		self.current_mode = None
 		self.current_port = None
+		self._amlogic_sysfs = False
+		self._amlogic_current = ""
+		self._amlogic_modes = []
+		# Do not modify other boxes or valid legacy /proc mode configurations.
+		# Set up native Amlogic tables only if no legacy HDMI mode is usable.
+		original = eAVSwitch.getInstance().readAvailableModes().split()
+		legacyUsable = any(
+			any(token in original for rate in self.rates.get(mode, {}).values() for token in rate.values())
+			for mode in self.modes.get("HDMI", [])
+		)
+		if not legacyUsable:
+			native, current = _amlogicHardwareModes()
+			if native:
+				self._amlogic_sysfs = True
+				self._amlogic_current = current
+				self._amlogic_modes = native
+				modeRates = _amlogicBuildModeTables(native)
+				# Work on this instance only, not the class-wide legacy tables.
+				self.rates = dict(self.rates)
+				self.rates.update(modeRates)
+				self.modes = dict(self.modes)
+				self.modes["HDMI"] = list(modeRates)
+				print(f"[AVSwitch][Amlogic] Native HDMI modes: {self.modes['HDMI']}, current: {current}")
 		self.readAvailableModes()
 		self.readPreferredModes()
 		self.createConfig()
 
 	def readAvailableModes(self):
-		SystemInfo["AvailableVideomodes"] = []
-		SystemInfo["AvailableVideomodes"] = eAVSwitch.getInstance().readAvailableModes().split(" ")
-		# print(f"[AVSwitch][readAvailableModes] {SystemInfo['AvailableVideomodes']}")
-		if isPluginInstalled("AutoResolution"):
-			return SystemInfo["AvailableVideomodes"]
+		if self._amlogic_sysfs:
+			# C++ AVSwitch only reads /proc/stb/video/videomode_choices;
+			# the actual Amlogic kernel list uses a different namespace.
+			self._amlogic_modes, _ = _amlogicHardwareModes()
+			SystemInfo["AvailableVideomodes"] = list(self._amlogic_modes)
+		else:
+			SystemInfo["AvailableVideomodes"] = eAVSwitch.getInstance().readAvailableModes().split()
+		return SystemInfo["AvailableVideomodes"]
 
 	def readPreferredModes(self):
 		self.modes_preferred = eAVSwitch.getInstance().getPreferredModes(1)
@@ -123,6 +201,21 @@ class AVSwitch:
 		print(f"[AVSwitch] setMode - port: {port}, mode: {mode}, rate: {rate}")
 		self.current_mode = mode
 		self.current_port = port
+		if self._amlogic_sysfs and port == "HDMI":
+			# Use only a native mode found in the kernel's capability list.
+			mapping = self.rates.get(mode, {}).get(rate, {})
+			target = next(iter(mapping.values()), None)
+			currentModes, _ = _amlogicHardwareModes()
+			if target and target in currentModes:
+				try:
+					with open("/sys/class/display/mode", "w") as stream:
+						stream.write(target)
+					print(f"[AVSwitch][Amlogic] HDMI mode set to: {target}")
+				except (IOError, OSError) as err:
+					print(f"[AVSwitch][Amlogic] Failed to set HDMI mode {target}: {err}")
+			else:
+				print(f"[AVSwitch][Amlogic] Unsupported mode: {mode}/{rate}; no display change")
+			return
 		modes = self.rates[mode][rate]
 		mode_50 = modes.get(50)
 		mode_60 = modes.get(60)
@@ -208,7 +301,14 @@ class AVSwitch:
 				lst.append((port, descr))
 			modes = self.getModeList(port)
 			if len(modes):
-				config.av.videomode[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+				choices = [mode for (mode, rates) in modes]
+				default = choices[0]
+				if self._amlogic_sysfs and port == "HDMI":
+					for candidate, candidateRates in modes:
+						if any(self._amlogic_current in table.values() for table in self.rates[candidate].values()):
+							default = candidate
+							break
+				config.av.videomode[port] = ConfigSelection(choices=choices, default=default)
 			for (mode, rates) in modes:
 				ratelist = []
 				for rate in rates:
@@ -217,7 +317,13 @@ class AVSwitch:
 							ratelist.append((rate, mode == "2160p30" and "auto (25Hz/30Hz/24Hz)" or "auto (50Hz/60Hz/24Hz)"))
 					else:
 						ratelist.append((rate, rate == "multi" and (mode == "2160p30" and "multi (25Hz/30Hz)" or "multi (50Hz/60Hz)") or rate))
-				config.av.videorate[mode] = ConfigSelection(choices=ratelist)
+				defaultRate = ratelist[0][0] if ratelist else None
+				if self._amlogic_sysfs and port == "HDMI":
+					for candidateRate, mapping in self.rates[mode].items():
+						if self._amlogic_current in mapping.values():
+							defaultRate = candidateRate
+							break
+				config.av.videorate[mode] = ConfigSelection(choices=ratelist, default=defaultRate)
 				print(f"[AVSwitch][createConfig] mode:{mode} rates:{ratelist}")
 		config.av.videoport = ConfigSelection(choices=lst)
 
