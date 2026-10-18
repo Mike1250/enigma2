@@ -699,18 +699,55 @@ def InitAVSwitch():
 		])
 		config.av.allow_10bit.addNotifier(setDisable10Bit)
 
-	if SystemInfo["Canaudiosource"]:
+	# Legacy Enigma2 exposes /proc/stb/hdmi/audio_source. DreamOne/Two
+	# Amlogic exposes the equivalent control in HDMI sysfs and expects
+	# numeric source values (0=PCM, 1=S/PDIF, 2=Bluetooth). The system
+	# information probe may otherwise hide this setting on OpenBH.
+	audioSourcePath = SystemInfo.get("Canaudiosource", False)
+	amlogicAudioSourcePath = None
+	if not audioSourcePath:
+		for candidate in (
+			"/sys/devices/virtual/amhdmitx/amhdmitx0/audio_source",
+			"/sys/class/amhdmitx/amhdmitx0/audio_source"
+		):
+			if path.exists(candidate):
+				audioSourcePath = candidate
+				amlogicAudioSourcePath = candidate
+				SystemInfo["Canaudiosource"] = candidate
+				break
+	elif audioSourcePath in (
+		"/sys/devices/virtual/amhdmitx/amhdmitx0/audio_source",
+		"/sys/class/amhdmitx/amhdmitx0/audio_source"
+	):
+		amlogicAudioSourcePath = audioSourcePath
+
+	if audioSourcePath:
 		def setAudioSource(configElement):
 			try:
-				with open(SystemInfo["Canaudiosource"], "w") as fd:
+				with open(audioSourcePath, "w") as fd:
 					fd.write(configElement.value)
-			except (IOError, OSError):
-				pass
+			except (IOError, OSError) as error:
+				print(f"[AVSwitch] Unable to set audio source: {error}")
 
-		config.av.audio_source = ConfigSelection(choices={
-			"pcm": _("PCM"),
-			"spdif": _("SPDIF")
-		}, default="pcm")
+		if amlogicAudioSourcePath:
+			# Preserve the currently active hardware route during GUI init.
+			try:
+				with open(audioSourcePath, "r") as fd:
+					currentAudioSource = fd.read().strip().split()[0]
+			except (IOError, OSError, IndexError):
+				currentAudioSource = "0"
+			if currentAudioSource not in ("0", "1", "2"):
+				currentAudioSource = "0"
+			config.av.audio_source = ConfigSelection(choices=[
+				("0", _("PCM")),
+				("1", _("S/PDIF")),
+				("2", _("Bluetooth"))
+			], default=currentAudioSource)
+		else:
+			config.av.audio_source = ConfigSelection(choices=[
+				("pcm", _("PCM")),
+				("spdif", _("SPDIF"))
+			], default="pcm")
 		config.av.audio_source.addNotifier(setAudioSource)
 	else:
 		config.av.audio_source = ConfigNothing()
