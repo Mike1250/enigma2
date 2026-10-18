@@ -48,8 +48,8 @@ static void audioLog(const char *format, ...)
     va_start(args, format);
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
-    fprintf(stderr, "[OpenBH-AMLAUDIO-V4] %s\n", message);
-    FILE *log = fopen("/tmp/openbh_amlogic_audio_v4.log", "a");
+    fprintf(stderr, "[OpenBH-AMLAUDIO-V5] %s\n", message);
+    FILE *log = fopen("/tmp/openbh_amlogic_audio_v5.log", "a");
     if (log) {
         time_t now = time(nullptr);
         fprintf(log, "%lld %s\n", (long long)now, message);
@@ -120,6 +120,8 @@ public:
         videoFd(-1), lastPts(-1), pidPts(AV_NOPTS_VALUE), outRate(48000),
         ptsRef(pts), stopFlag(stopRequested), decodedFrames(0), pcmFramesWritten(0),
         xruns(0), writeErrors(0), ptsDrops(0), syncWaits(0), syncWaitMs(0),
+        initialSyncDone(false), startupSilenceMs(0), startupSkipMs(0),
+        lastAvDeltaMs(0), lastSeenParserPts(AV_NOPTS_VALUE),
         syncEnabled(enableVideoSync()), softwareVolume(enableSoftwareVolume()),
         lastAppliedVolume(-1), lastAppliedMute(false),
         createdAt(std::chrono::steady_clock::now()),
@@ -157,10 +159,11 @@ public:
             audioLog("ALSA open %s failed: %s", selected, snd_strerror(rc));
             return;
         }
-        // Retain V3's stable 350-ms ALSA buffer but avoid an immediate start
-        // with only one tiny decoded frame. Reduce for channel-zap testing via
-        // OPENBH_AMLOGIC_ALSA_LATENCY_US=250000 if the receiver permits it.
-        unsigned int latency = 350000;
+        // Keep the live PCM queue short: V4's 350ms queue plus up to 900ms
+        // per-frame waits made audio lag behind video on some DreamTwo units.
+        // Lower only if the device remains xrun-free.
+        // OPENBH_AMLOGIC_ALSA_LATENCY_US overrides this setting.
+        unsigned int latency = 230000;
         const char *latencyEnv = getenv("OPENBH_AMLOGIC_ALSA_LATENCY_US");
         if (latencyEnv && *latencyEnv) {
             char *tail = nullptr;
@@ -185,12 +188,12 @@ public:
         }
         snd_pcm_uframes_t bufferFrames = 0, periodFrames = 0;
         if (snd_pcm_get_params(pcm, &bufferFrames, &periodFrames) == 0) {
-            // Start only after 120 ms of audio are queued. This prevents
-            // the 2-3 initial underruns observed with auto-start-on-first-period.
+            // Prebuffer approximately 80ms to avoid cold-start xruns without
+            // introducing V4's large fixed startup delay.
             snd_pcm_sw_params_t *params;
             snd_pcm_sw_params_alloca(&params);
             if (snd_pcm_sw_params_current(pcm, params) == 0) {
-                const snd_pcm_uframes_t requested = (snd_pcm_uframes_t)(outRate * 120 / 1000);
+                const snd_pcm_uframes_t requested = (snd_pcm_uframes_t)(outRate * 80 / 1000);
                 const snd_pcm_uframes_t threshold =
                     std::max(periodFrames, std::min(requested,
                              bufferFrames > periodFrames ? bufferFrames - periodFrames : bufferFrames));
@@ -228,11 +231,11 @@ public:
                  "poll_empty=%llu decoded=%llu pcm_frames=%llu xruns=%llu "
                  "write_errors=%llu pts_drops=%llu sync_waits=%llu sync_wait_ms=%llu "
                  "sync_timeouts=%llu "
-                 "volume=%d mute=%d alsa_state=%s avail=%ld",
+                 "volume=%d mute=%d av_delta_ms=%ld alsa_state=%s avail=%ld",
                  tsPackets, payloadPackets, reads, pesStarts, ccGaps, duplicatedPackets,
                  pollTimeouts, decodedFrames, pcmFramesWritten, xruns, writeErrors,
                  ptsDrops, syncWaits, syncWaitMs, syncTimeouts,
-                 lastAppliedVolume, (int)lastAppliedMute,
+                 lastAppliedVolume, (int)lastAppliedMute, lastAvDeltaMs,
                  pcm ? snd_pcm_state_name(snd_pcm_state(pcm)) : "NONE",
                  (long)available);
     }
@@ -250,6 +253,10 @@ public:
         pidPts = AV_NOPTS_VALUE;
         createdAt = std::chrono::steady_clock::now();
         syncBypassUntil = createdAt;
+        initialSyncDone = false;
+        startupSilenceMs = 0;
+        startupSkipMs = 0;
+        lastSeenParserPts = AV_NOPTS_VALUE;
     }
     void setPts(int64_t value) { if (value >= 0) pidPts = value; }
     void submit(const uint8_t *data, int size)
@@ -277,8 +284,20 @@ private:
         if (!pkt) return;
         if (av_new_packet(pkt, size) < 0) { av_packet_free(&pkt); return; }
         memcpy(pkt->data, buffer, size);
-        if (lastPts < 0 && parser && parser->pts != AV_NOPTS_VALUE)
-            lastPts = parser->pts;
+        // Only re-anchor on a NEW PES PTS, not on every parsed frame.
+        // V4 anchored once at channel start and then drifted on discontinuity.
+        if (parser && parser->pts != AV_NOPTS_VALUE &&
+            parser->pts != lastSeenParserPts) {
+            const int64_t newPts = parser->pts & ((1LL << 33) - 1);
+            lastSeenParserPts = parser->pts;
+            if (lastPts < 0 || std::llabs(ptsDelta(newPts, lastPts)) > 9000) {
+                if (lastPts >= 0)
+                    audioLog("PES timestamp re-anchor old=%lld new=%lld delta=%lldms",
+                         (long long)lastPts, (long long)newPts,
+                         (long long)(ptsDelta(newPts, lastPts) / 90));
+                lastPts = newPts;
+            }
+        }
         int rc = avcodec_send_packet(ctx, pkt);
         av_packet_free(&pkt);
         if (rc < 0) return;
@@ -339,58 +358,87 @@ private:
             }
         }
 
-        // A/V sync: audio PTS is the timestamp of the *next queued sample*.
-        // Video PTS is the frame being presented. Do not send the PCM far
-        // ahead of the video. Account for samples already queued in ALSA.
-        // Unlike V1/V2, NEVER discard entire audio frames because PTS differs:
-        // that caused periodic 2-3s silences. Also wait for first valid VPTS
-        // on channel changes to prevent old/new audio leading black video.
-        if (syncEnabled && videoFd >= 0 && lastPts >= 0 &&
-            std::chrono::steady_clock::now() >= syncBypassUntil) {
-            auto now = std::chrono::steady_clock::now();
-            auto startupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - createdAt).count();
-            const long startupWaitMaxMs = envLong("OPENBH_AMLOGIC_STARTUP_WAIT_MS", 3500, 0, 10000);
-            const long maxLeadMs = envLong("OPENBH_AMLOGIC_MAX_AUDIO_LEAD_MS", 65, 0, 500);
-            int64_t waitedMs = 0;
-            while (!stopFlag.load()) {
-                uint64_t videoPts = 0;
-                const bool haveVideo = (::ioctl(videoFd, VIDEO_GET_PTS, &videoPts) == 0 &&
-                                        videoPts != 0 && videoPts != UINT64_MAX);
-                if (!haveVideo) {
-                    // Gate the initial audio until a picture has a valid PTS,
-                    // but allow audio-only/radio and unsupported video ioctls.
-                    if (startupMs >= startupWaitMaxMs) break;
-                } else {
-                    snd_pcm_sframes_t queued = 0;
-                    if (snd_pcm_delay(pcm, &queued) < 0 || queued < 0)
-                        queued = 0;
-                    const int64_t ahead90k = ptsDelta(lastPts, (int64_t)videoPts) -
-                             (int64_t)queued * 90000 / outRate;
-                    if (ahead90k <= maxLeadMs * 90 || ahead90k < -900000)
-                        break;  // already aligned, or clocks from different epochs
-                    // If a frozen video PTS lasts too long, avoid deadlocking
-                    // the audio-demux reader and filling the kernel TS buffer.
-                    if (waitedMs >= 900) {
-                        ++syncTimeouts;
-                        // Do not repeatedly wait 900 ms on *every* audio
-                        // frame if the video clock freezes or is mismatched.
-                        // Fall back to V3's continuous PCM for five seconds.
-                        syncBypassUntil = std::chrono::steady_clock::now() +
-                                          std::chrono::seconds(5);
-                        audioLog("AV sync wait capped: audio ahead=%lldms; pacing bypass 5s", (long long)(ahead90k / 90));
-                        break;
+        // V5 A/V sync: NEVER wait on every decoded frame. V4's repeated
+        // 10ms sleeps up to 900ms starved the transport reader and ALSA.
+        // Align the FIRST PCM block only (PTS units 90kHz) and then let
+        // ALSA consume a continuous stream. No tsync-mode writes, no kernel
+        // clock changes and no forced reset on individual continuity gaps.
+        // Signed user offset: negative advances audio, positive delays it.
+        // A conservative measured correction is used only when both PTS
+        // clocks are comparable and the video is already running.
+        if (!initialSyncDone) {
+            initialSyncDone = true;
+            const long manualMs = envLong("OPENBH_AMLOGIC_AUDIO_DELAY_MS", 0, -1000, 1000);
+            long correctionMs = manualMs;
+            bool videoValid = false;
+            uint64_t videoPts = 0;
+            if (syncEnabled && videoFd >= 0 && lastPts >= 0) {
+                // One immediate read: do not block the demux waiting for
+                // a video frame or reuse a previous channel's stale PTS.
+                uint64_t probe = 0;
+                if (::ioctl(videoFd, VIDEO_GET_PTS, &probe) == 0 &&
+                    probe != 0 && probe != UINT64_MAX) {
+                    const int64_t d = ptsDelta(lastPts, (int64_t)probe);
+                    if (d > -900000 && d < 900000) {
+                        videoValid = true;
+                        videoPts = probe;
+                        lastAvDeltaMs = (long)(d / 90);
+                        // Restrict correction while the actual display clock
+                        // is being established. At most +/- 160ms initially.
+                        correctionMs += std::max(-160L, std::min(160L, lastAvDeltaMs));
                     }
                 }
-                usleep(10000);
-                waitedMs += 10;
-                startupMs += 10;
             }
-            if (waitedMs > 0) {
-                ++syncWaits;
-                syncWaitMs += (unsigned long long)waitedMs;
+            // Leave headroom in the direct ALSA buffer and never enqueue a
+            // long silent interval that might create a visible/audio stall.
+            startupSilenceMs = std::max(0L, std::min(130L, correctionMs));
+            startupSkipMs = std::max(0L, std::min(350L, -correctionMs));
+            audioLog("start align: ptsA=%lld ptsV=%llu comparable=%d "
+                     "delta=%ldms manual=%ldms silence=%ldms skip=%ldms",
+                     (long long)lastPts, (unsigned long long)videoPts,
+                     (int)videoValid, lastAvDeltaMs, manualMs,
+                     startupSilenceMs, startupSkipMs);
+        }
+        // If audio is late relative to video, advance it by skipping only
+        // startup PCM; do not repeatedly chop decoded audio mid-program.
+        if (startupSkipMs > 0 && frames > 0) {
+            const int skip = (int)std::min((long)frames,
+                             (startupSkipMs * (long)outRate + 999) / 1000);
+            if (skip > 0) {
+                pcmData.erase(pcmData.begin(), pcmData.begin() + skip * 2);
+                frames -= skip;
+                startupSkipMs -= (long)skip * 1000 / outRate;
+                if (startupSkipMs <= 1) startupSkipMs = 0;
             }
-            if (stopFlag.load()) return;
+            // The frame's timeline advances below whether we output or skip.
+            if (frames == 0) {
+                ++decodedFrames;
+                if (lastPts >= 0) {
+                    lastPts += (int64_t)frame->nb_samples * 90000 / inputRate;
+                    ptsRef.store(lastPts);
+                }
+                return;
+            }
+        }
+        if (startupSilenceMs > 0) {
+            const size_t silence = (size_t)startupSilenceMs * outRate / 1000;
+            pcmData.insert(pcmData.begin(), silence * 2, 0);
+            frames += (int)silence;
+            startupSilenceMs = 0;
+        }
+        // Read-only A/V telemetry. Include audio still waiting inside ALSA.
+        // No sleeps, resets, drops or ioctl writes in the steady-state path.
+        if (syncEnabled && videoFd >= 0 && lastPts >= 0) {
+            uint64_t vpts = 0;
+            if (::ioctl(videoFd, VIDEO_GET_PTS, &vpts) == 0 &&
+                vpts != 0 && vpts != UINT64_MAX) {
+                snd_pcm_sframes_t queued = 0;
+                if (snd_pcm_delay(pcm, &queued) < 0 || queued < 0) queued = 0;
+                const int64_t delta = ptsDelta(lastPts, (int64_t)vpts);
+                if (delta > -900000 && delta < 900000)
+                    lastAvDeltaMs = (long)(delta / 90 -
+                                   (int64_t)queued * 1000 / outRate);
+            }
         }
         int offset = 0;
         int recoveryTries = 0;
@@ -449,6 +497,11 @@ private:
     unsigned long long syncWaits;
     unsigned long long syncWaitMs;
     unsigned long long syncTimeouts = 0;
+    bool initialSyncDone;
+    long startupSilenceMs;
+    long startupSkipMs;
+    long lastAvDeltaMs;
+    int64_t lastSeenParserPts;
     bool syncEnabled;
     bool softwareVolume;
     int lastAppliedVolume;
