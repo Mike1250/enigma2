@@ -196,6 +196,23 @@ public:
         avcodec_free_context(&ctx);
     }
     bool ready() const { return ctx && parser && pcm; }
+    // Freeze PCM *itself* when ALSA supports hardware pause. Merely stopping
+    // demux reads allows the existing ALSA queue to continue playing during
+    // timeshift pause. Do not use snd_pcm_drop(): it destroys the PTS epoch.
+    void freezePCM()
+    {
+        if (!pcm || snd_pcm_state(pcm) != SND_PCM_STATE_RUNNING) return;
+        const int err = snd_pcm_pause(pcm, 1);
+        if (err < 0 && err != -ENOSYS && err != -EINVAL)
+            audioLog("ALSA pause unsupported/failed: %s", snd_strerror(err));
+    }
+    void unfreezePCM()
+    {
+        if (!pcm || snd_pcm_state(pcm) != SND_PCM_STATE_PAUSED) return;
+        const int err = snd_pcm_pause(pcm, 0);
+        if (err < 0)
+            audioLog("ALSA resume failed: %s", snd_strerror(err));
+    }
     void logStats(unsigned long long tsPackets, unsigned long long payloadPackets,
                   unsigned long long ccGaps, unsigned long long duplicatedPackets,
                   unsigned long long pesStarts, unsigned long long reads,
@@ -223,6 +240,8 @@ public:
         }
         swr_free(&swr);
         lastPts = -1;
+        // APTS from the previous decoder generation is invalid after a seek/zap.
+        ptsRef.store(-1);
         pidPts = AV_NOPTS_VALUE;
         createdAt = std::chrono::steady_clock::now();
         lastSeenParserPts = AV_NOPTS_VALUE;
@@ -364,9 +383,31 @@ private:
             pcmFramesWritten += (unsigned long long)n;
         }
         ++decodedFrames;
+        if (offset < frames) {
+            // Part of this frame was not queued (xrun/write failure).
+            // Its timestamp is not a reliable presentation timestamp.
+            ptsRef.store(-1);
+        }
         if (lastPts >= 0) {
+            // lastPts is the *end of the decoded frame*. It is NOT the audio
+            // presentation position: snd_pcm_writei() only queues samples.
+            // Report the ALSA played position instead, using the PCM delay in
+            // output-rate sample frames. Both counters use the same 90 kHz
+            // MPEG PTS domain; account for 33-bit wrap after subtraction.
             lastPts += (int64_t)frame->nb_samples * 90000 / inputRate;
-            ptsRef.store(lastPts);
+            snd_pcm_sframes_t queued = -1;
+            if (offset == frames && pcm &&
+                snd_pcm_state(pcm) == SND_PCM_STATE_RUNNING &&
+                snd_pcm_delay(pcm, &queued) == 0 && queued >= 0 &&
+                queued <= (snd_pcm_sframes_t)(outRate * 3)) {
+                const int64_t presented = lastPts -
+                    (int64_t)queued * 90000 / outRate;
+                ptsRef.store(presented & ((1LL << 33) - 1));
+            } else {
+                // Do not report submitted PCM as played PCM when ALSA has
+                // not started or does not provide a meaningful delay.
+                ptsRef.store(-1);
+            }
         }
         if (decodedFrames == 1) notice("first decoded audio frame output to ALSA", frames);
     }
@@ -443,6 +484,7 @@ void DreamNextGenAudio::run()
     unsigned long long tsPackets = 0, payloadPackets = 0, ccGaps = 0;
     unsigned long long duplicatedPackets = 0, pesStarts = 0, reads = 0, pollTimeouts = 0;
     time_t lastStats = time(nullptr);
+    bool alsaFrozen = false;
     uint8_t buf[188 * 128];
     while (!m_stop.load()) {
         if (m_flush.exchange(false)) {
@@ -451,7 +493,12 @@ void DreamNextGenAudio::run()
             havePes = false;
             haveCC = false;
         }
-        if (m_paused.load()) { usleep(20000); continue; }
+        if (m_paused.load()) {
+            if (!alsaFrozen) { worker.freezePCM(); alsaFrozen = true; }
+            usleep(20000);
+            continue;
+        }
+        if (alsaFrozen) { worker.unfreezePCM(); alsaFrozen = false; }
         pollfd pfd = {m_demuxFd, POLLIN | POLLERR | POLLHUP, 0};
         int r = ::poll(&pfd, 1, 100);
         if (r <= 0 || !(pfd.revents & POLLIN)) {

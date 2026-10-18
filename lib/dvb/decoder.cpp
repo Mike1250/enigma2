@@ -170,11 +170,43 @@ int eDVBAudio::startPid(int pid, int type)
 	}
 
 #ifdef DREAMNEXTGEN
-	if (m_amlogicAudio) {
-		int result = m_amlogicAudio->start(pid, type);
-		if (result < 0)
-			eWarning("[DreamNextGen-AUDIO] start failed for PID 0x%x type %d: %d", pid, type, result);
-	}
+    // OpenATV DreamNextGen keeps the standard DVB audio-device control
+    // sequence even when the audio stream is consumed via TSDEMUX_TAP.
+    // Mirror AUDIO_SET_BYPASS_MODE -> AUDIO_PLAY -> userspace consumer start.
+    // The userspace PCM decoder remains DreamNextGenAudio in this stage.
+    if (m_fd >= 0) {
+        int bypass = 0;
+        switch (type) {
+        case aMPEG:  bypass = 1;    break;
+        case aDTS:   bypass = 2;    break;
+        case aAAC:   bypass = 8;    break;
+        case aAACHE: bypass = 9;    break;
+        case aLPCM:  bypass = 6;    break;
+        case aDTSHD:bypass = 0x10; break;
+        case aDRA:   bypass = 0x40; break;
+        case aDDP:   bypass = 0x22; break;
+        case aAC3:
+        case aAC4:
+        default:     bypass = 0;    break;
+        }
+        if (::ioctl(m_fd, AUDIO_SET_BYPASS_MODE, bypass) < 0)
+            eWarning("[eDVBAudio%d] AUDIO_SET_BYPASS_MODE(%d) failed: %m", m_dev, bypass);
+        if (::ioctl(m_fd, AUDIO_PLAY) < 0)
+            eWarning("[eDVBAudio%d] AUDIO_PLAY failed: %m", m_dev);
+    }
+    if (m_amlogicAudio) {
+        const int result = m_amlogicAudio->start(pid, type);
+        if (result < 0) {
+            eWarning("[DreamNextGen-AUDIO] start failed for PID 0x%x type %d: %d", pid, type, result);
+            // Fail the whole audio PID start rather than claim successful
+            // playback with no running audio consumer. Keep demux clean.
+            if (m_fd_demux >= 0)
+                ::ioctl(m_fd_demux, DMX_STOP);
+            if (m_fd >= 0)
+                ::ioctl(m_fd, AUDIO_STOP);
+            return result;
+        }
+    }
 #else
 	if (m_fd >= 0)
 	{
@@ -318,10 +350,14 @@ void eDVBAudio::setChannel(int channel)
 int eDVBAudio::getPTS(pts_t &now)
 {
 #ifdef DREAMNEXTGEN
-	if (m_amlogicAudio && m_amlogicAudio->pts() >= 0) {
-		now = m_amlogicAudio->pts();
-		return 0;
-	}
+    if (m_amlogicAudio) {
+        // The kernel audiodsp is not the PCM consumer for TSDEMUX_TAP.
+        // Never report the stub AUDIO_GET_PTS (often zero) as valid APTS.
+        const int64_t presented = m_amlogicAudio->pts();
+        if (presented < 0) return -1;
+        now = presented;
+        return 0;
+    }
 #endif
 	if (m_fd >= 0)
 	{
