@@ -90,3 +90,8 @@ dvbinclude_HEADERS = \
 	dvb/atsc.h \
 	dvb/fcc.h \
 	dvb/fccdecoder.h
+
+# OpenBH DreamOne/DreamTwo FFmpeg + ALSA audio backend
+if DREAMNEXTGEN
+dvb_libenigma_dvb_a_SOURCES += dvb/amlogic_audio.cpp
+endif

@@ -7,6 +7,10 @@
 #include <lib/base/ebase.h>
 #endif
 
+#ifdef DREAMNEXTGEN
+class OpenBHAmlogicAudio;
+#endif
+
 class eSocketNotifier;
 
 class eDVBAudio: public iObject
@@ -15,6 +19,9 @@ class eDVBAudio: public iObject
 private:
 	ePtr<eDVBDemux> m_demux;
 	int m_fd, m_fd_demux, m_dev, m_is_freezed;
+#ifdef DREAMNEXTGEN
+	OpenBHAmlogicAudio *m_amlogicAudio;
+#endif
 public:
 	enum { aMPEG, aAC3, aDTS, aAAC, aAACHE, aLPCM, aDTSHD, aDDP, aDRA, aAC4 };
 	eDVBAudio(eDVBDemux *demux, int dev);

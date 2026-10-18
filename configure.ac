@@ -97,6 +97,16 @@ AS_IF([test "x$enable_amlogic" = "xyes"], [
 AM_CONDITIONAL([DREAMNEXTGEN], [test "x$enable_amlogic" = "xyes"])
 
 
+dnl DreamNextGen only: software DVB audio decoded by FFmpeg and played through ALSA.
+dnl Other distributions/machines never require these libraries.
+AS_IF([test "x$enable_amlogic" = "xyes"], [
+    PKG_CHECK_MODULES([AMLOGIC_AUDIO], [alsa libavcodec libavutil libswresample])
+    CPPFLAGS="$CPPFLAGS $AMLOGIC_AUDIO_CFLAGS"
+    LIBS="$LIBS $AMLOGIC_AUDIO_LIBS"
+])
+
+
+
 AC_ARG_WITH(machinebuild,
 	[  --with-machinebuild=NAME machine build [[none,atemeo5200,atemeo6000...]]],
 	[MACHINEBUILD="$withval"],[MACHINEBUILD="atemeo5200"])

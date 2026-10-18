@@ -4,6 +4,9 @@
 #include <lib/base/eerror.h>
 #include <lib/base/wrappers.h>
 #include <lib/dvb/decoder.h>
+#ifdef DREAMNEXTGEN
+#include <lib/dvb/amlogic_audio.h>
+#endif
 #ifdef HAVE_EGL
 #include <lib/gdi/egl/gegldc.h>
 #endif
@@ -99,6 +102,9 @@ DEFINE_REF(eDVBAudio);
 
 eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 	:m_demux(demux), m_dev(dev)
+#ifdef DREAMNEXTGEN
+	, m_amlogicAudio(nullptr)
+#endif
 {
 	char filename[128] = {};
 	sprintf(filename, "/dev/dvb/adapter%d/audio%d", demux ? demux->adapter : 0, dev);
@@ -117,6 +123,11 @@ eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 		m_fd_demux = -1;
 	}
 
+#ifdef DREAMNEXTGEN
+	if (m_fd_demux >= 0)
+		m_amlogicAudio = new OpenBHAmlogicAudio(m_fd_demux, dev);
+#endif
+
 #ifndef DREAMNEXTGEN
 	if (m_fd >= 0)
 	{
@@ -134,7 +145,11 @@ int eDVBAudio::startPid(int pid, int type)
 
 		pes.pid      = pid;
 		pes.input    = DMX_IN_FRONTEND;
+#ifdef DREAMNEXTGEN
+		pes.output   = DMX_OUT_TSDEMUX_TAP;
+#else
 		pes.output   = DMX_OUT_DECODER;
+#endif
 		switch (m_dev)
 		{
 		case 0:
@@ -167,6 +182,13 @@ int eDVBAudio::startPid(int pid, int type)
 		eDebugNoNewLine("ok\n");
 	}
 
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) {
+		int result = m_amlogicAudio->start(pid, type);
+		if (result < 0)
+			eWarning("[OpenBH-AMLAUDIO] start failed for PID 0x%x type %d: %d", pid, type, result);
+	}
+#else
 	if (m_fd >= 0)
 	{
 		int bypass = 0;
@@ -215,11 +237,15 @@ int eDVBAudio::startPid(int pid, int type)
 		else
 			eDebugNoNewLine("ok\n");
 	}
+#endif // DREAMNEXTGEN
 	return 0;
 }
 
 void eDVBAudio::stop()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) m_amlogicAudio->stop();
+#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_STOP ", m_dev);
@@ -240,6 +266,9 @@ void eDVBAudio::stop()
 
 void eDVBAudio::flush()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) m_amlogicAudio->flush();
+#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_CLEAR_BUFFER ", m_dev);
@@ -252,6 +281,9 @@ void eDVBAudio::flush()
 
 void eDVBAudio::freeze()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) m_amlogicAudio->pause(true);
+#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_PAUSE ", m_dev);
@@ -264,6 +296,9 @@ void eDVBAudio::freeze()
 
 void eDVBAudio::unfreeze()
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio) m_amlogicAudio->pause(false);
+#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_CONTINUE ", m_dev);
@@ -295,6 +330,12 @@ void eDVBAudio::setChannel(int channel)
 
 int eDVBAudio::getPTS(pts_t &now)
 {
+#ifdef DREAMNEXTGEN
+	if (m_amlogicAudio && m_amlogicAudio->pts() >= 0) {
+		now = m_amlogicAudio->pts();
+		return 0;
+	}
+#endif
 	if (m_fd >= 0)
 	{
 		if (::ioctl(m_fd, AUDIO_GET_PTS, &now) < 0)
@@ -305,6 +346,10 @@ int eDVBAudio::getPTS(pts_t &now)
 
 eDVBAudio::~eDVBAudio()
 {
+#ifdef DREAMNEXTGEN
+	delete m_amlogicAudio;
+	m_amlogicAudio = nullptr;
+#endif
 	unfreeze();  // why unfreeze here... but not unfreeze video in ~eDVBVideo ?!?
 	if (m_fd >= 0)
 		::close(m_fd);
