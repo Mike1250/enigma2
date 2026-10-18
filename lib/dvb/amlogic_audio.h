@@ -1,5 +1,5 @@
-#ifndef OPENBH_AMLOGIC_AUDIO_H
-#define OPENBH_AMLOGIC_AUDIO_H
+#ifndef DREAMNEXTGEN_AUDIO_H
+#define DREAMNEXTGEN_AUDIO_H
 
 #ifdef DREAMNEXTGEN
 #include <atomic>
@@ -8,19 +8,19 @@
 
 /* A DVB TS -> FFmpeg -> ALSA PCM audio pipeline for DreamOne/Two.
  * This is deliberately independent of the legacy audiodsp char driver. */
-class OpenBHAmlogicAudio
+class DreamNextGenAudio
 {
 public:
-    OpenBHAmlogicAudio(int demuxFd, int videoDev);
-    ~OpenBHAmlogicAudio();
+    DreamNextGenAudio(int demuxFd, int videoDev);
+    ~DreamNextGenAudio();
     int start(int audioPid, int enigmaAudioType);
     void stop();
     void pause(bool paused);
     void flush();
     int64_t pts() const { return m_pts.load(); }
 private:
-    OpenBHAmlogicAudio(const OpenBHAmlogicAudio &) = delete;
-    OpenBHAmlogicAudio &operator=(const OpenBHAmlogicAudio &) = delete;
+    DreamNextGenAudio(const DreamNextGenAudio &) = delete;
+    DreamNextGenAudio &operator=(const DreamNextGenAudio &) = delete;
     static void *runThread(void *arg);
     void run();
     int m_demuxFd;
