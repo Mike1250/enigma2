@@ -5,7 +5,7 @@
 #include <lib/base/wrappers.h>
 #include <lib/dvb/decoder.h>
 #ifdef DREAMNEXTGEN
-#include <lib/dvb/amlogic_audio.h>
+#include <lib/dvb/tsparser.h>
 #endif
 #ifdef HAVE_EGL
 #include <lib/gdi/egl/gegldc.h>
@@ -84,7 +84,7 @@ DEFINE_REF(eDVBAudio);
 eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 	:m_demux(demux), m_dev(dev)
 #ifdef DREAMNEXTGEN
-	, m_amlogicAudio(nullptr)
+	, m_TsParser(nullptr)
 #endif
 {
 	char filename[128] = {};
@@ -106,7 +106,7 @@ eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 
 #ifdef DREAMNEXTGEN
 	if (m_fd_demux >= 0)
-		m_amlogicAudio = new DreamNextGenAudio(m_fd_demux, dev);
+		m_TsParser = new eTsParser();
 #endif
 
 #ifndef DREAMNEXTGEN
@@ -119,6 +119,9 @@ eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 
 int eDVBAudio::startPid(int pid, int type)
 {
+#ifdef DREAMNEXTGEN
+	if (m_TsParser) m_TsParser->stop();
+#endif
 	if (m_fd_demux >= 0)
 	{
 		dmx_pes_filter_params pes = {};
@@ -173,7 +176,7 @@ int eDVBAudio::startPid(int pid, int type)
     // OpenATV DreamNextGen keeps the standard DVB audio-device control
     // sequence even when the audio stream is consumed via TSDEMUX_TAP.
     // Mirror AUDIO_SET_BYPASS_MODE -> AUDIO_PLAY -> userspace consumer start.
-    // The userspace PCM decoder remains DreamNextGenAudio in this stage.
+    // The userspace audio consumer is now the TS parser with PCM output.
     if (m_fd >= 0) {
         int bypass = 0;
         switch (type) {
@@ -194,8 +197,8 @@ int eDVBAudio::startPid(int pid, int type)
         if (::ioctl(m_fd, AUDIO_PLAY) < 0)
             eWarning("[eDVBAudio%d] AUDIO_PLAY failed: %m", m_dev);
     }
-    if (m_amlogicAudio) {
-        const int result = m_amlogicAudio->start(pid, type);
+    if (m_TsParser) {
+        const int result = m_TsParser->startPid(m_fd_demux);
         if (result < 0) {
             eWarning("[DreamNextGen-AUDIO] start failed for PID 0x%x type %d: %d", pid, type, result);
             // Fail the whole audio PID start rather than claim successful
@@ -263,7 +266,7 @@ int eDVBAudio::startPid(int pid, int type)
 void eDVBAudio::stop()
 {
 #ifdef DREAMNEXTGEN
-	if (m_amlogicAudio) m_amlogicAudio->stop();
+	if (m_TsParser) m_TsParser->stop();
 #endif
 	if (m_fd >= 0)
 	{
@@ -286,7 +289,7 @@ void eDVBAudio::stop()
 void eDVBAudio::flush()
 {
 #ifdef DREAMNEXTGEN
-	if (m_amlogicAudio) m_amlogicAudio->flush();
+	if (m_TsParser) m_TsParser->flush();
 #endif
 	if (m_fd >= 0)
 	{
@@ -301,7 +304,7 @@ void eDVBAudio::flush()
 void eDVBAudio::freeze()
 {
 #ifdef DREAMNEXTGEN
-	if (m_amlogicAudio) m_amlogicAudio->pause(true);
+	if (m_TsParser) m_TsParser->freeze();
 #endif
 	if (m_fd >= 0)
 	{
@@ -316,7 +319,7 @@ void eDVBAudio::freeze()
 void eDVBAudio::unfreeze()
 {
 #ifdef DREAMNEXTGEN
-	if (m_amlogicAudio) m_amlogicAudio->pause(false);
+	if (m_TsParser) m_TsParser->unfreeze();
 #endif
 	if (m_fd >= 0)
 	{
@@ -350,11 +353,11 @@ void eDVBAudio::setChannel(int channel)
 int eDVBAudio::getPTS(pts_t &now)
 {
 #ifdef DREAMNEXTGEN
-    if (m_amlogicAudio) {
+    if (m_TsParser) {
         // The kernel audiodsp is not the PCM consumer for TSDEMUX_TAP.
         // Never report the stub AUDIO_GET_PTS (often zero) as valid APTS.
-        const int64_t presented = m_amlogicAudio->pts();
-        if (presented < 0) return -1;
+        pts_t presented = 0;
+        if (m_TsParser->getPTS(presented)) return -1;
         now = presented;
         return 0;
     }
@@ -370,8 +373,8 @@ int eDVBAudio::getPTS(pts_t &now)
 eDVBAudio::~eDVBAudio()
 {
 #ifdef DREAMNEXTGEN
-	delete m_amlogicAudio;
-	m_amlogicAudio = nullptr;
+	delete m_TsParser;
+	m_TsParser = nullptr;
 #endif
 	unfreeze();  // why unfreeze here... but not unfreeze video in ~eDVBVideo ?!?
 	if (m_fd >= 0)

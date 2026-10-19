@@ -4,7 +4,7 @@
 #include <lib/base/object.h>
 #include <lib/dvb/demux.h>
 #ifdef DREAMNEXTGEN
-class DreamNextGenAudio;
+class eTsParser;
 #endif
 
 class eSocketNotifier;
@@ -16,7 +16,7 @@ private:
 	ePtr<eDVBDemux> m_demux;
 	int m_fd, m_fd_demux, m_dev, m_is_freezed;
 #ifdef DREAMNEXTGEN
-	DreamNextGenAudio *m_amlogicAudio;
+	eTsParser *m_TsParser;
 #endif
 public:
 	enum { aMPEG, aAC3, aDTS, aAAC, aAACHE, aLPCM, aDTSHD, aDDP, aDRA, aAC4 };
