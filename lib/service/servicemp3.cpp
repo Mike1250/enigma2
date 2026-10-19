@@ -2311,6 +2311,43 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			if (m_sourceinfo.is_hls || m_sourceinfo.is_dash)
 				g_object_set(G_OBJECT(m_gst_playbin), "connection-speed", (guint64)(4495000LL), NULL);
 		}
+		/*
+		 * DreamTwo/OpenBH MoviePlayer sound-first handoff (OpenATV-inspired):
+		 * choose concrete media sinks before the playbin state transition,
+		 * rather than selecting the highest-ranked system audio sink.
+		 * This receiver's dreamaudiosink decodes AAC but produced silence;
+		 * gst-launch playbin + alsasink device=hw:0,0 produced audible PCM.
+		 * Native Dreambox video sink already works independently. Do not
+		 * change live DVB eAudioDecoder/eAlsaOutput or the Amlogic driver.
+		 */
+		if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
+		{
+			GstElement *movie_alsa = gst_element_factory_make("alsasink", "movie_audio_hw00");
+			if (movie_alsa)
+			{
+				g_object_set(G_OBJECT(movie_alsa), "device", "hw:0,0", "sync", TRUE, NULL);
+				g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", movie_alsa, NULL);
+				gst_object_unref(movie_alsa);
+				flags |= GST_PLAY_FLAG_SOFT_VOLUME;
+				eDebug("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: selected ALSA hw:0,0 for local movie");
+			}
+			else
+				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: alsasink missing, falling back to default sink");
+
+			/* OpenATV DREAMNEXTGEN explicitly selects dreamvideosink. Keep
+			 * its default hardware pacing (sync=false), which matches the
+			 * existing local video playback. A/V offset is a separate task. */
+			GstElement *movie_video = gst_element_factory_make("dreamvideosink", "movie_amlogic_video");
+			if (movie_video)
+			{
+				g_object_set(G_OBJECT(movie_video), "sync", FALSE, NULL);
+				g_object_set(G_OBJECT(m_gst_playbin), "video-sink", movie_video, NULL);
+				gst_object_unref(movie_video);
+				eDebug("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: selected native dreamvideosink");
+			}
+			else
+				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: dreamvideosink missing; using default video sink");
+		}
 		g_object_set (G_OBJECT (m_gst_playbin), "flags", flags, NULL);
 		g_object_set (G_OBJECT (m_gst_playbin), "uri", uri, NULL);
 		GstElement *subsink = gst_element_factory_make("subsink", "subtitle_sink");
