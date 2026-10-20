@@ -2327,9 +2327,12 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			{
 				g_object_set(G_OBJECT(movie_alsa), "device", "hw:0,0", "sync", TRUE, NULL);
 				g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", movie_alsa, NULL);
-				gst_object_unref(movie_alsa);
+				/* MOVIE_ALSA_V3_LIFETIME: playbin takes ownership of the
+				 * factory-created sink's floating reference. Do NOT unref it
+				 * here: doing so can destroy the sink while playbin uses it,
+				 * leading to a crash when closing MoviePlayer. */
 				flags |= GST_PLAY_FLAG_SOFT_VOLUME;
-				eDebug("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: selected ALSA hw:0,0 for local movie");
+				eDebug("[eServiceMP3] MOVIE_ALSA_V3_LIFETIME: ALSA hw:0,0 handed to playbin");
 			}
 			else
 				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: alsasink missing, falling back to default sink");
@@ -2342,8 +2345,9 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			{
 				g_object_set(G_OBJECT(movie_video), "sync", FALSE, NULL);
 				g_object_set(G_OBJECT(m_gst_playbin), "video-sink", movie_video, NULL);
-				gst_object_unref(movie_video);
-				eDebug("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: selected native dreamvideosink");
+				/* MOVIE_ALSA_V3_LIFETIME: playbin owns the floating sink
+				 * reference after g_object_set(), just as for audio above. */
+				eDebug("[eServiceMP3] MOVIE_ALSA_V3_LIFETIME: native dreamvideosink handed to playbin");
 			}
 			else
 				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: dreamvideosink missing; using default video sink");
@@ -3315,9 +3319,32 @@ RESULT eServiceMP3::seekRelative(int direction, pts_t to)
 
 	int res = seekTo(ppos);
 
-	// Do double seek to same position so to overcome problem with seeking backward and passthrough on for some boxes
+	/* MOVIE_ALSA_V4_SEEK: the legacy second flushing seek works around
+	 * backwards/passthrough issues on some boxes. Do not issue two
+	 * back-to-back GST_SEEK_FLAG_FLUSH operations against this receiver's
+	 * software-decoded PCM -> alsasink movie chain: after the first flush
+	 * the ALSA element may still be re-prerolling, so a second FLUSH can
+	 * interrupt its restart and leave video running without sound.
+	 * Preserve the original workaround for all other sink configurations.
+	 */
 	if (res > -1 && !getHDAudioAuxState(m_gst_playbin))
-		seekTo(ppos);
+	{
+		bool direct_movie_alsa = false;
+		if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
+		{
+			GstElement *selected_audio_sink = NULL;
+			g_object_get(G_OBJECT(m_gst_playbin), "audio-sink", &selected_audio_sink, NULL);
+			if (selected_audio_sink)
+			{
+				direct_movie_alsa = !strcmp(GST_OBJECT_NAME(selected_audio_sink), "movie_audio_hw00");
+				gst_object_unref(selected_audio_sink); /* g_object_get owns the returned ref */
+			}
+		}
+		if (direct_movie_alsa)
+			eDebug("[eServiceMP3] MOVIE_ALSA_V4_SEEK: single flushing seek for direct ALSA movie");
+		else
+			seekTo(ppos);
+	}
 
 	return res;
 }
@@ -5257,7 +5284,23 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						loadCuesheet();
 					updateEpgCacheNowNext();
 
-					if (m_pip_decoder < 0 && (!videoSink || m_ref.getData(0) == 2)) // show radio pic
+					/* MOVIE_ALSA_V3_VIDEO: this OpenBH branch only discovers
+					 * GstDVBVideoSink. The selected Dreambox Amlogic sink
+					 * (movie_amlogic_video) is NOT that type, so videoSink is
+					 * NULL even during working local movie playback. Do not
+					 * open a second DVB still-picture decoder over the movie. */
+					bool has_movie_amlogic_video = false;
+					if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
+					{
+						GstElement *movie_video_sink = NULL;
+						g_object_get(G_OBJECT(m_gst_playbin), "video-sink", &movie_video_sink, NULL);
+						if (movie_video_sink)
+						{
+							has_movie_amlogic_video = !strcmp(GST_OBJECT_NAME(movie_video_sink), "movie_amlogic_video");
+							gst_object_unref(movie_video_sink); /* g_object_get returns a new ref */
+						}
+					}
+					if (m_pip_decoder < 0 && ((!videoSink && !has_movie_amlogic_video) || m_ref.getData(0) == 2)) // show radio pic
 					{
 						bool showRadioBackground = eConfigManager::getConfigBoolValue("config.misc.showradiopic", true);
 						std::string radio_pic = eConfigManager::getConfigValue(showRadioBackground ? "config.misc.radiopic" : "config.misc.blackradiopic");
