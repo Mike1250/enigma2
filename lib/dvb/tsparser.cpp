@@ -959,7 +959,7 @@ void eTsParser::thread()
                 tsPktNum = read(m_fd_demux, tsBuffer, sizeof(tsBuffer));
                 if (tsPktNum <= 0)
                 {
-                    if ((errno == EWOULDBLOCK) | (errno == EAGAIN))
+                    if ((errno == EWOULDBLOCK) | ((errno == EAGAIN || errno == EOVERFLOW)))
                         continue;
                     goto to_end;
                 }

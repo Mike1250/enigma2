@@ -55,7 +55,7 @@ int eAlsaOutput::start(unsigned int rate)
     }
     if (!m_pcm) return -ENODEV;
     int err = snd_pcm_set_params(m_pcm, SND_PCM_FORMAT_S16_LE,
-        SND_PCM_ACCESS_RW_INTERLEAVED, 2, rate, 1, 110000);
+        SND_PCM_ACCESS_RW_INTERLEAVED, 2, rate, 1, 320000);
     if (err < 0) {
         eWarning("[OpenATV-PCM] ALSA configuration failed: %s", snd_strerror(err));
         stop();
@@ -82,17 +82,31 @@ void eAlsaOutput::flush()
     m_presentedPTS.store(-1);
     g_dreamnextgen_audio_presented_pts.store(-1);
 }
+/* Enigma2 native V4: preserve successful unpause; recover failed ALSA resumes. */
+static int e2_native_v4_pause(snd_pcm_t *pcm, int pause_requested)
+{
+    int ret = snd_pcm_pause(pcm, pause_requested);
+    if (ret >= 0 || pause_requested)
+        return ret;
+    ret = snd_pcm_recover(pcm, ret, 1);
+    if (ret >= 0)
+        return ret;
+    snd_pcm_drop(pcm);
+    return snd_pcm_prepare(pcm);
+}
+
 void eAlsaOutput::pause(bool p)
 {
     m_paused.store(p);
     if (!m_pcm) return;
-    if (snd_pcm_pause(m_pcm, p ? 1 : 0) < 0 && p) {
+    if (e2_native_v4_pause(m_pcm, p ? 1 : 0) < 0 && p) {
         /* Unsupported pause: do not flush or invalidate the timeline. */
         eWarning("[OpenATV-PCM] ALSA hardware pause unavailable");
     }
 }
 int eAlsaOutput::pushData(const int16_t *pcm, unsigned int frames, int64_t pts90k)
 {
+	unsigned int e2_v4_eagain_retries = 0;
     if (!m_pcm || !m_rate || !pcm) return -ENODEV;
     if (pts90k >= 0) {
         pts90k &= ((1LL << 33)-1);
@@ -142,7 +156,12 @@ int eAlsaOutput::pushData(const int16_t *pcm, unsigned int frames, int64_t pts90
     unsigned int tries = 0;
     while (remaining && !m_paused.load() && tries++ < 500) {
         snd_pcm_sframes_t n = snd_pcm_writei(m_pcm, pcm, remaining);
-        if (n == -EAGAIN) { usleep(2000); continue; }
+        if (n == -EAGAIN) { if (++e2_v4_eagain_retries == 225 && snd_pcm_state(m_pcm) == SND_PCM_STATE_RUNNING)
+		{
+			/* Restart only a RUNNING PCM that has failed writes for ~450 ms. */
+			flush();
+		}
+		usleep(2000); continue; }
         if (n < 0) {
             if (snd_pcm_recover(m_pcm, (int)n, 1) < 0) return (int)n;
             continue;
