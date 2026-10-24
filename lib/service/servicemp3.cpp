@@ -8,6 +8,7 @@
 #include <lib/base/object.h>
 #include <lib/dvb/epgcache.h>
 #include <lib/dvb/decoder.h>
+#include <lib/dvb/volume.h>
 #ifdef HAVE_EGL
 #include <lib/gdi/egl/gegldc.h>
 #endif
@@ -1899,6 +1900,9 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	m_pump(eApp, 1, "Servicemp3")
 {
 	m_subtitle_sync_timer = eTimer::create(eApp);
+	m_localMovieVolumeTimer = eTimer::create(eApp);
+	m_lastLocalMovieVolume = -1;
+	m_lastLocalMovieMute = -1;
 	m_dvb_subtitle_sync_timer = eTimer::create(eApp);
 	m_dvb_subtitle_parser = new eDVBSubtitleParser();
 	m_dvb_subtitle_parser->connectNewPage(sigc::mem_fun(*this, &eServiceMP3::newDVBSubtitlePage), m_new_dvb_subtitle_page_connection);
@@ -1971,6 +1975,7 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	}
 
 	CONNECT(m_subtitle_sync_timer->timeout, eServiceMP3::pushSubtitles);
+	CONNECT(m_localMovieVolumeTimer->timeout, eServiceMP3::updateLocalMovieVolume);
 	CONNECT(m_dvb_subtitle_sync_timer->timeout, eServiceMP3::pushDVBSubtitles);
 	CONNECT(m_pump.recv_msg, eServiceMP3::gstPoll);
 	CONNECT(m_nownext_timer->timeout, eServiceMP3::updateEpgCacheNowNext);
@@ -2352,7 +2357,16 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			else
 				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: dreamvideosink missing; using default video sink");
 		}
+		/* LOCAL_MOVIE_VOLUME_SYNC_V1: the global Enigma2 volume/mute values
+		 * are not automatically propagated to GStreamer software PCM. */
+		if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
+			flags |= GST_PLAY_FLAG_SOFT_VOLUME;
 		g_object_set (G_OBJECT (m_gst_playbin), "flags", flags, NULL);
+		if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio && m_pip_decoder < 0)
+		{
+			updateLocalMovieVolume();
+			m_localMovieVolumeTimer->start(200, false);
+		}
 		g_object_set (G_OBJECT (m_gst_playbin), "uri", uri, NULL);
 		GstElement *subsink = gst_element_factory_make("subsink", "subtitle_sink");
 		if (!subsink)
@@ -2381,6 +2395,36 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	g_free(uri);
 	if (suburi != NULL)
 		g_free(suburi);
+}
+
+
+/* LOCAL_MOVIE_VOLUME_SYNC_V1
+ * MoviePlayer's ALSA/GStreamer sink is independent of live DVB output.
+ * GStreamer therefore needs an explicit copy of the Enigma2 volume/mute
+ * state. Sample on the Enigma2 event loop (not an ALSA or GStreamer worker),
+ * and write to playbin only when the value has changed.
+ */
+void eServiceMP3::updateLocalMovieVolume()
+{
+	if (!m_gst_playbin || m_sourceinfo.is_streaming || m_sourceinfo.is_audio ||
+	    m_pip_decoder >= 0 || m_state == stStopped)
+		return;
+
+	eDVBVolumecontrol *control = eDVBVolumecontrol::getInstance();
+	if (!control)
+		return;
+	int volume = control->getVolume();
+	if (volume < 0) volume = 0;
+	if (volume > 100) volume = 100;
+	int mute = control->isMuted() ? 1 : 0;
+	if (volume == m_lastLocalMovieVolume && mute == m_lastLocalMovieMute)
+		return;
+	g_object_set(G_OBJECT(m_gst_playbin),
+	             "volume", static_cast<gdouble>(volume) / 100.0,
+	             "mute", static_cast<gboolean>(mute), NULL);
+	m_lastLocalMovieVolume = volume;
+	m_lastLocalMovieMute = mute;
+	eDebug("[eServiceMP3] LOCAL_MOVIE_VOLUME_SYNC_V1 volume=%d mute=%d", volume, mute);
 }
 
 eServiceMP3::~eServiceMP3()
@@ -2972,6 +3016,10 @@ void eServiceMP3::disconnectAsyncSignalHandlers()
 
 RESULT eServiceMP3::stop()
 {
+	/* LOCAL_MOVIE_VOLUME_SYNC_V1: never poll a stopped/destroyed playbin. */
+	if (m_localMovieVolumeTimer) m_localMovieVolumeTimer->stop();
+	m_lastLocalMovieVolume = -1;
+	m_lastLocalMovieMute = -1;
 	m_passthrough_fix_timer->stop();
 	m_dash_recover_timer->stop();
 	/* A switch still waiting on the pipeline to settle - a fresh pipeline

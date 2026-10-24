@@ -534,6 +534,9 @@ private:
 	typedef std::pair<uint32_t, subtitle_page_t> subtitle_pages_map_pair_t;
 	subtitle_pages_map_t m_subtitle_pages;
 	ePtr<eTimer> m_subtitle_sync_timer;
+	ePtr<eTimer> m_localMovieVolumeTimer;
+	int m_lastLocalMovieVolume;
+	int m_lastLocalMovieMute;
 	ePtr<eTimer> m_dvb_subtitle_sync_timer;
 	ePtr<eDVBSubtitleParser> m_dvb_subtitle_parser;
 	ePtr<eConnection> m_new_dvb_subtitle_page_connection;
@@ -579,6 +582,7 @@ private:
 
 	void pushDVBSubtitles();
 	void pushSubtitles();
+	void updateLocalMovieVolume();
 	void pullSubtitle(GstBuffer *buffer);
 	void sourceTimeout();
 	void clearBuffers(bool force=false);
