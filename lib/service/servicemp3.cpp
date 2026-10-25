@@ -8,6 +8,7 @@
 #include <lib/base/object.h>
 #include <lib/dvb/epgcache.h>
 #include <lib/dvb/decoder.h>
+#include <lib/dvb/volume.h>
 #ifdef HAVE_EGL
 #include <lib/gdi/egl/gegldc.h>
 #endif
@@ -2331,6 +2332,14 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 				g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", movie_audio, NULL);
 				g_object_set(G_OBJECT(m_gst_playbin), "volume", (gdouble)1.0, NULL);
 				gst_object_unref(movie_audio);
+				/* Only local video files, only this native dreamaudiosink. */
+				eDVBVolumecontrol *movieVolume = eDVBVolumecontrol::getInstance();
+				if (movieVolume)
+				{
+					m_localMovieVolumeConnection = movieVolume->volumeChanged.connect(
+						sigc::mem_fun(*this, &eServiceMP3::syncLocalMovieVolume));
+					syncLocalMovieVolume();
+				}
 				eDebug("[eServiceMP3] V9 native dreamaudiosink dreamhdmi volume=1; video untouched");
 			}
 			else
@@ -2367,8 +2376,41 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 		g_free(suburi);
 }
 
+/* Follow the Enigma2 VOL+/VOL-/MUTE state for local V9 video files.
+ * Do not reconfigure, pause, replace, or seek the GStreamer pipeline. */
+void eServiceMP3::syncLocalMovieVolume()
+{
+	if (!m_gst_playbin || m_state == stStopped)
+		return;
+	eDVBVolumecontrol *vc = eDVBVolumecontrol::getInstance();
+	if (!vc)
+		return;
+	int percent = vc->getVolume();
+	if (percent < 0) percent = 0;
+	if (percent > 100) percent = 100;
+	const gdouble gain = vc->isMuted() ? 0.0 : (gdouble)percent / 100.0;
+	GstElement *sink = NULL;
+	g_object_get(G_OBJECT(m_gst_playbin), "audio-sink", &sink, NULL);
+	if (!sink)
+		return;
+	/* Avoid operating on a substitute sink or on any stream without V9. */
+	GstElementFactory *factory = gst_element_get_factory(sink);
+	const gchar *factoryName = factory ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)) : NULL;
+	if (factoryName && !strcmp(factoryName, "dreamaudiosink"))
+	{
+		GParamSpec *property = g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "volume");
+		if (property && G_IS_PARAM_SPEC_DOUBLE(property) && (property->flags & G_PARAM_WRITABLE))
+		{
+			g_object_set(G_OBJECT(sink), "volume", gain, NULL);
+			eDebug("[eServiceMP3] V9 local audio volume=%d mute=%d", percent, vc->isMuted());
+		}
+	}
+	gst_object_unref(sink);
+}
+
 eServiceMP3::~eServiceMP3()
 {
+	m_localMovieVolumeConnection.disconnect();
 	// disconnect subtitle callback
 	GstElement *subsink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "subtitle_sink");
 
@@ -2956,6 +2998,8 @@ void eServiceMP3::disconnectAsyncSignalHandlers()
 
 RESULT eServiceMP3::stop()
 {
+	/* Disconnect before handing the original V9 pipeline to stopWorker. */
+	m_localMovieVolumeConnection.disconnect();
 	m_passthrough_fix_timer->stop();
 	m_dash_recover_timer->stop();
 	/* A switch still waiting on the pipeline to settle - a fresh pipeline
