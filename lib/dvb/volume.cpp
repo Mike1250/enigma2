@@ -5,12 +5,6 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
-#include <alsa/asoundlib.h>
-#include <dirent.h>
-#include <ctype.h>
-#include <string.h>
-#endif
 
 #include <linux/dvb/version.h>
 #if DVB_API_VERSION < 3
@@ -33,77 +27,6 @@
 #  define ALSA_CARD "default"
 # endif
 #endif
-
-// Optional OpenATV-style ALSA mixer mirror for IPAudioPlus on DreamNextGen.
-// Unlike enabling HAVE_ALSA globally, this does not replace OpenBH DVB volume.
-// Requires both an explicit marker file and an active ipa_core process.
-#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
-static bool s_ipa_alsa_bridge_ready = false;
-
-static bool e2IPACoreIsRunning()
-{
-    DIR *dir = opendir("/proc");
-    if (!dir)
-        return false;
-    bool found = false;
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL)
-    {
-        if (!isdigit((unsigned char)ent->d_name[0]))
-            continue;
-        char path[128];
-        snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
-        FILE *fd = fopen(path, "r");
-        if (!fd)
-            continue;
-        char name[64] = {0};
-        const bool read_ok = fgets(name, sizeof(name), fd) != NULL;
-        fclose(fd);
-        if (read_ok && (!strcmp(name, "ipa_core\n") || !strcmp(name, "ipa_core")))
-        {
-            found = true;
-            break;
-        }
-    }
-    closedir(dir);
-    return found;
-}
-
-static void e2IPAMirrorAlsaVolume(int percent)
-{
-    // Disabled by default and only applies while the IPA standalone player runs.
-    if (access("/etc/enigma2/ipa_alsa_mirror.enabled", F_OK) != 0 || !e2IPACoreIsRunning())
-        return;
-    if (percent < 0) percent = 0;
-    if (percent > 100) percent = 100;
-    snd_mixer_t *handle = NULL;
-    if (snd_mixer_open(&handle, 0) < 0)
-        return;
-    const char *card = "hw:0";
-    if (snd_mixer_attach(handle, card) < 0 ||
-        snd_mixer_selem_register(handle, NULL, NULL) < 0 ||
-        snd_mixer_load(handle) < 0)
-    {
-        snd_mixer_close(handle);
-        return;
-    }
-    snd_mixer_selem_id_t *sid;
-    snd_mixer_selem_id_alloca(&sid);
-    snd_mixer_selem_id_set_name(sid, "Master");
-    snd_mixer_selem_id_set_index(sid, 0);
-    snd_mixer_elem_t *master = snd_mixer_find_selem(handle, sid);
-    if (master && snd_mixer_selem_has_playback_volume(master))
-    {
-        long min_raw = 0, max_raw = 0;
-        if (snd_mixer_selem_get_playback_volume_range(master, &min_raw, &max_raw) == 0 && max_raw > min_raw)
-        {
-            long raw = min_raw + (max_raw - min_raw) * percent / 100;
-            snd_mixer_selem_set_playback_volume_all(master, raw);
-        }
-    }
-    snd_mixer_close(handle);
-}
-#endif // DREAMNEXTGEN && !HAVE_ALSA
 
 eDVBVolumecontrol* eDVBVolumecontrol::instance = NULL;
 
@@ -218,10 +141,6 @@ void eDVBVolumecontrol::setVolume(int left, int right)
 	leftVol = checkVolume(left);
 	rightVol = checkVolume(right);
 	volumeChanged.emit();
-#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
-	s_ipa_alsa_bridge_ready = true;
-	e2IPAMirrorAlsaVolume(muted ? 0 : leftVol);
-#endif
 
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA leftVol=%d", leftVol);
@@ -293,10 +212,6 @@ void eDVBVolumecontrol::volumeMute()
 	CFile::writeInt("/proc/stb/audio/j1_mute", 1);
 #endif
 	volumeChanged.emit();
-#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
-	if (s_ipa_alsa_bridge_ready)
-		e2IPAMirrorAlsaVolume(0);
-#endif
 }
 
 void eDVBVolumecontrol::volumeUnMute()
@@ -321,10 +236,6 @@ void eDVBVolumecontrol::volumeUnMute()
 	CFile::writeInt("/proc/stb/audio/j1_mute", 0);
 #endif
 	volumeChanged.emit();
-#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
-	if (s_ipa_alsa_bridge_ready)
-		e2IPAMirrorAlsaVolume(leftVol);
-#endif
 }
 
 void eDVBVolumecontrol::volumeToggleMute()
