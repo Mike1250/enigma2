@@ -4825,6 +4825,32 @@ int eServiceMP3::selectAudioStream(int i, bool skipAudioFix)
 	 * either way - cheap, and guards against GStreamer's own selection
 	 * having drifted independently of this bookkeeping.
 	 */
+	/* Do not re-select an already active E-AC3 audio track when a local
+	 * movie first reaches PLAYING. playbin may have autoselected track 0
+	 * before this notification. Re-setting current-audio can send a new
+	 * selector RECONFIGURE downstream and restart the first audio buffers.
+	 * E-AC3 needs no auxiliary transcoding in this source implementation.
+	 * Keep the existing native dreamaudiosink and its volume bridge intact.
+	 */
+	if (!skipAudioFix && !m_sourceinfo.is_streaming && !m_sourceinfo.is_audio &&
+		!m_initial_start && m_pip_decoder < 0 &&
+		(m_currentAudioStream < 0 || m_currentAudioStream == i) &&
+		m_audioStreams[i].type == atEAC3 &&
+		hdAudioAuxModeForCodec(m_audioStreams[i].codec) == hdAuxNone &&
+		!getHDAudioAuxState(m_gst_playbin))
+	{
+		gint active_audio = -1;
+		g_object_get(G_OBJECT(m_gst_playbin), "current-audio", &active_audio, NULL);
+		if (active_audio == i)
+		{
+			eDebug("[eServiceMP3] E-AC3 startup: keeping already active audio track %d (no redundant reconfiguration)", i);
+			m_currentAudioStream = i;
+			m_event((iPlayableService*)this, evUpdatedInfo);
+			setCacheEntry(true, i);
+			return 0;
+		}
+	}
+
 	const bool isActualAudioSwitch = (i != m_currentAudioStream);
 
 	/*
