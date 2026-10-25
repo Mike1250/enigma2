@@ -126,7 +126,7 @@ int eAlsaOutput::pushData(const int16_t *pcm, unsigned int frames, int64_t pts90
     if (video >= 0) {
         int64_t audioPresent = (m_nextPTS - queued * 90000 / m_rate) & ((1LL << 33)-1);
         int64_t err = eAVSyncCore::delta90k(audioPresent, video);
-        if (llabs(err) < 5 * 90000) { /* only same PTS epoch */
+        if (llabs(err) < 15 * 90000) { /* only same PTS epoch */
             if (err < -9000) {
                 unsigned int drop = (unsigned int)std::min<int64_t>(frames,(-err - 4500)*m_rate/90000);
                 pcm += 2 * drop;

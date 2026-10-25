@@ -3319,9 +3319,32 @@ RESULT eServiceMP3::seekRelative(int direction, pts_t to)
 
 	int res = seekTo(ppos);
 
-	// Do double seek to same position so to overcome problem with seeking backward and passthrough on for some boxes
+	/* MOVIE_ALSA_V4_SEEK: the legacy second flushing seek works around
+	 * backwards/passthrough issues on some boxes. Do not issue two
+	 * back-to-back GST_SEEK_FLAG_FLUSH operations against this receiver's
+	 * software-decoded PCM -> alsasink movie chain: after the first flush
+	 * the ALSA element may still be re-prerolling, so a second FLUSH can
+	 * interrupt its restart and leave video running without sound.
+	 * Preserve the original workaround for all other sink configurations.
+	 */
 	if (res > -1 && !getHDAudioAuxState(m_gst_playbin))
-		seekTo(ppos);
+	{
+		bool direct_movie_alsa = false;
+		if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
+		{
+			GstElement *selected_audio_sink = NULL;
+			g_object_get(G_OBJECT(m_gst_playbin), "audio-sink", &selected_audio_sink, NULL);
+			if (selected_audio_sink)
+			{
+				direct_movie_alsa = !strcmp(GST_OBJECT_NAME(selected_audio_sink), "movie_audio_hw00");
+				gst_object_unref(selected_audio_sink); /* g_object_get owns the returned ref */
+			}
+		}
+		if (direct_movie_alsa)
+			eDebug("[eServiceMP3] MOVIE_ALSA_V4_SEEK: single flushing seek for direct ALSA movie");
+		else
+			seekTo(ppos);
+	}
 
 	return res;
 }
