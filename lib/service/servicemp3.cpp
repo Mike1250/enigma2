@@ -8,7 +8,6 @@
 #include <lib/base/object.h>
 #include <lib/dvb/epgcache.h>
 #include <lib/dvb/decoder.h>
-#include <lib/dvb/volume.h>
 #ifdef HAVE_EGL
 #include <lib/gdi/egl/gegldc.h>
 #endif
@@ -2355,21 +2354,6 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 		}
 		g_object_set (G_OBJECT (m_gst_playbin), "flags", flags, NULL);
 		g_object_set (G_OBJECT (m_gst_playbin), "uri", uri, NULL);
-		/* MoviePlayer audio only: the existing alsasink hw:0,0 path uses
-		 * playbin's software-volume flag. Mirror Enigma2 VOL/MUTE into it;
-		 * no timers, decoder resets, seeks or changes to sink lifetime. */
-		if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio &&
-			(flags & GST_PLAY_FLAG_SOFT_VOLUME))
-		{
-			eDVBVolumecontrol *volume = eDVBVolumecontrol::getInstance();
-			if (volume)
-			{
-				m_localMovieVolumeConnection = volume->volumeChanged.connect(
-					sigc::mem_fun(*this, &eServiceMP3::syncLocalMovieVolume));
-				syncLocalMovieVolume();
-			}
-		}
-
 		GstElement *subsink = gst_element_factory_make("subsink", "subtitle_sink");
 		if (!subsink)
 			eDebug("[eServiceMP3] sorry, can't play: missing gst-plugin-subsink");
@@ -2399,28 +2383,8 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 		g_free(suburi);
 }
 
-/* AUDIO_VOLUME_ONLY: retain all MoviePlayer media/seek/stop code from
- * the supplied source. Only the playbin audio gain/mute is adjusted. */
-void eServiceMP3::syncLocalMovieVolume()
-{
-	if (!m_gst_playbin)
-		return;
-	eDVBVolumecontrol *volume = eDVBVolumecontrol::getInstance();
-	if (!volume)
-		return;
-	int level = volume->getVolume();
-	if (level < 0) level = 0;
-	if (level > 100) level = 100;
-	gboolean mute = volume->isMuted() ? TRUE : FALSE;
-	g_object_set(G_OBJECT(m_gst_playbin),
-		"volume", static_cast<gdouble>(level) / 100.0,
-		"mute", mute, NULL);
-	eDebug("[eServiceMP3] AUDIO_VOLUME_ONLY level=%d mute=%d", level, mute != FALSE);
-}
-
 eServiceMP3::~eServiceMP3()
 {
-	m_localMovieVolumeConnection.disconnect();
 	// disconnect subtitle callback
 	GstElement *subsink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "subtitle_sink");
 
@@ -3008,7 +2972,6 @@ void eServiceMP3::disconnectAsyncSignalHandlers()
 
 RESULT eServiceMP3::stop()
 {
-	m_localMovieVolumeConnection.disconnect();
 	m_passthrough_fix_timer->stop();
 	m_dash_recover_timer->stop();
 	/* A switch still waiting on the pipeline to settle - a fresh pipeline

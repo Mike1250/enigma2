@@ -140,7 +140,6 @@ void eDVBVolumecontrol::setVolume(int left, int right)
 		/* left, right is 0..100 */
 	leftVol = checkVolume(left);
 	rightVol = checkVolume(right);
-	volumeChanged.emit();
 
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA leftVol=%d", leftVol);
@@ -211,7 +210,6 @@ void eDVBVolumecontrol::volumeMute()
 	//HACK?
 	CFile::writeInt("/proc/stb/audio/j1_mute", 1);
 #endif
-	volumeChanged.emit();
 }
 
 void eDVBVolumecontrol::volumeUnMute()
@@ -235,7 +233,6 @@ void eDVBVolumecontrol::volumeUnMute()
 	//HACK?
 	CFile::writeInt("/proc/stb/audio/j1_mute", 0);
 #endif
-	volumeChanged.emit();
 }
 
 void eDVBVolumecontrol::volumeToggleMute()

@@ -12,7 +12,6 @@
 #include <lib/gui/esubtitle.h>
 #include <atomic>
 #include <memory>
-#include <sigc++/sigc++.h>
 
 class eStaticServiceMP3Info;
 
@@ -518,8 +517,6 @@ private:
 	static void handleElementAdded(GstBin *bin, GstElement *element, gpointer user_data);
 	static void handleDeepElementAdded(GstBin *bin, GstBin *sub_bin, GstElement *element, gpointer user_data);
 	void disconnectAsyncSignalHandlers();
-	void syncLocalMovieVolume();
-	sigc::connection m_localMovieVolumeConnection;
 
 	struct subtitle_page_t
 	{

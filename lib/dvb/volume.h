@@ -6,9 +6,6 @@
 #endif
 
 #include <lib/base/ebase.h>
-#ifndef SWIG
-#include <sigc++/sigc++.h>
-#endif
 
 class eDVBVolumecontrol
 {
@@ -32,9 +29,6 @@ private:
 	int checkVolume(int vol);
 
 public:
-#ifndef SWIG
-	sigc::signal<void()> volumeChanged;
-#endif
 	static eDVBVolumecontrol* getInstance();
 
 	void setVolumeSteps(int steps);
