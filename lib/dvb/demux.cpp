@@ -1288,7 +1288,31 @@ RESULT eDVBTSRecorder::start()
 		return -3;
 	}
 
-	setBufferSize(1024*1024);
+	/* The time-shift recorder carries BOTH audio and video TS packets.
+	 * Its recording file is created by eDVBServicePlay::startTimeshift()
+	 * with the basename timeshift.XXXXXX. Do not change ordinary recordings,
+	 * Live-TV or the movie-player/GStreamer sink.
+	 * Request the larger demux ring BEFORE DMX_SET_PES_FILTER/DMX_START;
+	 * keep a bounded fallback for drivers that reject large allocations.
+	 */
+	const bool is_timeshift_recording =
+		m_target_filename.find("/timeshift.") != std::string::npos;
+	if (is_timeshift_recording)
+	{
+		if (setBufferSize(4 * 1024 * 1024) < 0)
+		{
+			eWarning("[eDVBTSRecorder] 4 MiB timeshift demux buffer unavailable; trying 2 MiB");
+			if (setBufferSize(2 * 1024 * 1024) < 0)
+			{
+				eWarning("[eDVBTSRecorder] 2 MiB timeshift demux buffer unavailable; reverting to 1 MiB");
+				setBufferSize(1024 * 1024);
+			}
+		}
+		else
+			eDebug("[eDVBTSRecorder] 4 MiB timeshift audio+video TS demux buffer requested");
+	}
+	else
+		setBufferSize(1024 * 1024);
 
 	dmx_pes_filter_params flt = {};
 	memset(&flt, 0, sizeof(flt));
