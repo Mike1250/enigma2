@@ -5,7 +5,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-/* OpenBH IPAudioPlus: native, session-scoped OpenATV-style Master volume.
+/* OpenBH IPAudioPlus V2: native, session-scoped OpenATV-style Master volume.
  * Active only for the GStreamer audio-only playbin used by IPAudioPlus.
  * The dlopen path avoids changing existing Enigma2 ALSA link flags.
  * This section is intentionally built only for the non-HAVE_ALSA OpenBH
@@ -49,7 +49,9 @@ static bool ipaNativePlayerActive()
         const ssize_t n = read(fd, cmd, sizeof(cmd));
         close(fd);
         if (n <= 0) continue;
-        bool gst = false, playbin = false, flags = false, video = false, audio = false;
+        /* GStreamer IPAudioPlus may format playbin flags differently on OpenBH;
+         * identify the audio-only ALSA playbin by its defining arguments. */
+        bool gst = false, playbin = false, video = false, audio = false;
         size_t offset = 0;
         bool first = true;
         while (offset < static_cast<size_t>(n))
@@ -67,12 +69,11 @@ static bool ipaNativePlayerActive()
                 first = false;
             }
             else if (strcmp(arg, "playbin") == 0) playbin = true;
-            else if (strcmp(arg, "flags=0x02") == 0) flags = true;
             else if (strcmp(arg, "video-sink=fakesink") == 0) video = true;
             else if (strncmp(arg, "audio-sink=alsasink", 19) == 0) audio = true;
             offset += len + 1;
         }
-        active = gst && playbin && flags && video && audio;
+        active = gst && playbin && video && audio;
     }
     closedir(dir);
     return active;
@@ -300,13 +301,14 @@ eDVBVolumecontrol::eDVBVolumecontrol()
 	setVolume(100, 100);
 #ifndef HAVE_ALSA
 	/* Native event-driven IPAudioPlus gain plus timer for start/stop only. */
-	if (ipaNativeEnabled() && eApp)
+	if (eApp)
 	{
 		m_ipaNativeTimer = eTimer::create(eApp);
 		m_ipaNativeConnection = m_ipaNativeTimer->timeout.connect(
 			sigc::mem_fun(*this, &eDVBVolumecontrol::ipaNativeTick));
 		m_ipaNativeTimer->start(600, false);
-		if (ipaNativePlayerActive())
+		eDebug("[IPA Native Master V2] Watcher initialized (inactive until enabled flag)");
+		if (ipaNativeEnabled() && ipaNativePlayerActive())
 			ipaNativeSession.sync(muted ? 0 : leftVol, true);
 	}
 #endif
@@ -405,6 +407,12 @@ void eDVBVolumecontrol::setVolume(int left, int right)
 	leftVol = checkVolume(left);
 	rightVol = checkVolume(right);
 	volumeChanged.emit();
+	/* V2: this MUST run before the DVB mixer branch: that branch can return
+	 * early when /dev/dvb/adapter0/audio0 is available. */
+#ifndef HAVE_ALSA
+	if (ipaNativeEnabled() || ipaNativeSession.active)
+		ipaNativeSession.sync(muted ? 0 : leftVol, ipaNativePlayerActive());
+#endif
 
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA leftVol=%d", leftVol);
@@ -440,11 +448,6 @@ void eDVBVolumecontrol::setVolume(int left, int right)
 
 	//HACK?
 	CFile::writeInt("/proc/stb/avs/0/volume", left); /* in -1dB */
-#endif
-#ifndef HAVE_ALSA
-	/* An IPAudioPlus GStreamer stream receives the change immediately. */
-	if (m_ipaNativeTimer && (ipaNativeEnabled() || ipaNativeSession.active))
-		ipaNativeSession.sync(muted ? 0 : leftVol, ipaNativePlayerActive());
 #endif
 }
 
@@ -482,7 +485,7 @@ void eDVBVolumecontrol::volumeMute()
 #endif
 	volumeChanged.emit();
 #ifndef HAVE_ALSA
-	if (m_ipaNativeTimer && (ipaNativeEnabled() || ipaNativeSession.active))
+	if (ipaNativeEnabled() || ipaNativeSession.active)
 		ipaNativeSession.sync(0, ipaNativePlayerActive());
 #endif
 }
@@ -510,7 +513,7 @@ void eDVBVolumecontrol::volumeUnMute()
 #endif
 	volumeChanged.emit();
 #ifndef HAVE_ALSA
-	if (m_ipaNativeTimer && (ipaNativeEnabled() || ipaNativeSession.active))
+	if (ipaNativeEnabled() || ipaNativeSession.active)
 		ipaNativeSession.sync(leftVol, ipaNativePlayerActive());
 #endif
 }
@@ -526,9 +529,17 @@ void eDVBVolumecontrol::volumeToggleMute()
 #ifndef HAVE_ALSA
 void eDVBVolumecontrol::ipaNativeTick()
 {
-    /* The timer does not poll volume: its sole job is session startup/cleanup.
-     * VOL+/VOL-/MUTE are handled synchronously in the methods above. */
-    if (!ipaNativeEnabled())
+    /* The timer handles session startup/cleanup; volume changes happen
+     * synchronously in setVolume, volumeMute and volumeUnMute. */
+    static bool previouslyEnabled = false;
+    const bool enabled = ipaNativeEnabled();
+    if (enabled != previouslyEnabled)
+    {
+        eDebug("[IPA Native Master V2] %s", enabled ?
+            "Enabled; checking for IPAudioPlus GStreamer" : "Disabled");
+        previouslyEnabled = enabled;
+    }
+    if (!enabled)
     {
         ipaNativeSession.finish();
         return;
