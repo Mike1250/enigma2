@@ -29,6 +29,15 @@ private:
 	int leftVol, rightVol;
 	int m_volsteps;
 
+#ifndef SWIG
+#ifndef HAVE_ALSA
+	/* Native, in-process IPAudioPlus GStreamer session watcher. */
+	ePtr<eTimer> m_ipaNativeTimer;
+	sigc::connection m_ipaNativeConnection;
+	void ipaNativeTick();
+#endif
+#endif
+
 	int checkVolume(int vol);
 
 public:
