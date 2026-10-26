@@ -5,7 +5,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-/* OpenBH IPAudioPlus V2: native, session-scoped OpenATV-style Master volume.
+/* OpenBH IPAudioPlus V4: automatic native Master volume with lightweight player detection.
  * Active only for the GStreamer audio-only playbin used by IPAudioPlus.
  * The dlopen path avoids changing existing Enigma2 ALSA link flags.
  * This section is intentionally built only for the non-HAVE_ALSA OpenBH
@@ -19,61 +19,88 @@
 #include <string.h>
 
 namespace {
-static const char * const ipaNativeFlag = "/etc/enigma2/ipa_native_volume.enabled";
-
-static bool ipaNativeEnabled()
-{
-    return access(ipaNativeFlag, F_OK) == 0;
-}
-
 /* Match exact IPAudioPlus audio-only gst-launch signature, not generic video.
  * The private URL remains in /proc only and is never logged or copied out.
  */
+/* Avoid scanning every /proc/<pid>/cmdline on every VOL button press or
+ * every timer tick.  First check the cached player PID; an idle search reads
+ * only /proc/<pid>/comm before opening any command line.
+ * Process discovery is only used for the audio-only GStreamer output, never
+ * for DVB tuner channels, movie files or protected IPAudioPlus URLs.
+ */
+static unsigned long ipaNativeTrackedPid = 0;
+
+static bool ipaNativeMatchesPid(unsigned long pid)
+{
+    if (!pid) return false;
+    char file[96];
+    snprintf(file, sizeof(file), "/proc/%lu/comm", pid);
+    int fd = open(file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char comm[40];
+    ssize_t c = read(fd, comm, sizeof(comm) - 1);
+    close(fd);
+    if (c <= 0) return false;
+    comm[c] = 0;
+    if (c > 0 && comm[c - 1] == '\n') comm[c - 1] = 0;
+    if (strcmp(comm, "gst-launch-1.0") != 0) return false;
+
+    snprintf(file, sizeof(file), "/proc/%lu/cmdline", pid);
+    fd = open(file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char cmd[16384];
+    const ssize_t n = read(fd, cmd, sizeof(cmd));
+    close(fd);
+    if (n <= 0) return false;
+
+    bool gst = false, playbin = false, video = false, audio = false;
+    size_t offset = 0;
+    bool first = true;
+    while (offset < static_cast<size_t>(n))
+    {
+        const char *arg = cmd + offset;
+        const size_t avail = static_cast<size_t>(n) - offset;
+        const size_t len = strnlen(arg, avail);
+        if (len == avail) break;
+        if (first)
+        {
+            const char *base = strrchr(arg, '/');
+            base = base ? base + 1 : arg;
+            gst = strcmp(base, "gst-launch-1.0") == 0;
+            if (!gst) break;
+            first = false;
+        }
+        else if (strcmp(arg, "playbin") == 0) playbin = true;
+        else if (strcmp(arg, "video-sink=fakesink") == 0) video = true;
+        else if (strncmp(arg, "audio-sink=alsasink", 19) == 0) audio = true;
+        offset += len + 1;
+    }
+    return gst && playbin && video && audio;
+}
+
 static bool ipaNativePlayerActive()
 {
+    if (ipaNativeTrackedPid)
+    {
+        if (ipaNativeMatchesPid(ipaNativeTrackedPid)) return true;
+        ipaNativeTrackedPid = 0;
+    }
     DIR *dir = opendir("/proc");
     if (!dir) return false;
     bool active = false;
     struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL && !active)
+    while ((entry = readdir(dir)) != NULL)
     {
         if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
         char *end = NULL;
         const unsigned long pid = strtoul(entry->d_name, &end, 10);
         if (!end || *end != '\0' || pid == 0) continue;
-        char file[96];
-        snprintf(file, sizeof(file), "/proc/%lu/cmdline", pid);
-        int fd = open(file, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) continue;
-        char cmd[16384];
-        const ssize_t n = read(fd, cmd, sizeof(cmd));
-        close(fd);
-        if (n <= 0) continue;
-        /* GStreamer IPAudioPlus may format playbin flags differently on OpenBH;
-         * identify the audio-only ALSA playbin by its defining arguments. */
-        bool gst = false, playbin = false, video = false, audio = false;
-        size_t offset = 0;
-        bool first = true;
-        while (offset < static_cast<size_t>(n))
+        if (ipaNativeMatchesPid(pid))
         {
-            const char *arg = cmd + offset;
-            const size_t avail = static_cast<size_t>(n) - offset;
-            const size_t len = strnlen(arg, avail);
-            if (len == avail) break;
-            if (first)
-            {
-                const char *base = strrchr(arg, '/');
-                base = base ? base + 1 : arg;
-                gst = strcmp(base, "gst-launch-1.0") == 0;
-                if (!gst) break;
-                first = false;
-            }
-            else if (strcmp(arg, "playbin") == 0) playbin = true;
-            else if (strcmp(arg, "video-sink=fakesink") == 0) video = true;
-            else if (strncmp(arg, "audio-sink=alsasink", 19) == 0) audio = true;
-            offset += len + 1;
+            ipaNativeTrackedPid = pid;
+            active = true;
+            break;
         }
-        active = gst && playbin && video && audio;
     }
     closedir(dir);
     return active;
@@ -227,7 +254,7 @@ struct IpaNativeSession
     }
     void sync(int level, bool present)
     {
-        if (!ipaNativeEnabled() || !present)
+        if (!present)
         {
             finish();
             return;
@@ -291,7 +318,7 @@ eDVBVolumecontrol* eDVBVolumecontrol::getInstance()
 }
 
 eDVBVolumecontrol::eDVBVolumecontrol()
-:m_volsteps(5)
+:muted(false), leftVol(100), rightVol(100), m_volsteps(5)
 {
 #ifdef HAVE_ALSA
 	mainVolume = NULL;
@@ -300,16 +327,15 @@ eDVBVolumecontrol::eDVBVolumecontrol()
 	volumeUnMute();
 	setVolume(100, 100);
 #ifndef HAVE_ALSA
-	/* Native event-driven IPAudioPlus gain plus timer for start/stop only. */
+	/* Native Master updates are event-driven; timer only watches process
+	 * start/stop. One-shot rescheduling reduces GUI-loop /proc work. */
 	if (eApp)
 	{
 		m_ipaNativeTimer = eTimer::create(eApp);
 		m_ipaNativeConnection = m_ipaNativeTimer->timeout.connect(
 			sigc::mem_fun(*this, &eDVBVolumecontrol::ipaNativeTick));
-		m_ipaNativeTimer->start(600, false);
-		eDebug("[IPA Native Master V2] Watcher initialized (inactive until enabled flag)");
-		if (ipaNativeEnabled() && ipaNativePlayerActive())
-			ipaNativeSession.sync(muted ? 0 : leftVol, true);
+		m_ipaNativeTimer->start(1200, true);
+		eDebug("[IPA Native Master V4] Automatic native gain; cached process detection");
 	}
 #endif
 }
@@ -404,14 +430,21 @@ int eDVBVolumecontrol::checkVolume(int vol)
 void eDVBVolumecontrol::setVolume(int left, int right)
 {
 		/* left, right is 0..100 */
-	leftVol = checkVolume(left);
-	rightVol = checkVolume(right);
-	volumeChanged.emit();
-	/* V2: this MUST run before the DVB mixer branch: that branch can return
-	 * early when /dev/dvb/adapter0/audio0 is available. */
+	const int checkedLeft = checkVolume(left);
+	const int checkedRight = checkVolume(right);
+	const bool volumeActuallyChanged = (checkedLeft != leftVol || checkedRight != rightVol);
+	leftVol = checkedLeft;
+	rightVol = checkedRight;
+	/* Movie notification is only necessary on a change.  During live DVB
+	 * zapping Enigma2 may reassert the same volume repeatedly; do not wake
+	 * a local-media callback unless the gain really changed. */
+	if (volumeActuallyChanged)
+		volumeChanged.emit();
+	/* V4: use the cached native session; /proc discovery happens on a timer.
+	 * Gain still reaches IPAudioPlus before the original DVB early-return. */
 #ifndef HAVE_ALSA
-	if (ipaNativeEnabled() || ipaNativeSession.active)
-		ipaNativeSession.sync(muted ? 0 : leftVol, ipaNativePlayerActive());
+	if (ipaNativeSession.active)
+		ipaNativeSession.sync(muted ? 0 : leftVol, true);
 #endif
 
 #ifdef HAVE_ALSA
@@ -464,6 +497,7 @@ bool eDVBVolumecontrol::isMuted()
 
 void eDVBVolumecontrol::volumeMute()
 {
+	const bool muteActuallyChanged = !muted;
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA Mute");
 	if (mainVolume)
@@ -483,15 +517,17 @@ void eDVBVolumecontrol::volumeMute()
 	//HACK?
 	CFile::writeInt("/proc/stb/audio/j1_mute", 1);
 #endif
-	volumeChanged.emit();
+	if (muteActuallyChanged)
+		volumeChanged.emit();
 #ifndef HAVE_ALSA
-	if (ipaNativeEnabled() || ipaNativeSession.active)
-		ipaNativeSession.sync(0, ipaNativePlayerActive());
+	if (ipaNativeSession.active)
+		ipaNativeSession.sync(0, true);
 #endif
 }
 
 void eDVBVolumecontrol::volumeUnMute()
 {
+	const bool muteActuallyChanged = muted;
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA unMute to %d", leftVol);
 	if (mainVolume)
@@ -511,10 +547,11 @@ void eDVBVolumecontrol::volumeUnMute()
 	//HACK?
 	CFile::writeInt("/proc/stb/audio/j1_mute", 0);
 #endif
-	volumeChanged.emit();
+	if (muteActuallyChanged)
+		volumeChanged.emit();
 #ifndef HAVE_ALSA
-	if (ipaNativeEnabled() || ipaNativeSession.active)
-		ipaNativeSession.sync(leftVol, ipaNativePlayerActive());
+	if (ipaNativeSession.active)
+		ipaNativeSession.sync(leftVol, true);
 #endif
 }
 
@@ -529,21 +566,13 @@ void eDVBVolumecontrol::volumeToggleMute()
 #ifndef HAVE_ALSA
 void eDVBVolumecontrol::ipaNativeTick()
 {
-    /* The timer handles session startup/cleanup; volume changes happen
-     * synchronously in setVolume, volumeMute and volumeUnMute. */
-    static bool previouslyEnabled = false;
-    const bool enabled = ipaNativeEnabled();
-    if (enabled != previouslyEnabled)
-    {
-        eDebug("[IPA Native Master V2] %s", enabled ?
-            "Enabled; checking for IPAudioPlus GStreamer" : "Disabled");
-        previouslyEnabled = enabled;
-    }
-    if (!enabled)
-    {
-        ipaNativeSession.finish();
-        return;
-    }
-    ipaNativeSession.sync(muted ? 0 : leftVol, ipaNativePlayerActive());
+    /* Only player start/stop discovery runs here.  When inactive, scan /proc
+     * about once every 1.2s (never on remote keys); while active validate
+     * the cached PID once per 0.8s. No external program, flag or JSON file.
+     */
+    const bool present = ipaNativePlayerActive();
+    ipaNativeSession.sync(muted ? 0 : leftVol, present);
+    if (m_ipaNativeTimer)
+        m_ipaNativeTimer->start(present ? 800 : 1200, true);
 }
 #endif
