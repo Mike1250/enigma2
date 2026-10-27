@@ -1299,7 +1299,7 @@ RESULT eDVBTSRecorder::start()
 		m_target_filename.find("/timeshift.") != std::string::npos;
 	if (is_timeshift_recording)
 	{
-		if (setBufferSize(4 * 1024 * 1024) < 0)
+		if (setBufferSize(2 * 1024 * 1024) < 0)
 		{
 			eWarning("[eDVBTSRecorder] 4 MiB timeshift demux buffer unavailable; trying 2 MiB");
 			if (setBufferSize(2 * 1024 * 1024) < 0)
