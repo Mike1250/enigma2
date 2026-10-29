@@ -2514,6 +2514,15 @@ class InfoBarSeek:
 				self.unPauseService()
 
 	def pauseService(self):
+		# Native MediaPlayer's pauseEntry() can call pauseService() again
+		# when the file list has focus. Toggle only this screen; other
+		# InfoBarSeek users (including DVB/timeshift) are unchanged.
+		if (self.seekstate == self.SEEK_STATE_PAUSE
+				and self.__class__.__module__ == "Plugins.Extensions.MediaPlayer.plugin"
+				and self.__class__.__name__ == "MediaPlayer"):
+			print("[DREAM_MEDIAPLAYER_NATIVE_TOGGLE_V1] resume from pauseService")
+			self.unPauseService()
+			return
 		if self.seekstate != self.SEEK_STATE_EOF:
 			self.lastseekstate = self.seekstate
 		self.setSeekState(self.SEEK_STATE_PAUSE)
