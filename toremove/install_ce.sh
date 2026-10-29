@@ -1,7 +1,5 @@
 #!/bin/sh
 # DreamTwo: silent vendor configuration and DTB installation
-exec >/dev/null 2>&1
-set -eu
 
 CFG_URL='https://raw.githubusercontent.com/Mike1250/enigma2/refs/heads/amlogic/toremove/cfg_fp.ini'
 DTB_URL='https://raw.githubusercontent.com/Mike1250/enigma2/refs/heads/amlogic/toremove/dtb.img'
