@@ -1,4 +1,6 @@
 #!/bin/sh
+exec >/dev/null 2>&1
+set -eu
 # DreamTwo / Amlogic: update /dev/vendor front-panel configuration and /dev/dtb.
 # Run as root. This script removes its own /tmp copy when it exits.
 set -eu
