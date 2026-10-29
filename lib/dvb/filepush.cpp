@@ -1,4 +1,7 @@
 #include "filepush.h"
+#include "timeshiftgap.h"
+#include <stdlib.h>
+#include <string.h>
 #include <lib/base/eerror.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -69,6 +72,27 @@ void eFilePushThread::thread()
 		size_t current_span_remaining = 0;
 		m_sof = 0;
 
+		/* Timeshift-only PTS gap compensator. No impact on ordinary PVR,
+		 * live DVB, MoviePlayer, or the recording writer. */
+		eTimeshiftGapClock ts_gap;
+		bool ts_gap_position_valid = false;
+		off_t ts_gap_next_position = 0;
+		uint64_t ts_gap_max_ms = 120000; // cap corrupt PTS, configurable up to ten minutes
+		const char *gap_enabled_env = getenv("OPENBH_TIMESHIFT_GAP");
+		const bool ts_gap_enabled = m_flags == 1 && m_blocksize == 188 &&
+			(!gap_enabled_env || strcmp(gap_enabled_env, "0") != 0);
+		if (m_flags == 1)
+			eDebug("[OPENBH_TIMESHIFT_GAP_V2] START enabled=%d blocksize=%d",
+				ts_gap_enabled ? 1 : 0, m_blocksize);
+		const char *max_ms_env = getenv("OPENBH_TIMESHIFT_GAP_MAX_MS");
+		if (max_ms_env && *max_ms_env)
+		{
+			char *end = NULL;
+			unsigned long long configured = strtoull(max_ms_env, &end, 10);
+			if (end != max_ms_env && *end == '\0' && configured >= 1000 && configured <= 600000)
+				ts_gap_max_ms = configured;
+		}
+
 		while (!m_stop)
 		{
 			// eTrace("[FilePushThread][DATA] Pumping data at pos=%lld", (long long)m_current_position);
@@ -85,6 +109,15 @@ void eFilePushThread::thread()
 			/* if we have a source span, don't read past the end */
 			if (m_sg && maxread > current_span_remaining)
 				maxread = current_span_remaining;
+
+			/* Timeshift seek/span change begins a new PTS epoch. */
+			if (ts_gap_enabled && ts_gap_position_valid &&
+				m_current_position != ts_gap_next_position)
+			{
+				ts_gap.reset();
+				eDebug("[OPENBH_TIMESHIFT_GAP_V2] RESET on seek/span pos=%lld expected=%lld",
+					(long long)m_current_position, (long long)ts_gap_next_position);
+			}
 
 			/* align to blocksize */
 			maxread -= maxread % m_blocksize;
@@ -188,6 +221,32 @@ void eFilePushThread::thread()
 			}
 			else
 			{
+				/* Do not release recovered video and its audio before the missing
+				 * PTS interval has elapsed. Only flag=1, 188-byte timeshift TS.
+				 * This is playback pacing; it never fabricates encrypted TS or
+				 * mutates the original timeshift file/index. */
+				eTimeshiftGapClock::Decision ts_decision;
+				if (ts_gap_enabled)
+				{
+					ts_decision = ts_gap.inspect(m_buffer, buf_end,
+						eTimeshiftGapClock::monotonicMs(), 700, ts_gap_max_ms);
+					if (ts_decision.hold_ms)
+					{
+						eDebug("[OPENBH_TIMESHIFT_GAP_V2] HOLD pid=0x%x jump=%llu ms already_waited=%llu ms hold=%llu ms",
+							ts_decision.video_pid,
+							(unsigned long long)ts_decision.pts_jump_ms,
+							(unsigned long long)ts_decision.elapsed_ms,
+							(unsigned long long)ts_decision.hold_ms);
+						const uint64_t deadline = eTimeshiftGapClock::monotonicMs() + ts_decision.hold_ms;
+						while (!m_stop && eTimeshiftGapClock::monotonicMs() < deadline)
+						{
+							uint64_t remaining = deadline - eTimeshiftGapClock::monotonicMs();
+							usleep((remaining > 50 ? 50 : remaining) * 1000);
+						}
+					}
+				}
+				if (m_stop)
+					break;
 				/* Write data to mux */
 				int buf_start = 0;
 				filterRecordData(m_buffer, buf_end);
@@ -219,6 +278,12 @@ void eFilePushThread::thread()
 					buf_start += w;
 				}
 
+				if (ts_gap_enabled)
+				{
+					ts_gap.delivered(ts_decision, eTimeshiftGapClock::monotonicMs());
+					ts_gap_position_valid = true;
+					ts_gap_next_position = m_current_position + buf_end;
+				}
 				eofcount = 0;
 				m_current_position += buf_end;
 				bytes_read += buf_end;
