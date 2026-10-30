@@ -802,17 +802,47 @@ void eDVBSubtitleParser::subtitle_process_pes(uint8_t *pkt, int len)
 
 		m_seen_eod = false;
 
-		while (len && *pkt == DVB_SUB_SYNC_BYTE)
+		while (len > 0 && *pkt == DVB_SUB_SYNC_BYTE)
 		{
-			int l = subtitle_process_segment(pkt);
-			if (l < 0)
+			// OPENBH_SUBTITLE_V6: never pass a truncated segment to the decoder.
+			if (len < 6)
+			{
+				eWarning("[OPENBH_SUBTITLE_V6] truncated segment header, remaining=%d", len);
 				break;
+			}
+			int segment_size = 6 + ((int(pkt[4]) << 8) | int(pkt[5]));
+			if (segment_size > len)
+			{
+				eWarning("[OPENBH_SUBTITLE_V6] truncated segment type=%02x size=%d remaining=%d",
+					pkt[1], segment_size, len);
+				break;
+			}
+			int l = subtitle_process_segment(pkt);
+			if (l < 0 || l > len)
+			{
+				eWarning("[OPENBH_SUBTITLE_V6] segment decoder aborted type=%02x result=%d remaining=%d",
+					pkt[1], l, len);
+				break;
+			}
 			pkt += l;
 			len -= l;
 		}
 
-		if (len && *pkt != 0xFF)
+		if (len > 0 && *pkt != 0xFF)
 			eDebug("[eDVBSubtitleParser] strange data at the end");
+
+		// OPENBH_SUBTITLE_V6: OpenATV redraws the page at PES end when the
+		// end-of-display-set (0x80) marker was missing or not processed.
+		// Otherwise only the later 2-byte clear-page PCS gets displayed.
+		if (!m_seen_eod)
+		{
+			static unsigned int subtitle_v6_fallbacks = 0;
+			++subtitle_v6_fallbacks;
+			if (subtitle_v6_fallbacks <= 80)
+				eDebug("[OPENBH_SUBTITLE_V6] PES fallback redraw #%u remaining=%d next=%02x",
+					subtitle_v6_fallbacks, len, len > 0 ? (unsigned)*pkt : 0u);
+			subtitle_redraw_all();
+		}
 	}
 }
 
