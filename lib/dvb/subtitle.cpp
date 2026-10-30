@@ -59,10 +59,26 @@ void eDVBSubtitleParser::subtitle_process_line(subtitle_region *region, subtitle
 	int y = object->object_vertical_position + line;
 	if (x + len > region->width)
 		len = region->width - x;
-	if (len < 0 || y >= region->height)
+	// OPENBH_SUBTITLE_V7: crop against the pixmap, not just the display.
+	// A centered 1920-pixel source line can otherwise write before a
+	// narrower region's allocation (particularly on AArch64).
+	if (region->buffer == 0 || !region->buffer->surface || len <= 0 || y < 0 || y >= region->height)
 		return;
-
-	memcpy((uint8_t*)region->buffer->surface->data + region->buffer->surface->stride * y + x, data, len);
+	if (x < 0)
+	{
+		int skip = -x;
+		if (skip >= len)
+			return;
+		data += skip;
+		len -= skip;
+		x = 0;
+	}
+	if (x >= region->width)
+		return;
+	if (len > region->width - x)
+		len = region->width - x;
+	if (len > 0)
+		memcpy((uint8_t*)region->buffer->surface->data + region->buffer->surface->stride * y + x, data, len);
 }
 
 static int map_2_to_4_bit_table[4];
@@ -131,7 +147,7 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 				map_2_to_4_bit_table[col] :
 				region->depth == subtitle_region::bpp8 ?
 				map_2_to_8_bit_table[col] : col;
-			while (len && ((*linep) < m_display_size.width()))
+			while (len && ((*linep) < 1920))
 			{
 				line[(*linep)++] = c;
 				len--;
@@ -185,7 +201,7 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 			}
 			uint8_t c = region->depth == subtitle_region::bpp8 ?
 				map_4_to_8_bit_table[col] : col;
-			while (len && ((*linep) < m_display_size.width()))
+			while (len && ((*linep) < 1920))
 			{
 				line[(*linep)++] = c;
 				len--;
@@ -218,7 +234,7 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 				} else
 					break;
 			}
-			while (len && ((*linep) < m_display_size.width()))
+			while (len && ((*linep) < 1920))
 			{
 				line[(*linep)++] = col;
 				len--;
@@ -252,7 +268,16 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 		*linep = 0;
 		return 1;
 	default:
-		return -1;
+	{
+		// OPENBH_SUBTITLE_V7: as in FFmpeg, a nonstandard pixel block
+		// must not abort all following lines/segments. Skip its one-byte
+		// selector and report it, so the stream remains diagnosable.
+		static unsigned int unknown_blocks = 0;
+		if (++unknown_blocks <= 80)
+			eWarning("[OPENBH_SUBTITLE_V7] unknown pixel block=%02x region=%d object=%d line=%d column=%d",
+				data_type, region->region_id, object->object_id, *linenr, *linep);
+		return 1;
+	}
 	}
 	return 0;
 }
@@ -438,6 +463,10 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 				delete objects;
 				objects = n;
 			}
+			// OPENBH_SUBTITLE_V7: avoid reusing the old image when the region
+			// version, dimensions, or content changes.
+			region->buffer = 0;
+			region->committed = false;
 		}
 		else
 			break;
@@ -637,98 +666,90 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 	}
 	case DVB_SUB_SEGMENT_OBJECT_DATA:
 	{
-		int object_id;
-		int object_coding_method;
+		// OPENBH_SUBTITLE_V7: the same object may be referenced in
+		// multiple regions. Its pixel data must be decoded from the SAME
+		// immutable field start for each placement (as in FFmpeg).
+		if (!page || segment_length < 3)
+			break;
 
-		object_id  = *segment++ << 8;
-		object_id |= *segment++;
-		processed_length += 2;
-
-		object_coding_method  = (*segment >> 2) & 3;
-		segment++; // non_modifying_color_flag
-		processed_length++;
-
-		subtitle_region *region = page->regions;
-		while (region)
+		const int object_id = (int(segment[0]) << 8) | segment[1];
+		const int object_coding_method = (segment[2] >> 2) & 3;
+		if (object_coding_method != 0)
 		{
-			subtitle_region_object *object = region->objects;
-			while (object)
+			static unsigned int unsupported_objects = 0;
+			if (++unsupported_objects <= 20)
+				eWarning("[OPENBH_SUBTITLE_V7] unsupported object=%d coding_method=%d",
+					object_id, object_coding_method);
+			break;
+		}
+		if (segment_length < 7)
+		{
+			eWarning("[OPENBH_SUBTITLE_V7] short object=%d segment=%d", object_id, segment_length);
+			break;
+		}
+		const int top_len = (int(segment[3]) << 8) | segment[4];
+		const int bottom_len = (int(segment[5]) << 8) | segment[6];
+		if (top_len + bottom_len > segment_length - 7)
+		{
+			eWarning("[OPENBH_SUBTITLE_V7] bad field sizes object=%d top=%d bottom=%d segment=%d",
+					object_id, top_len, bottom_len, segment_length);
+			break;
+		}
+		uint8_t *const top_data = segment + 7;
+		uint8_t *const bottom_data = top_data + top_len;
+
+		static unsigned int object_traces = 0;
+		if (++object_traces <= 60)
+			eDebug("[OPENBH_SUBTITLE_V7] OBJECT #%u id=%d top=%d bottom=%d segment=%d first=%02x",
+				object_traces, object_id, top_len, bottom_len, segment_length,
+					top_len ? (unsigned)top_data[0] : 0u);
+
+		for (subtitle_region *region = page->regions; region; region = region->next)
+		{
+			for (subtitle_region_object *object = region->objects; object; object = object->next)
 			{
-				if (object->object_id == object_id)
+				if (object->object_id != object_id || region->buffer == 0)
+					continue;
+
+				// Preserve the original default mappings.
+				map_2_to_4_bit_table[0] = 0;
+				map_2_to_4_bit_table[1] = 8;
+				map_2_to_4_bit_table[2] = 7;
+				map_2_to_4_bit_table[3] = 15;
+				map_2_to_8_bit_table[0] = 0;
+				map_2_to_8_bit_table[1] = 0x88;
+				map_2_to_8_bit_table[2] = 0x77;
+				map_2_to_8_bit_table[3] = 0xff;
+				map_4_to_8_bit_table[0] = 0;
+				for (int index = 1; index < 16; ++index)
+					map_4_to_8_bit_table[index] = index * 0x11;
+
+				auto decode_field = [&](uint8_t *field, int field_len, int first_line)
 				{
-					if (object_coding_method == 0)
+					int line = first_line;
+					int linep = 0;
+					int offset = 0;
+					while (offset < field_len)
 					{
-						int top_field_data_blocklength, bottom_field_data_blocklength;
-						int i=1, line, linep;
-
-						top_field_data_blocklength  = *segment++ << 8;
-						top_field_data_blocklength |= *segment++;
-
-						bottom_field_data_blocklength  = *segment++ << 8;
-						bottom_field_data_blocklength |= *segment++;
-						processed_length += 4;
-
-						// its working on cyfra channels.. but hmm in EN300743 the default table is 0, 7, 8, 15
-						map_2_to_4_bit_table[0] = 0;
-						map_2_to_4_bit_table[1] = 8;
-						map_2_to_4_bit_table[2] = 7;
-						map_2_to_4_bit_table[3] = 15;
-
-						// this map is realy untested...
-						map_2_to_8_bit_table[0] = 0;
-						map_2_to_8_bit_table[1] = 0x88;
-						map_2_to_8_bit_table[2] = 0x77;
-						map_2_to_8_bit_table[3] = 0xff;
-
-						map_4_to_8_bit_table[0] = 0;
-						for (; i < 16; ++i)
-							map_4_to_8_bit_table[i] = i * 0x11;
-
-						i = 0;
-						line = 0;
-						linep = 0;
-						while (i < top_field_data_blocklength)
+						int consumed = subtitle_process_pixel_data(region, object, &line, &linep, field + offset);
+						if (consumed <= 0 || consumed > field_len - offset)
 						{
-							int len;
-							len = subtitle_process_pixel_data(region, object, &line, &linep, segment);
-							if (len < 0)
-								return -1;
-							segment += len;
-							processed_length += len;
-							i += len;
+							eWarning("[OPENBH_SUBTITLE_V7] field stop object=%d region=%d top=%d offset=%d/%d consumed=%d byte=%02x",
+								object_id, region->region_id, first_line == 0, offset, field_len,
+								consumed, (unsigned)field[offset]);
+							break;
 						}
-
-						line = 1;
-						linep = 0;
-
-						if (bottom_field_data_blocklength)
-						{
-							i = 0;
-							while (i < bottom_field_data_blocklength)
-							{
-								int len;
-								len = subtitle_process_pixel_data(region, object, &line, &linep, segment);
-								if (len < 0)
-									return -1;
-								segment += len;
-									processed_length += len;
-								i += len;
-							}
-						}
-						else if (top_field_data_blocklength)
-							eDebug("[eDVBSubtitleParser] !!!! unimplemented: no bottom field! (%d : %d)", top_field_data_blocklength, bottom_field_data_blocklength);
-
-						if ((top_field_data_blocklength + bottom_field_data_blocklength) & 1)
-						{
-							segment++; processed_length++;
-						}
+						offset += consumed;
 					}
-					else if (object_coding_method == 1)
-						eDebug("[eDVBSubtitleParser] ---- object_coding_method 1 unsupported!");
-				}
-				object = object->next;
+				};
+
+				decode_field(top_data, top_len, 0);
+				if (bottom_len)
+					decode_field(bottom_data, bottom_len, 1);
+				// FFmpeg treats the top field as the source for both parities
+				// when no bottom field exists. This source's decoder already
+				// maintains separate interlaced lines, so do not overwrite it.
 			}
-			region = region->next;
 		}
 		break;
 	}
