@@ -3898,6 +3898,7 @@ RESULT eDVBServicePlay::enableSubtitles(iSubtitleUser *user, SubtitleTrack &trac
 			return subtitle_result;
 		}
 		m_subtitle_widget = user;
+		eDebug("[OPENBH_SUBTITLE_FIX_V3] DVB PES active pid=%04x pages=%d/%d", pid, composition_page_id, ancillary_page_id);
 		if (m_dvb_service){
 			m_dvb_service->setCacheEntry(eDVBService::cSUBTITLE, ((pid&0xFFFF)<<16)|((composition_page_id&0xFF)<<8)|(ancillary_page_id&0xFF));
 		}
@@ -3914,6 +3915,8 @@ error_out:
 
 RESULT eDVBServicePlay::disableSubtitles()
 {
+	// Cancel any pending callback from the previous subtitle PID.
+	m_subtitle_sync_timer->stop();
 	if (m_subtitle_widget) m_subtitle_widget->destroy();
 	m_subtitle_widget = 0;
 	if (m_subtitle_parser)
@@ -4123,14 +4126,29 @@ void eDVBServicePlay::checkSubtitleTiming()
 	{
 		return;
 	}
-	// Use SoftDecoder for PTS if active, otherwise use regular decoder
+	// OPENBH_SUBTITLE_FIX_V3: never schedule a page relative to a failed
+	// VIDEO_GET_PTS result. An Amlogic decoder may return an error (or 0)
+	// during startup, causing the old code to schedule a huge wait.
+	bool valid_pts = false;
 	if (m_soft_decoder && m_csa_session && m_csa_session->isActive() && !m_timeshift_active)
-	{
-		m_soft_decoder->getPTS(0, pos);
-	}
+		valid_pts = (m_soft_decoder->getPTS(0, pos) == 0 && pos > 0);
 	else if (m_decoder)
+		valid_pts = (m_decoder->getPTS(0, pos) == 0 && pos > 0);
+
+	if (!valid_pts)
 	{
-		m_decoder->getPTS(0, pos);
+		if (!m_is_pvr && !m_timeshift_active && !m_dvb_subtitle_pages.empty())
+		{
+			// Live DVB: a decoded page exists, but no usable video clock.
+			// Display instead of leaving the page invisible indefinitely.
+			eDebug("[OPENBH_SUBTITLE_FIX_V3] live DVB page without valid VPTS: showing immediately");
+			m_subtitle_widget->setPage(m_dvb_subtitle_pages.front());
+			m_dvb_subtitle_pages.pop_front();
+		}
+		// For recordings/timeshift, do not advance subtitles while paused.
+		if (!m_dvb_subtitle_pages.empty() || !m_subtitle_pages.empty())
+			m_subtitle_sync_timer->start(200, 1);
+		return;
 	}
 
 	while (1)
@@ -4156,7 +4174,24 @@ void eDVBServicePlay::checkSubtitleTiming()
 
 		// If subtitle is overdue or within 20ms the video timing then display it.
 		// If not, pause subtitle processing until the subtitle should be shown
-		int diff = show_time - pos;
+		// 64-bit signed PTS delta (old 32-bit int silently overflowed).
+		pts_t diff = show_time - pos;
+		// MPEG-TS PTS wraps at 2^33 ticks; normalize only raw 33-bit PTS.
+		const pts_t wrap = (1LL << 33);
+		if (show_time >= 0 && show_time < wrap && pos >= 0 && pos < wrap)
+		{
+			if (diff > wrap / 2)
+				diff -= wrap;
+			else if (diff < -wrap / 2)
+				diff += wrap;
+		}
+		// A live DVB page >20s ahead is in a different timebase from VPTS.
+		// Show this page instead of waiting forever; no fixed offset is added.
+		if (type == DVB && !m_is_pvr && !m_timeshift_active && diff > 20LL * 90000)
+		{
+			eWarning("[OPENBH_SUBTITLE_FIX_V3] live DVB PTS mismatch video=%lld page=%lld delta=%lld: showing page", (long long)pos, (long long)show_time, (long long)diff);
+			diff = 0;
+		}
 		if (diff < 20*90)
 		{
 			//eDebug("[eDVBServicePlay] Showing subtitle with pts:%lld Video pts:%lld diff:%.03fs. Page stack size %d", show_time, pos, diff / 90000.0f, m_dvb_subtitle_pages.size());
@@ -4174,7 +4209,10 @@ void eDVBServicePlay::checkSubtitleTiming()
 		else
 		{
 			//eDebug("[eDVBServicePlay] Delay early subtitle by %.03fs. Page stack size %d", diff / 90000.0f, m_dvb_subtitle_pages.size());
-			m_subtitle_sync_timer->start(diff / 90, 1);
+			// Re-read the clock frequently enough to survive PTS jumps/resync.
+			// Avoid passing an overflowed or excessively long timeout to eTimer.
+			int wait_ms = diff / 90 > 250 ? 250 : (int)(diff / 90);
+			m_subtitle_sync_timer->start(wait_ms > 0 ? wait_ms : 1, 1);
 			break;
 		}
 	}
