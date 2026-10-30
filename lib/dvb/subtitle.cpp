@@ -270,6 +270,15 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 	page_id |= *segment++;
 	segment_length  = *segment++ << 8;
 	segment_length |= *segment++;
+	// OPENBH_SUBTITLE_V5: report the first 180 segment headers only.
+	static unsigned int subtitle_v5_segments = 0;
+	if (subtitle_v5_segments < 180)
+	{
+		++subtitle_v5_segments;
+		eDebug("[OPENBH_SUBTITLE_V5] SEG #%u type=%02x page=%d length=%d wanted=%d/%d raw=%d",
+			subtitle_v5_segments, segment_type, page_id, segment_length,
+			m_composition_page_id, m_ancillary_page_id, (int)isBufferProcess);
+	}
 	if (segment_type == DVB_SUB_SEGMENT_STUFFING)
 		return segment_length + 6;
 	if (page_id != m_composition_page_id && page_id != m_ancillary_page_id && !isBufferProcess)
@@ -305,6 +314,8 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 			page->page_regions = 0;
 			page->regions = 0;
 			page->page_id = page_id;
+			page->page_version_number = -1; // OPENBH_SUBTITLE_V5: initialize PCS state
+			page->pcs_size = segment_length;
 			page->cluts = 0;
 			page->next = 0;
 			*ppage = page;
@@ -352,6 +363,7 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 		page->page_time_out = page_time_out;
 
 		page->page_version_number = page_version_number;
+		page->pcs_size = segment_length; // OPENBH_SUBTITLE_V5: keep PCS size current
 
 		subtitle_page_region **r = &page->page_regions;
 
@@ -900,6 +912,20 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 	if (!page)
 		return;
 
+	// OPENBH_SUBTITLE_V5: show why the normal page callback contains zero bitmaps.
+	int subtitle_v5_refs = 0, subtitle_v5_defs = 0, subtitle_v5_committed = 0;
+	for (subtitle_page_region *pr = page->page_regions; pr; pr = pr->next)
+		++subtitle_v5_refs;
+	for (subtitle_region *rg = page->regions; rg; rg = rg->next)
+	{
+		++subtitle_v5_defs;
+		if (rg->committed) ++subtitle_v5_committed;
+	}
+	static unsigned int subtitle_v5_redraws = 0;
+	if (subtitle_v5_redraws++ < 100)
+		eDebug("[OPENBH_SUBTITLE_V5] REDRAW page=%d refs=%d definitions=%d committed=%d version=%d pcs_size=%d",
+			page_id, subtitle_v5_refs, subtitle_v5_defs, subtitle_v5_committed,
+			page->page_version_number, page->pcs_size);
 	/* iterate all regions in this pcs */
 	subtitle_page_region *region = page->page_regions;
 
@@ -1161,6 +1187,8 @@ int eDVBSubtitleParser::start(int pid, int composition_page_id, int ancillary_pa
 	{
 		eDebug("[eDVBSubtitleParser] start on pid 0x%04x with composition_page_id %d and ancillary_page_id %d",
 			pid, composition_page_id, ancillary_page_id);
+		// OPENBH_SUBTITLE_V5: drop cached page/region/CLUT data on track restart.
+		subtitle_reset();
 		m_composition_page_id = composition_page_id;
 		m_ancillary_page_id = ancillary_page_id;
 		#ifdef DREAMNEXTGEN
