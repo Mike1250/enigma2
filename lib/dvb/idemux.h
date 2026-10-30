@@ -19,8 +19,6 @@ class iDVBPESReader: public iObject
 public:
 	virtual RESULT setBufferSize(int size)=0;
 	virtual RESULT start(int pid)=0;
-	// Experimental Enigma2-only subtitle PES route; other readers unchanged.
-	virtual RESULT startSubtitle(int pid) { return start(pid); }
 	virtual RESULT stop()=0;
 	virtual RESULT connectRead(const sigc::slot<void(const uint8_t*,int)> &read, ePtr<eConnection> &conn)=0;
 	virtual ~iDVBPESReader() { };

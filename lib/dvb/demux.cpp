@@ -410,29 +410,7 @@ RESULT eDVBPESReader::start(int pid)
 	return res;
 }
 
-RESULT eDVBPESReader::startSubtitle(int pid)
-{
-	if (m_fd < 0)
-		return -ENODEV;
 
-	dmx_pes_filter_params flt = {};
-	flt.pes_type = DMX_PES_SUBTITLE0;
-	flt.pid = pid;
-	flt.input = DMX_IN_FRONTEND;
-	flt.output = DMX_OUT_TAP;
-	flt.flags = DMX_IMMEDIATE_START;
-
-	eDebug("[eDVBPESReader] experimental SUBTITLE0 filter pid=%04x", pid);
-	RESULT res = ::ioctl(m_fd, DMX_SET_PES_FILTER, &flt);
-	if (res)
-	{
-		eWarning("[eDVBPESReader] SUBTITLE0 rejected for pid=%04x: %m, falling back to OTHER", pid);
-		return start(pid);
-	}
-	m_active = 1;
-	m_notifier->start();
-	return 0;
-}
 
 
 RESULT eDVBPESReader::stop()
