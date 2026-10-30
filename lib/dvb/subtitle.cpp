@@ -12,6 +12,81 @@
 #include <lib/gdi/gpixmap.h>
 #include <lib/base/nconfig.h>
 #include <algorithm>
+#include <unistd.h>
+
+// DREAMTWO_SUBPROBE_V1: bounded, opt-in diagnostic capture. No decoding changes.
+// Activate with: touch /tmp/e2subtitle_capture_live
+// Captures exact input PES (after ePESParser assembly) and indexed pixmaps
+// (before the OSD renderer). Never enabled in normal operation.
+static bool dreamtwo_subprobe_enabled()
+{
+	return access("/tmp/e2subtitle_capture_live", F_OK) == 0;
+}
+
+static void dreamtwo_subprobe_pes(const uint8_t *data, int len)
+{
+	static unsigned int count = 0;
+	if (!dreamtwo_subprobe_enabled() || count >= 32 || len <= 0 || len > 65541)
+		return;
+	char path[120];
+	snprintf(path, sizeof(path), "/tmp/e2sub_live_%03u.pes", count);
+	FILE *f = fopen(path, "wb");
+	if (!f)
+		return;
+	size_t wrote = fwrite(data, 1, (size_t)len, f);
+	fclose(f);
+	if (wrote == (size_t)len)
+	{
+		eDebug("[DREAMTWO_SUBPROBE_V1] PES #%u len=%d file=%s", count, len, path);
+		count++;
+	}
+}
+
+static void dreamtwo_subprobe_region(int region_id, int width, int height,
+    const gPixmap *pixmap, const gRGB *palette, int ncolors)
+{
+	static unsigned int count = 0;
+	if (!dreamtwo_subprobe_enabled() || count >= 32 || !pixmap ||
+	    width < 1 || width > 1920 || height < 1 || height > 1080 ||
+	    !pixmap->surface || !pixmap->surface->data ||
+	    pixmap->surface->stride < width || !palette || ncolors < 1)
+		return;
+
+	char picpath[120], palpath[120];
+	snprintf(picpath, sizeof(picpath), "/tmp/e2sub_pix_%03u_r%d.pgm", count, region_id);
+	snprintf(palpath, sizeof(palpath), "/tmp/e2sub_pix_%03u_r%d.pal", count, region_id);
+	FILE *pic = fopen(picpath, "wb");
+	if (!pic)
+		return;
+	fprintf(pic, "P5\n%d %d\n255\n", width, height);
+	const uint8_t *pixels = (const uint8_t *)pixmap->surface->data;
+	bool complete = true;
+	for (int y = 0; y < height; ++y)
+	{
+		if (fwrite(pixels + y * pixmap->surface->stride, 1, width, pic) != (size_t)width)
+		{
+			complete = false;
+			break;
+		}
+	}
+	fclose(pic);
+	if (!complete)
+		return;
+	FILE *pal = fopen(palpath, "w");
+	if (pal)
+	{
+		fprintf(pal, "region_id=%d width=%d height=%d stride=%d colors=%d\n",
+			region_id, width, height, pixmap->surface->stride, ncolors);
+		for (int i = 0; i < ncolors; ++i)
+			fprintf(pal, "%d %u %u %u %u\n", i,
+				(unsigned)palette[i].r, (unsigned)palette[i].g,
+				(unsigned)palette[i].b, (unsigned)palette[i].a);
+		fclose(pal);
+	}
+	eDebug("[DREAMTWO_SUBPROBE_V1] PIX #%u region=%d size=%dx%d stride=%d file=%s",
+		count, region_id, width, height, pixmap->surface->stride, picpath);
+	count++;
+}
 
 void bitstream_init(bitstream *bit, const void *buffer, int size)
 {
@@ -775,6 +850,7 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 
 void eDVBSubtitleParser::subtitle_process_pes(uint8_t *pkt, int len)
 {
+	dreamtwo_subprobe_pes(pkt, len);
 	if (!extract_pts(m_show_time, pkt))
 	{
 		pkt += 6; len -= 6;
@@ -1113,6 +1189,8 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 				}
 			}
 
+			dreamtwo_subprobe_region(reg->region_id, reg->width, reg->height,
+				reg->buffer.operator->(), palette, clut_size);
 			eDVBSubtitleRegion Region;
 			Region.m_pixmap = reg->buffer;
 			Region.m_position.setX(x0);
