@@ -4757,16 +4757,21 @@ class InfoBarSubtitleSupport:
 
 	def enableSubtitle(self, selectedSubtitle):
 		subtitle = self.getCurrentServiceSubtitle()
-		self.selected_subtitle = selectedSubtitle
-		if subtitle and self.selected_subtitle:
-			subtitle.enableSubtitles(self.subtitle_window.instance, self.selected_subtitle)
-			self.subtitle_window.show()
-			self.doCenterDVBSubs()
+		if subtitle and selectedSubtitle:
+			result = subtitle.enableSubtitles(self.subtitle_window.instance, selectedSubtitle)
+			if result == 0:
+				self.selected_subtitle = selectedSubtitle
+				self.subtitle_window.show()
+				self.doCenterDVBSubs()
+				return
+			print("[InfoBarSubtitleSupport] Subtitle PES start failed: %s" % result)
+			self.selected_subtitle = None
+			self.subtitle_window.hide()
 		else:
+			self.selected_subtitle = None
 			if subtitle:
 				subtitle.disableSubtitles(self.subtitle_window.instance)
 			self.subtitle_window.hide()
-
 	def toggleDefaultSubtitles(self):
 		from Screens.SubtitleDisplay import HIDE_SCREEN_TYPE_YES, HIDE_SCREEN_TYPE_NO
 		subtitle = self.getCurrentServiceSubtitle()

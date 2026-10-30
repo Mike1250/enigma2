@@ -11,6 +11,9 @@
 #include <lib/base/eerror.h>
 #include <lib/gdi/gpixmap.h>
 #include <lib/base/nconfig.h>
+#ifdef DREAMNEXTGEN
+#include <unistd.h>
+#endif
 
 void bitstream_init(bitstream *bit, const void *buffer, int size)
 {
@@ -1160,6 +1163,10 @@ int eDVBSubtitleParser::start(int pid, int composition_page_id, int ancillary_pa
 			pid, composition_page_id, ancillary_page_id);
 		m_composition_page_id = composition_page_id;
 		m_ancillary_page_id = ancillary_page_id;
+		#ifdef DREAMNEXTGEN
+		if (::access("/tmp/e2_subtitle_use_pes0", F_OK) == 0)
+			return m_pes_reader->startSubtitle(pid);
+		#endif
 		return m_pes_reader->start(pid);
 	}
 	return -1;

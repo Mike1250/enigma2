@@ -3891,8 +3891,13 @@ RESULT eDVBServicePlay::enableSubtitles(iSubtitleUser *user, SubtitleTrack &trac
 		composition_page_id = track.page_number;
 		ancillary_page_id = track.magazine_number;
 
+		RESULT subtitle_result = m_subtitle_parser->start(pid, composition_page_id, ancillary_page_id);
+		if (subtitle_result)
+		{
+			eWarning("[eDVBServicePlay] DVB subtitle PES start failed pid=%04x result=%d", pid, subtitle_result);
+			return subtitle_result;
+		}
 		m_subtitle_widget = user;
-		m_subtitle_parser->start(pid, composition_page_id, ancillary_page_id);
 		if (m_dvb_service){
 			m_dvb_service->setCacheEntry(eDVBService::cSUBTITLE, ((pid&0xFFFF)<<16)|((composition_page_id&0xFF)<<8)|(ancillary_page_id&0xFF));
 		}
