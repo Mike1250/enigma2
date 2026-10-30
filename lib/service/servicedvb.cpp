@@ -4142,6 +4142,8 @@ void eDVBServicePlay::checkSubtitleTiming()
 			// Live DVB: a decoded page exists, but no usable video clock.
 			// Display instead of leaving the page invisible indefinitely.
 			eDebug("[OPENBH_SUBTITLE_FIX_V3] live DVB page without valid VPTS: showing immediately");
+			eDebug("[OPENBH_SUBTITLE_TRACE_V4] DISPLAY no-VPTS DVB regions=%lu",
+				(unsigned long)m_dvb_subtitle_pages.front().m_regions.size());
 			m_subtitle_widget->setPage(m_dvb_subtitle_pages.front());
 			m_dvb_subtitle_pages.pop_front();
 		}
@@ -4202,6 +4204,8 @@ void eDVBServicePlay::checkSubtitleTiming()
 			}
 			else
 			{
+				eDebug("[OPENBH_SUBTITLE_TRACE_V4] DISPLAY scheduled DVB regions=%lu pts=%lld vpts=%lld",
+					(unsigned long)dvb_page.m_regions.size(), (long long)dvb_page.m_show_time, (long long)pos);
 				m_subtitle_widget->setPage(dvb_page);
 				m_dvb_subtitle_pages.pop_front();
 			}
@@ -4220,6 +4224,12 @@ void eDVBServicePlay::checkSubtitleTiming()
 
 void eDVBServicePlay::newDVBSubtitlePage(const eDVBSubtitlePage &p)
 {
+	// OPENBH_SUBTITLE_TRACE_V4: successful parser callback (NOT just PES startup).
+	static unsigned int dvb_page_count = 0;
+	eDebug("[OPENBH_SUBTITLE_TRACE_V4] PAGE decoded #%u regions=%lu display=%dx%d pts=%lld widget=%p",
+		++dvb_page_count, (unsigned long)p.m_regions.size(), p.m_display_size.width(),
+		p.m_display_size.height(), (long long)p.m_show_time, (void *)m_subtitle_widget);
+
 	if (m_subtitle_widget)
 	{
 		pts_t pos = 0;
