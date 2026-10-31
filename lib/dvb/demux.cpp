@@ -1330,6 +1330,13 @@ int eDVBRecordScrambledThread::writeData(int len)
 			m_ts_parser.parseData(m_current_offset, m_buffer, len);
 	}
 
+	// Match the OpenBH passive monitor behavior: feed the already
+	// descrambled TS buffer to a non-blocking diagnostic/software-decoder FD.
+	// Ignore errors/short writes: never hold up normal TS delivery.
+	const int monitor_fd = m_monitor_fd.load(std::memory_order_relaxed);
+	if (monitor_fd >= 0)
+		(void)::write(monitor_fd, m_buffer, len);
+
 	// Call the appropriate parent writeData based on target type:
 	// - Streaming (socket): use eDVBRecordStreamThread::writeData() for proper socket handling
 	// - Recording (file): use eDVBRecordFileThread::writeData() for file I/O
@@ -1698,6 +1705,14 @@ RESULT eDVBTSRecorder::setDescrambler(ePtr<iServiceScrambled> serviceDescrambler
 void eDVBTSRecorder::setDiscardOnTimeout(bool discard)
 {
 	m_thread->setDiscardOnTimeout(discard);
+}
+
+RESULT eDVBTSRecorder::setMonitorFD(int fd)
+{
+	if (!m_thread)
+		return -1;
+	m_thread->setMonitorFD(fd);
+	return 0;
 }
 
 bool eDVBTSRecorder::waitForFirstData(int timeout_ms)

@@ -112,6 +112,8 @@ public:
 	void enableAccessPoints(bool enable) { m_ts_parser.enableAccessPoints(enable); }
 	void setDescrambler(ePtr<iServiceScrambled> serviceDescrambler) { m_serviceDescrambler = serviceDescrambler; updateWriteChunk(); };
 	void setDiscardOnTimeout(bool discard) { m_discard_on_timeout = discard; }
+	// OpenBH soft-decoder monitor: the main stream must never wait for it.
+	void setMonitorFD(int fd) { m_monitor_fd.store(fd, std::memory_order_relaxed); }
 
 	// Virtual: wait for first data (only ScrambledThread actually waits)
 	virtual bool waitForFirstData(int /*timeout_ms*/) { return true; }
@@ -160,6 +162,7 @@ protected:
 	std::vector<int> m_buffer_use_histogram;
 	ePtr<iServiceScrambled> m_serviceDescrambler;
 	int m_aio_short_write_count = 0;
+	std::atomic<int> m_monitor_fd{-1};
 	unsigned int m_busy_discard_count = 0;
 	std::string _targetFilename;
 	bool _fileOutput = false;
@@ -247,6 +250,7 @@ public:
 
 	RESULT setDescrambler(ePtr<iServiceScrambled>);
 	void setDiscardOnTimeout(bool discard);
+	RESULT setMonitorFD(int fd) override;
 
 	// Wait for first data to be written (for SoftDecoder sync)
 	bool waitForFirstData(int timeout_ms);

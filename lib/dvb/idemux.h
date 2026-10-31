@@ -78,6 +78,9 @@ public:
 	virtual RESULT setSplitSize(off_t bytes) { errno = ENOSYS; return -1; }
 	virtual long long getWrittenBytes() { errno = ENOSYS; return -1; }
 	virtual void setSyncOnStop(bool enabled) { }
+	// OpenBH software decoder: passive, best-effort TS tap.
+	// fd must be non-blocking and remains owned by the caller; -1 detaches.
+	virtual RESULT setMonitorFD(int fd) = 0;
 };
 
 #endif
