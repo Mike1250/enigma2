@@ -3270,6 +3270,21 @@ RESULT eServiceMP3::trickSeek(gdouble ratio)
 		 * We know that filesrc and souphttpsrc will not timeout after long pause
 		 * If there are other sources which will not timeout, add them here
 		*/
+		// [AML_LOCAL_RESUME_V1] local media: PAUSED->PLAYING can be ASYNC.
+		// Do not flush-seek or switch native dreamaudiosink merely because
+		// gst_element_get_state(...,0) has not reported SUCCESS yet.
+		if (!strcmp(name, "filesrc"))
+		{
+			GstStateChangeReturn change = gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+			if (change != GST_STATE_CHANGE_FAILURE)
+			{
+				setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
+				eDebug("[AML_LOCAL_RESUME_V1] local file direct PLAYING (%s), no seek",
+					gst_element_state_change_return_get_name(change));
+				return 0;
+			}
+			eWarning("[AML_LOCAL_RESUME_V1] direct PLAYING failed, retaining legacy fallback");
+		}
 		if (!strcmp(name, "filesrc") || !strcmp(name, "souphttpsrc"))
 		{
 			GstStateChangeReturn ret;
