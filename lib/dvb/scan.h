@@ -59,13 +59,12 @@ class eDVBScan: public sigc::trackable, public iObject
 		/* scan state variables */
 	int m_channel_state;
 	int m_ready, m_ready_all;
-	bool m_ch_current_active;
+	bool m_ch_current_active = false;
 
 	std::map<eDVBChannelID, ePtr<iDVBFrontendParameters> > m_new_channels;
 	std::map<eDVBChannelID, int> m_tuner_data; // frequency read from tuner for every new channel
 
 	std::map<eServiceReferenceDVB, ePtr<eDVBService> > m_new_services;
-	std::vector<eServiceReferenceDVB> m_new_servicerefs;
 	std::map<eServiceReferenceDVB, ePtr<eDVBService> >::iterator m_last_service;
 
 	std::map<unsigned short, service> m_pmts_to_read;
@@ -95,7 +94,7 @@ class eDVBScan: public sigc::trackable, public iObject
 	void addKnownGoodChannel(const eDVBChannelID &chid, iDVBFrontendParameters *feparm);
 	void addChannelToScan(iDVBFrontendParameters *feparm);
 
-	int sameChannel(iDVBFrontendParameters *ch1, iDVBFrontendParameters *ch2, bool exact=false) const;
+	int sameChannel(iDVBFrontendParameters *ch1, iDVBFrontendParameters *ch2, bool exact, int offset) const;
 
 	void channelDone();
 
@@ -107,6 +106,10 @@ class eDVBScan: public sigc::trackable, public iObject
 	int m_networkid;
 	bool m_usePAT;
 	bool m_scan_debug;
+	bool m_updateLCN;
+
+	std::map<eDVBChannelID, uint32_t> m_aus_da_flags;
+	std::map<eDVBChannelID, std::string> m_default_authorities;
 public:
 	eDVBScan(iDVBChannel *channel, bool usePAT=true, bool debug=true );
 	~eDVBScan();

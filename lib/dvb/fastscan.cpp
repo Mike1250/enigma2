@@ -241,7 +241,7 @@ uint8_t FastScanTransportStream::getModulation(void) const
 	return 0;
 }
 
-uint32_t FastScanTransportStream::getSymbolRate(void) const
+int32_t FastScanTransportStream::getSymbolRate(void) const
 {
 	if (deliverySystem) return deliverySystem->getSymbolRate();
 	return 0;
@@ -302,7 +302,7 @@ const FastScanTransportStreamList *FastScanNetworkSection::getTransportStreams(v
 
 DEFINE_REF(eFastScan);
 
-eFastScan::eFastScan(int pid, const char *providername, eDVBFrontendParametersSatellite transponderparameters, bool originalnumbering, bool fixedserviceinfo, bool createradiobouquet)
+eFastScan::eFastScan(int pid, const char *providername, eDVBFrontendParametersSatellite transponderparameters, bool originalnumbering, bool fixedserviceinfo, bool createradiobouquet, bool dropunconfigured)
 {
 	m_pid = pid;
 	providerName = providername;
@@ -311,6 +311,7 @@ eFastScan::eFastScan(int pid, const char *providername, eDVBFrontendParametersSa
 	originalNumbering = originalnumbering;
 	useFixedServiceInfo = fixedserviceinfo;
 	createRadioBouquet = createradiobouquet;
+	dropUnconfigured = dropunconfigured;
 	versionNumber = -1;
 }
 
@@ -482,8 +483,6 @@ void eFastScan::parseResult()
 
 	if (!networksections.empty()) versionNumber = networksections[0]->getVersion();
 
-	bool drop = eConfigManager::getConfigBoolValue("config.misc.fastscan.drop");
-
 	for (unsigned int i = 0; i < networksections.size(); i++)
 	{
 		const FastScanTransportStreamList *transportstreams = networksections[i]->getTransportStreams();
@@ -491,12 +490,12 @@ void eFastScan::parseResult()
 		{
 			eDVBChannelID chid;
 			int orbitalposbcd = (*it)->getOrbitalPosition();
-			int orbitalpos = (orbitalposbcd & 0x0f) + ((orbitalposbcd >> 4) & 0x0f) * 10 + ((orbitalposbcd >> 8) & 0x0f) * 100;
+			int orbitalpos = (orbitalposbcd & 0x0f) + ((orbitalposbcd >> 4) & 0x0f) * 10 + ((orbitalposbcd >> 8) & 0x0f) * 100 + ((orbitalposbcd >> 12) & 0x0f) * 1000;
 			int westeastflag = (*it)->getWestEastFlag();
-			if (!westeastflag)
+			if (orbitalpos && !westeastflag)
 				orbitalpos = 3600 - orbitalpos;
 
-			if (drop && transponderParameters.orbital_position != orbitalpos &&
+			if (dropUnconfigured && transponderParameters.orbital_position != orbitalpos &&
 				!eDVBSatelliteEquipmentControl::getInstance()->isOrbitalPositionConfigured(orbitalpos))
 			{
 				eDebug("[eFastScan] dropping this transponder, it's on another satellite %d not configured.", orbitalpos);

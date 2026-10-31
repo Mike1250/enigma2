@@ -3,7 +3,7 @@
 #include <lib/dvb/cahandler.h>
 #include <lib/dvb/cwhandler.h>
 #include <lib/base/eerror.h>
-#include <lib/base/nconfig.h>
+#include <lib/base/esimpleconfig.h>
 
 DEFINE_REF(eDVBCSASession);
 
@@ -53,6 +53,14 @@ static bool dvbTripletMatch(const eServiceReferenceDVB& ref1, const eServiceRefe
 	return ref1.getServiceID() == ref2.getServiceID() &&
 	       ref1.getTransportStreamID() == ref2.getTransportStreamID() &&
 	       ref1.getOriginalNetworkID() == ref2.getOriginalNetworkID();
+}
+
+int eDVBCSASession::cachedCsaAlt(const eServiceReferenceDVB& ref)
+{
+	auto it = s_csa_cache.find(makeServiceKey(ref));
+	if (it == s_csa_cache.end() || !it->second.valid)
+		return -1;
+	return it->second.is_csa_alt ? 1 : 0;
 }
 
 eDVBCSASession::eDVBCSASession(const eServiceReferenceDVB& ref)
@@ -126,9 +134,9 @@ void eDVBCSASession::startECMMonitor(iDVBDemux *demux, uint16_t ecm_pid, uint16_
 	m_caid = caid;
 
 	// Cache-driven early activation: skip ECM section reader if CSA-ALT for
-	// this service is already known. Disabled in Aggressive mode (audio race on some boxes).
+	// this service is already known. Disabled in Aggressive mode (audio race on dm900).
 	const bool cache_early_activate_disabled =
-		(eConfigManager::getConfigIntValue("config.misc.softcsa.decoderRelease", 0) == 2);
+		(eSimpleConfig::getInt("config.softcsa.decoderRelease", 0) == 2);
 
 	if (!cache_early_activate_disabled)
 	{

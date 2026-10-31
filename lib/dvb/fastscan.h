@@ -14,7 +14,6 @@
 #include <dvbsi++/network_name_descriptor.h>
 #include <dvbsi++/service_list_descriptor.h>
 #include <dvbsi++/satellite_delivery_system_descriptor.h>
-#include <dvbsi++/s2_satellite_delivery_system_descriptor.h>
 
 /* HACK: fastscan table uses a nonstandard version of the LogicalChannel descriptor, with 14bit channel numbers (instead of 10bit), and a nonstandard definition of a 'hidden' flag */
 class FastScanLogicalChannel
@@ -83,7 +82,7 @@ typedef FastScanServiceList::const_iterator FastScanServiceListConstIterator;
 class FastScanServicesSection : public LongCrcSection
 {
 protected:
-	unsigned versionNumber : 5;
+	//unsigned versionNumber : 5;
 	FastScanServiceList services;
 
 public:
@@ -122,7 +121,7 @@ public:
 	uint8_t getRollOff(void) const;
 	uint8_t getModulationSystem(void) const;
 	uint8_t getModulation(void) const;
-	uint32_t getSymbolRate(void) const;
+	int32_t getSymbolRate(void) const;
 	uint8_t getFecInner(void) const;
 
 	const ServiceListItemList *getServiceList(void) const;
@@ -136,7 +135,7 @@ typedef FastScanTransportStreamList::const_iterator FastScanTransportStreamListC
 class FastScanNetworkSection : public LongCrcSection, public NetworkNameDescriptor
 {
 protected:
-	unsigned versionNumber : 5;
+	//unsigned versionNumber : 5;
 	FastScanTransportStreamList transportStreams;
 
 public:
@@ -232,6 +231,7 @@ class eFastScan: public sigc::trackable, public iObject
 	bool originalNumbering;
 	bool useFixedServiceInfo;
 	bool createRadioBouquet;
+	bool dropUnconfigured;
 	int versionNumber;
 	std::string providerName, bouquetFilename;
 	int m_pid;
@@ -248,7 +248,7 @@ class eFastScan: public sigc::trackable, public iObject
 #endif /* no SWIG */
 
 public:
-	eFastScan(int pid, const char *providername, eDVBFrontendParametersSatellite transponderparameters, bool originalnumbering = false, bool fixedserviceinfo = false, bool createRadioBouquet = false);
+	eFastScan(int pid, const char *providername, eDVBFrontendParametersSatellite transponderparameters, bool originalnumbering = false, bool fixedserviceinfo = false, bool createRadioBouquet = false, bool dropunconfigured = true);
 	~eFastScan();
 
 	void start(int frontendid = 0);

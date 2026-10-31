@@ -1,6 +1,5 @@
 #include <lib/dvb/csaengine.h>
 #include <lib/base/eerror.h>
-#include <lib/base/nconfig.h>
 #include <dlfcn.h>
 
 #define CSA_DEBUG 0
@@ -24,12 +23,6 @@ csa_dlopen_api g_csa_api = {
 
 bool csa_load_library()
 {
-	if (!eConfigManager::getConfigBoolValue("config.misc.softcsa.enabled", true))
-	{
-		eWarning("[eDVBCSAEngine] softcsa disabled");
-		return false;
-	}
-
 	// Already loaded successfully?
 	if (g_csa_api.available)
 		return true;
@@ -60,7 +53,7 @@ bool csa_load_library()
 
 	if (!g_csa_api.handle)
 	{
-		eWarning("[eDVBCSAEngine] libdvbcsa not found (dlopen failed)");
+		eDebug("[eDVBCSAEngine] libdvbcsa not found, software CSA is disabled");
 		return false;
 	}
 
@@ -78,7 +71,7 @@ bool csa_load_library()
 		!g_csa_api.batch_size  ||
 		!g_csa_api.decrypt)
 	{
-		eWarning("[eDVBCSAEngine] %s loaded but missing required symbols", loaded_name);
+		eWarning("[eDVBCSAEngine] %s loaded but missing required symbols, software CSA is disabled", loaded_name);
 		dlclose(g_csa_api.handle);
 		g_csa_api.handle    = 0;
 		g_csa_api.available = false;
@@ -229,19 +222,19 @@ void eDVBCSAEngine::setKey(int parity, uint8_t ecm_mode, const uint8_t* cw)
 	// so it never sees a partially-written key schedule.
 	if (parity == 0) // even
 	{
-		int active = m_key_even_idx.load(std::memory_order_relaxed);
+		int active = m_key_even_idx.load(std::memory_order_relaxed); // S8417: only this thread writes it
 		int inactive = 1 - active;
 		g_csa_api.key_set_ecm(ecm_mode, cw, m_key_even[inactive]);
-		m_key_even_idx.store(inactive, std::memory_order_release);
-		m_key_even_set.store(true, std::memory_order_release);
+		m_key_even_idx.store(inactive, std::memory_order_release); // S8417: publishes key write above
+		m_key_even_set.store(true, std::memory_order_release); // S8417: publishes idx store above
 	}
 	else // odd
 	{
-		int active = m_key_odd_idx.load(std::memory_order_relaxed);
+		int active = m_key_odd_idx.load(std::memory_order_relaxed); // S8417: only this thread writes it
 		int inactive = 1 - active;
 		g_csa_api.key_set_ecm(ecm_mode, cw, m_key_odd[inactive]);
-		m_key_odd_idx.store(inactive, std::memory_order_release);
-		m_key_odd_set.store(true, std::memory_order_release);
+		m_key_odd_idx.store(inactive, std::memory_order_release); // S8417: publishes key write above
+		m_key_odd_set.store(true, std::memory_order_release); // S8417: publishes idx store above
 	}
 
 	if (g_csa_api.get_ecm_table)
@@ -273,7 +266,7 @@ unsigned char eDVBCSAEngine::getScrambledBits(const unsigned char* pkt)
 	return pkt[3] >> 6;
 }
 
-unsigned char eDVBCSAEngine::getPayloadOffset(const unsigned char* pkt)
+int eDVBCSAEngine::getPayloadOffset(const unsigned char* pkt)
 {
 	unsigned char adapt_field = (pkt[3] & ~0xDF) >> 5;
 
@@ -287,6 +280,26 @@ void eDVBCSAEngine::clearTSC(unsigned char* pkt)
 {
 	if (pkt)
 		pkt[3] &= 0x3F;
+}
+
+void eDVBCSAEngine::setNullPacket(unsigned char* pkt)
+{
+	// PID 0x1FFF, the decoder ignores null packets
+	clearTSC(pkt);
+	pkt[1] = 0x1F;
+	pkt[2] = 0xFF;
+}
+
+void eDVBCSAEngine::logBadPacket(const char* reason, const unsigned char* pkt, int offset, int len)
+{
+	++m_bad_packets;
+	if (m_bad_packets > 20 && m_bad_packets % 500)
+		return;
+	if (len - offset >= 5)
+		eWarning("[eDVBCSAEngine] bad packet #%u (%s): offset=%d len=%d tei=%d hdr=%02X %02X %02X %02X %02X", m_bad_packets, reason, offset, len,
+			(pkt[1] & 0x80) ? 1 : 0, BYTE_HEX(pkt[0]), BYTE_HEX(pkt[1]), BYTE_HEX(pkt[2]), BYTE_HEX(pkt[3]), BYTE_HEX(pkt[4]));
+	else
+		eWarning("[eDVBCSAEngine] bad packet #%u (%s): offset=%d len=%d", m_bad_packets, reason, offset, len);
 }
 
 // Descrambling
@@ -304,10 +317,10 @@ void eDVBCSAEngine::descramble(unsigned char* packets, int len)
 	// Snapshot active key state and indices once for this entire buffer.
 	// setKey() on the CWHandler thread may swap the index at any time,
 	// but we consistently use the snapshot throughout this call.
-	const bool even_set = m_key_even_set.load(std::memory_order_acquire);
-	const bool odd_set = m_key_odd_set.load(std::memory_order_acquire);
-	dvbcsa_bs_key_t* key_even = even_set ? m_key_even[m_key_even_idx.load(std::memory_order_acquire)] : nullptr;
-	dvbcsa_bs_key_t* key_odd = odd_set ? m_key_odd[m_key_odd_idx.load(std::memory_order_acquire)] : nullptr;
+	const bool even_set = m_key_even_set.load(std::memory_order_acquire); // S8417: pairs with release in setKey()
+	const bool odd_set = m_key_odd_set.load(std::memory_order_acquire); // S8417: pairs with release in setKey()
+	dvbcsa_bs_key_t* key_even = even_set ? m_key_even[m_key_even_idx.load(std::memory_order_acquire)] : nullptr; // S8417: pairs with release in setKey()
+	dvbcsa_bs_key_t* key_odd = odd_set ? m_key_odd[m_key_odd_idx.load(std::memory_order_acquire)] : nullptr; // S8417: pairs with release in setKey()
 
 	int i        = 0;
 	int even_cnt = 0;
@@ -323,50 +336,49 @@ void eDVBCSAEngine::descramble(unsigned char* packets, int len)
 	{
 		unsigned char *pkt = packets + i;
 
-		if (!isPacketValid(pkt))
+		const bool sync = isPacketValid(pkt);
+		if (!sync || len - i < 188)
 		{
-			CSA_LOG("[eDVBCSAEngine] decrypt sync error at offset=%d", i);
-			return;
+			logBadPacket(sync ? "partial packet" : "sync loss", pkt, i, len);
+			break;  // Still flush the batches collected so far
 		}
 
-		unsigned char offset    = getPayloadOffset(pkt);
 		unsigned char scrambled = getScrambledBits(pkt);
-
-		if (scrambled == 2) // even
+		if (scrambled < 2) // clear or reserved
 		{
-			if (key_even)
-			{
-				// Key available: descramble and clear TSC
-				clearTSC(pkt);
-				pcks_even[even_cnt].data = pkt + offset;
-				pcks_even[even_cnt].len  = 188 - offset;
-				even_cnt++;
-			}
-			else
-			{
-				// No key: convert to null packet (PID 0x1FFF), Decoder will ignore null packets - no glitches
-				clearTSC(pkt);
-				pkt[1] = 0x1F;
-				pkt[2] = 0xFF;
-			}
+			i += 188;
+			continue;
 		}
-		else if (scrambled == 3) // odd
+
+		const bool even = (scrambled == 2);
+		const dvbcsa_bs_key_t* key = even ? key_even : key_odd;
+		int offset = getPayloadOffset(pkt);
+
+		if (!(pkt[3] & 0x10))
 		{
-			if (key_odd)
-			{
-				// Key available: descramble and clear TSC
-				clearTSC(pkt);
-				pcks_odd[odd_cnt].data = pkt + offset;
-				pcks_odd[odd_cnt].len  = 188 - offset;
-				odd_cnt++;
-			}
-			else
-			{
-				// No key: convert to null packet (PID 0x1FFF), Decoder will ignore null packets - no glitches
-				clearTSC(pkt);
-				pkt[1] = 0x1F;
-				pkt[2] = 0xFF;
-			}
+			// Adaptation field only, nothing to descramble
+			clearTSC(pkt);
+		}
+		else if (!key)
+		{
+			// No key: convert to null packet - no glitches
+			setNullPacket(pkt);
+		}
+		else if (offset >= 188)
+		{
+			// Never pass an invalid payload length to libdvbcsa, it aborts on it
+			logBadPacket("adaptation field too long", pkt, i, len);
+			setNullPacket(pkt);
+		}
+		else
+		{
+			// Key available: descramble and clear TSC
+			clearTSC(pkt);
+			dvbcsa_bs_batch_s* batch = even ? pcks_even : pcks_odd;
+			int& cnt = even ? even_cnt : odd_cnt;
+			batch[cnt].data = pkt + offset;
+			batch[cnt].len  = 188 - offset;
+			cnt++;
 		}
 
 		// flush even batch

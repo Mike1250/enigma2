@@ -22,29 +22,43 @@ dvb_libenigma_dvb_a_SOURCES = \
 	dvb/filepush.cpp \
 	dvb/frontend.cpp \
 	dvb/frontendparms.cpp \
+	dvb/hevc_hdr_detector.cpp \
 	dvb/metaparser.cpp \
 	dvb/opentv.cpp \
 	dvb/pesparse.cpp \
+	dvb/pgssubtitle.cpp \
 	dvb/pmt.cpp \
 	dvb/pvrparse.cpp \
 	dvb/radiotext.cpp \
 	dvb/rotor_calc.cpp \
 	dvb/scan.cpp \
 	dvb/sec.cpp \
+	dvb/servicetsfilter.cpp \
 	dvb/subtitle.cpp \
 	dvb/teletext.cpp \
 	dvb/tstools.cpp \
 	dvb/volume.cpp \
+	dvb/warmstart.cpp \
 	dvb/streamserver.cpp \
+	dvb/rtspstreamserver.cpp \
 	dvb/pmtparse.cpp \
 	dvb/encoder.cpp \
 	dvb/atsc.cpp \
 	dvb/fcc.cpp \
-	dvb/fccdecoder.cpp
+	dvb/fccdecoder.cpp \
+	dvb/eramtimeshift.cpp
+
+if DREAMNEXTGEN
+dvb_libenigma_dvb_a_SOURCES += 	\
+	dvb/alsa.cpp \
+	dvb/audiomanager.cpp \
+	dvb/avsync_core.cpp \
+	dvb/iec61937.cpp \
+	dvb/tsparser.cpp
+endif
 
 dvbincludedir = $(pkgincludedir)/lib/dvb
 dvbinclude_HEADERS = \
-	dvb/absdiff.h \
 	dvb/cablescan.h \
 	dvb/cahandler.h \
 	dvb/crc32.h \
@@ -66,6 +80,8 @@ dvbinclude_HEADERS = \
 	dvb/filepush.h \
 	dvb/frontend.h \
 	dvb/frontendparms.h \
+	dvb/hevc_hdr_detector.h \
+	dvb/hevc_hdr_parser.h \
 	dvb/idemux.h \
 	dvb/idvb.h \
 	dvb/isection.h \
@@ -73,25 +89,34 @@ dvbinclude_HEADERS = \
 	dvb/metaparser.h \
 	dvb/opentv.h \
 	dvb/pesparse.h \
+	dvb/pgssubtitle.h \
 	dvb/pmt.h \
 	dvb/pvrparse.h \
 	dvb/radiotext.h \
 	dvb/rotor_calc.h \
 	dvb/scan.h \
 	dvb/sec.h \
+	dvb/servicetsfilter.h \
 	dvb/specs.h \
 	dvb/subtitle.h \
 	dvb/teletext.h \
 	dvb/tstools.h \
 	dvb/volume.h \
+	dvb/warmstart.h \
 	dvb/streamserver.h \
+	dvb/rtspstreamserver.h \
 	dvb/pmtparse.h \
 	dvb/encoder.h \
 	dvb/atsc.h \
 	dvb/fcc.h \
-	dvb/fccdecoder.h
+	dvb/fccdecoder.h \
+	dvb/eramtimeshift.h
 
-# OpenBH DreamOne/DreamTwo FFmpeg + ALSA audio backend
 if DREAMNEXTGEN
-dvb_libenigma_dvb_a_SOURCES += dvb/amlogic_audio.cpp
+dvbinclude_HEADERS += \
+	dvb/alsa.h \
+	dvb/audiomanager.h \
+	dvb/avsync_core.h \
+	dvb/iec61937.h \
+	dvb/tsparser.h
 endif

@@ -6,9 +6,6 @@
 #endif
 
 #include <lib/base/ebase.h>
-#ifndef SWIG
-#include <sigc++/sigc++.h>
-#endif
 
 class eDVBVolumecontrol
 {
@@ -16,7 +13,17 @@ private:
 #ifdef HAVE_ALSA
 	snd_mixer_elem_t *mainVolume;
 	snd_mixer_t *alsaMixerHandle;
-#endif
+#ifdef DREAMNEXTGEN
+	const char *alsa_card;
+	bool  alsa_has_db;
+	long  alsa_min_raw, alsa_max_raw;   // raw range
+	long  alsa_min_db,  alsa_max_db;    // millibels (1/100 dB)
+
+	bool ensureMixer();          // open and locate the master mixer lazily
+	long uiToHw(int ui) const;   // 0..100 -> raw or dB
+	int  hwToUi(long hw) const;  // raw or dB -> 0..100
+#endif // DREAMNEXTGEN
+#endif // HAVE_ALSA
 	static eDVBVolumecontrol *instance;
 	eDVBVolumecontrol();
 #ifdef SWIG
@@ -25,40 +32,42 @@ private:
 	int openMixer();
 	void closeMixer(int fd);
 
+	bool mute_zero;
 	bool muted;
 	int leftVol, rightVol;
 	int m_volsteps;
-
-#ifndef SWIG
-#ifndef HAVE_ALSA
-	/* Native, in-process IPAudioPlus GStreamer session watcher. */
-	ePtr<eTimer> m_ipaNativeTimer;
-	sigc::connection m_ipaNativeConnection;
-	void ipaNativeTick();
-#endif
-#endif
+	int m_BaseVolume;
+	int m_VolumeOffset;
 
 	int checkVolume(int vol);
 
 public:
-#ifndef SWIG
-	/* Notification only, never changes the DVB hardware mixer path. */
-	sigc::signal<void()> volumeChanged;
-#endif
-	static eDVBVolumecontrol* getInstance();
+	static eDVBVolumecontrol *getInstance();
 
-	void setVolumeSteps(int steps);
-	void volumeUp(int left = 0, int right = 0);
-	void volumeDown(int left = 0, int right = 0);
+	void setVolumeSteps(int steps) { m_volsteps = steps; }
+	int volumeUp(int left = 0, int right = 0);
+	int volumeDown(int left = 0, int right = 0);
 
-	void setVolume(int left, int right);
+	int setVolume(int left, int right);
+	int setVolumeOffset(int offset);
 
 	void volumeMute();
 	void volumeUnMute();
-	void volumeToggleMute();
+	bool volumeToggleMute();
 
-	int getVolume();
-	bool isMuted();
+	int getBaseVolume() { return m_BaseVolume; }
+	int getVolumeOffset() { return m_VolumeOffset; }
+	int getVolume() { return leftVol; }
+	int getVolumeLeft() { return leftVol; }
+	int getVolumeRight() { return rightVol; }
+	bool isMuted(bool force=false) { return muted || (force && mute_zero); }
+
+#ifdef DREAMNEXTGEN
+	/* Fired on every setVolume (0..100, mute already applied). */
+	typedef void (*VolumeChangeCb)(int level);
+	static void registerVolumeChangeCb(VolumeChangeCb cb);
+	static VolumeChangeCb s_volume_change_cb;
+#endif
 };
 
 #endif //__volume_h

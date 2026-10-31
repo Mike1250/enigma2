@@ -16,8 +16,6 @@
 
 #include <dvbsi++/service_description_section.h>
 
-extern bool m_is_streamx;
-
 class eDVBChannel;
 
 	/* we do NOT handle resource conflicts here. instead, the allocateChannel
@@ -107,6 +105,7 @@ public:
 
 	virtual int getNumFrontends() = 0;
 	virtual RESULT getFrontend(ePtr<eDVBFrontend> &fe, int nr, bool simulate=false) = 0;
+	virtual bool isRTLSDRBridge() const { return false; }
 };
 
 class eDVBAdapterLinux: public iDVBAdapter
@@ -142,6 +141,7 @@ private:
 	int pipeFd[2];
 	std::string usbFrontendName;
 	std::string virtualFrontendName;
+	bool rtlSDRBridge;
 	bool running;
 	unsigned short int pidList[30];
 	unsigned char buffer[4 * 1024 * 188];
@@ -152,6 +152,7 @@ private:
 public:
 	eDVBUsbAdapter(int nr);
 	~eDVBUsbAdapter();
+	bool isRTLSDRBridge() const override { return rtlSDRBridge; }
 };
 #endif // SWIG
 
@@ -164,9 +165,13 @@ class eDVBResourceManager: public iObject, public sigc::trackable
 	eSmartPtrList<iDVBAdapter> m_adapter;
 	eSmartPtrList<eDVBRegisteredDemux> m_demux;
 	eSmartPtrList<eDVBRegisteredFrontend> m_frontend, m_simulate_frontend;
+	eSingleLock m_rtlsdr_lock;
+	bool m_rtlsdr_acquired;
 	void addAdapter(iDVBAdapter *adapter, bool front = false);
 	void setUsbTuner();
 
+public:
+#ifndef SWIG
 	struct active_channel
 	{
 		eDVBChannelID m_channel_id;
@@ -175,15 +180,22 @@ class eDVBResourceManager: public iObject, public sigc::trackable
 
 		active_channel(const eDVBChannelID &chid, eDVBChannel *ch) : m_channel_id(chid), m_channel(ch) { }
 	};
+#endif
+	void feStateChanged();
 
+private:
 	std::list<active_channel> m_active_channels, m_active_simulate_channels;
 
 	ePtr<iDVBChannelList> m_list;
 	ePtr<iDVBSatelliteEquipmentControl> m_sec;
 	static eDVBResourceManager *instance;
+
 	friend class eDVBChannel;
 	friend class eFBCTunerManager;
+	friend class eRTSPStreamClient;
+
 	ePtr<eFBCTunerManager> m_fbcmng;
+
 	RESULT addChannel(const eDVBChannelID &chid, eDVBChannel *ch);
 	RESULT removeChannel(eDVBChannel *ch);
 
@@ -193,7 +205,6 @@ class eDVBResourceManager: public iObject, public sigc::trackable
 	sigc::connection m_cached_channel_state_changed_conn;
 	ePtr<eTimer> m_releaseCachedChannelTimer;
 	void DVBChannelStateChanged(iDVBChannel*);
-	void feStateChanged();
 #ifndef SWIG
 public:
 #endif
@@ -203,6 +214,7 @@ public:
 
 	RESULT setChannelList(iDVBChannelList *list);
 	RESULT getChannelList(ePtr<iDVBChannelList> &list);
+	RESULT getActiveChannels(std::list<active_channel> &list);
 
 	enum {
 			/* errNoFrontend = -1 replaced by more spcific messages */
@@ -215,9 +227,10 @@ public:
 	};
 
 	RESULT connectChannelAdded(const sigc::slot<void(eDVBChannel*)> &channelAdded, ePtr<eConnection> &connection);
-	int canAllocateChannel(const eDVBChannelID &channelid, const eDVBChannelID &ignore, const eDVBChannelID& ignoresr, int &system, bool simulate=false);
+	int canAllocateChannel(const eDVBChannelID &channelid, const eDVBChannelID &ignore, int &system, bool simulate=false);
 
 		/* allocate channel... */
+	bool frontendPreferenceAllowsChannelUse(const eDVBChannelID &channelid, eUsePtr<iDVBChannel> channel, bool simulate);
 	RESULT allocateChannel(const eDVBChannelID &channelid, eUsePtr<iDVBChannel> &channel, bool simulate=false);
 	RESULT allocatePVRChannel(const eDVBChannelID &channelid, eUsePtr<iDVBPVRChannel> &channel);
 	static RESULT getInstance(ePtr<eDVBResourceManager> &);
@@ -229,23 +242,30 @@ public:
 
 			   there might be a priority given to certain frontend/chid
 			   combinations. this will be evaluated here. */
-	RESULT allocateFrontend(ePtr<eDVBAllocatedFrontend> &fe, ePtr<iDVBFrontendParameters> &feparm, bool simulate=false);
+	RESULT allocateFrontend(ePtr<eDVBAllocatedFrontend> &fe, ePtr<iDVBFrontendParameters> &feparm, bool simulate=false, bool returnScoreOnly=false);
 
 	RESULT allocateFrontendByIndex(ePtr<eDVBAllocatedFrontend> &fe, int slot_index);
+	bool sharedInputInUse(eDVBFrontend *frontend, int type, bool incompatibleOnly);
 			/* allocate a demux able to filter on the selected frontend. */
 	RESULT allocateDemux(eDVBRegisteredFrontend *fe, ePtr<eDVBAllocatedDemux> &demux, int &cap);
+	void refreshNonCIDemuxSources();
+	RESULT acquireRTLSDRAdapter();
+	void releaseRTLSDRAdapter();
 #ifdef SWIG
 public:
 #endif
 	int canAllocateFrontend(ePtr<iDVBFrontendParameters> &feparm, bool simulate=false);
-	bool canMeasureFrontendInputPower();
+	bool canMeasureFrontendInputPower(int slotid=-1);
+	int readFrontendInputPower(int slotid);
 	PSignal1<void,int> frontendUseMaskChanged;
 	SWIG_VOID(RESULT) allocateRawChannel(eUsePtr<iDVBChannel> &SWIG_OUTPUT, int slot_index);
 	PyObject *setFrontendSlotInformations(SWIG_PYOBJECT(ePyObject) list);
+	PyObject *setFrontendInputGroups(SWIG_PYOBJECT(ePyObject) list);
 	bool frontendIsCompatible(int index, const char *type);
 	bool frontendIsMultistream(int index);
 	std::string getFrontendCapabilities(int index);
-	void setFrontendType(int index, const char *types);
+	void setFrontendType(int index, const char *type, bool append=false);
+	int getFrontendType(int index);
 };
 SWIG_TEMPLATE_TYPEDEF(ePtr<eDVBResourceManager>, eDVBResourceManager);
 SWIG_EXTEND(ePtr<eDVBResourceManager>,
@@ -271,6 +291,8 @@ public:
 
 		/* only for managed channels - effectively tunes to the channelid. should not be used... */
 		/* cannot be used for PVR channels. */
+		/* RESULT == 0: succeeded */
+		/* RESULT != 0: failed */
 	RESULT setChannel(const eDVBChannelID &id, ePtr<iDVBFrontendParameters> &feparam);
 	eDVBChannelID getChannelID() { return m_channel_id; }
 
@@ -294,6 +316,7 @@ public:
 
 	RESULT getLength(pts_t &len);
 	RESULT getCurrentPosition(iDVBDemux *decoding_demux, pts_t &pos, int mode);
+	void forceSourcePosition(off_t offset) override;
 
 	int getUseCount() { return m_use_count; }
 
@@ -306,8 +329,10 @@ private:
 
 	ePtr<iDVBFrontendParameters> m_current_frontend_parameters;
 	eDVBChannelID m_channel_id;
+
 	sigc::signal<void(iDVBChannel*)> m_stateChanged;
 	sigc::signal<void(iDVBChannel*,int)> m_event;
+
 	int m_state;
 	ePtr<iTsSource> m_source;
 
@@ -347,6 +372,8 @@ private:
 	ePtr<iDVBDemux> m_tsid_onid_demux;
 	ePtr<eTable<ServiceDescriptionSection> > m_SDT;
 	void SDTready(int err);
+	static int m_debug;
+	static int m_debugSeek; /* -1 = not yet read from config.crash.debugSeek, 0/1 = cached value */
 };
 #endif // SWIG
 
