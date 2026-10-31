@@ -30,9 +30,9 @@ struct uniqueEPGKey
 {
 	int sid, onid, tsid;
 	uniqueEPGKey( const eServiceReference &ref )
-		:sid( ref.type == eServiceReference::idServiceDAB ? (ref.getUnsignedData(6) & 0xffff) : (ref.type != eServiceReference::idInvalid ? ((eServiceReferenceDVB&)ref).getServiceID().get() : -1) )
-		,onid( ref.type == eServiceReference::idServiceDAB ? (ref.getUnsignedData(3) & 0xffff) : (ref.type != eServiceReference::idInvalid ? ((eServiceReferenceDVB&)ref).getOriginalNetworkID().get() : -1) )
-		,tsid( ref.type == eServiceReference::idServiceDAB ? ((ref.getUnsignedData(7) ? ref.getUnsignedData(7) : ref.getUnsignedData(2)) & 0xffff) : (ref.type != eServiceReference::idInvalid ? ((eServiceReferenceDVB&)ref).getTransportStreamID().get() : -1) )
+		:sid( ref.type == eServiceReference::idDVB ? ((eServiceReferenceDVB&)ref).getServiceID().get() : -1 )
+		,onid( ref.type == eServiceReference::idDVB ? ((eServiceReferenceDVB&)ref).getOriginalNetworkID().get() : -1 )
+		,tsid( ref.type == eServiceReference::idDVB ? ((eServiceReferenceDVB&)ref).getTransportStreamID().get() : -1 )
 	{
 	}
 	uniqueEPGKey()
