@@ -65,6 +65,7 @@ dvbinclude_HEADERS = \
 	dvb/fastscan.h \
 	dvb/fbc.h \
 	dvb/filepush.h \
+	dvb/servicetsfilter.h \
 	dvb/frontend.h \
 	dvb/frontendparms.h \
 	dvb/idemux.h \
