@@ -46,6 +46,9 @@ public:
 		/* join the thread, i.e. busywait until thread has finnished. */
 	void kill();
 
+	/* Timed join for interruptible Amlogic file-push shutdown. */
+	bool join(int timeout_ms);
+
 	/* Call pthread_cancel, please don't do this. */
 	void abort_badly() { pthread_cancel(the_thread); }
 private:
