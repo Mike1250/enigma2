@@ -129,8 +129,9 @@ void eDVBSubtitleParser::subtitle_process_line(subtitle_region *region, subtitle
 {
 	if (!region || !object || !region->buffer || !region->buffer->surface || !data || len <= 0)
 		return;
-	bool subcentered = eConfigManager::getConfigBoolValue("config.subtitles.dvb_subtitles_centered");
-	int x = subcentered ? (region->width - len) / 2 : object->object_horizontal_position;
+	// EXACT_V2: Keep each object row at its authored x position. Center the whole
+	// region at display time instead of independently centering every pixel row.
+	int x = object->object_horizontal_position;
 	int y = object->object_vertical_position + line;
 	if (y < 0 || y >= region->height || x >= region->width)
 		return;
@@ -388,11 +389,9 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 			page = new subtitle_page;
 			page->page_regions = 0;
 			page->regions = 0;
-			page->pcs_size = 0; // OpenBH port: initialize PCS cache length.
+			page->pcs_size = -1; // EXACT_V2: no cached composition yet.
 			page->page_version_number = -1;
 			page->page_id = page_id;
-			page->pcs_size = -1;
-			page->page_version_number = -1;
 			page->cluts = 0;
 			page->next = 0;
 			*ppage = page;
@@ -410,15 +409,18 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 
 		page->state = page_state;
 
-		// when acquisition point or mode change: remove all displayed pages.
+		// EXACT_V2: every new PCS replaces the page's region-reference list,
+		// including normal (state 0) updates. Keeping old references causes
+		// duplicates and stale captions after repeated display sets.
+		while (page->page_regions)
+		{
+			subtitle_page_region *next = page->page_regions->next;
+			delete page->page_regions;
+			page->page_regions = next;
+		}
+		// Acquisition/mode-change PCS also resets cached region definitions.
 		if ((page_state == 1) || (page_state == 2))
 		{
-			while (page->page_regions)
-			{
-				subtitle_page_region *p = page->page_regions->next;
-				delete page->page_regions;
-				page->page_regions = p;
-			}
 			while (page->regions)
 			{
 				subtitle_region *p = page->regions->next;
@@ -516,6 +518,7 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 				delete objects;
 				objects = n;
 			}
+			region->objects = 0; // EXACT_V2: do not retain a freed list head.
 			if (region->buffer)
 			{
 				region->buffer=0;
@@ -563,14 +566,15 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 
 		if (region_fill_flag)
 		{
-			if (depth == 1)
-				memset(region->buffer->surface->data, region_2bit_pixel_code, region->height * region->width);
-			else if (depth == 2)
-				memset(region->buffer->surface->data, region_4bit_pixel_code, region->height * region->width);
-			else if (depth == 3)
-				memset(region->buffer->surface->data, region_8bit_pixel_code, region->height * region->width);
-			else
+			// EXACT_V2: the 8-bit surface has a byte stride, potentially > width.
+			int fill = depth == 1 ? region_2bit_pixel_code :
+				depth == 2 ? region_4bit_pixel_code :
+				depth == 3 ? region_8bit_pixel_code : 0;
+			if (depth < 1 || depth > 3)
 				eDebug("[eDVBSubtitleParser] !!!! invalid depth");
+			for (int row = 0; row < region->height; ++row)
+				memset((uint8_t*)region->buffer->surface->data +
+					row * region->buffer->surface->stride, fill, region->width);
 		}
 
 		region->objects = 0;
@@ -877,6 +881,8 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 
 void eDVBSubtitleParser::subtitle_process_pes(uint8_t *pkt, int len)
 {
+	// EXACT_V2: Capture the actual live PES bytes when opted in.
+	dreamtwo_subprobe_pes(pkt, len);
 	// [AML_SUBTITLE_PORT_V1] length-checked PES segment walk with EOD fallback.
 	if (!pkt || len < 11 || pkt[0] != 0 || pkt[1] != 0 || pkt[2] != 1)
 		return;
@@ -1035,11 +1041,13 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 		}
 		if (reg)
 		{
-			if (reg->committed)
-				continue;
-
+			// EXACT_V2: a region must remain redisplayable in later display sets;
+			// reg->committed merely records a prior publication.
 			int x0 = region->region_horizontal_address;
 			int y0 = region->region_vertical_address;
+			if (eConfigManager::getConfigBoolValue("config.subtitles.dvb_subtitles_centered") &&
+				reg->width <= m_display_size.width())
+				x0 = (m_display_size.width() - reg->width) / 2;
 
 			if ((x0 < 0) || (y0 < 0))
 				continue;
@@ -1053,12 +1061,24 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 				clut = clut->next;
 			}
 
-			int clut_size = reg->buffer->surface->clut.colors = reg->depth == subtitle_region::bpp2 ?
+			// EXACT_V2: Publish a separate software-backed pixmap so following
+			// object updates cannot change a page already queued for the OSD.
+			if (!reg->buffer || !reg->buffer->surface || !reg->buffer->surface->data ||
+				reg->width <= 0 || reg->height <= 0 ||
+				reg->buffer->surface->stride < reg->width)
+				continue;
+			ePtr<gPixmap> display_pixmap = new gPixmap(eSize(reg->width, reg->height), 8, 0);
+			if (!display_pixmap || !display_pixmap->surface || !display_pixmap->surface->data ||
+				display_pixmap->surface->stride < reg->width)
+				continue;
+			for (int row = 0; row < reg->height; ++row)
+				memcpy((uint8_t*)display_pixmap->surface->data + row * display_pixmap->surface->stride,
+					(const uint8_t*)reg->buffer->surface->data + row * reg->buffer->surface->stride,
+					(size_t)reg->width);
+			int clut_size = display_pixmap->surface->clut.colors = reg->depth == subtitle_region::bpp2 ?
 				4 : reg->depth == subtitle_region::bpp4 ? 16 : 256;
-
-			reg->buffer->surface->clut.data = new gRGB[clut_size];
-
-			gRGB *palette = reg->buffer->surface->clut.data;
+			display_pixmap->surface->clut.data = new gRGB[clut_size];
+			gRGB *palette = display_pixmap->surface->clut.data;
 
 			subtitle_clut_entry *entries=0;
 			switch(reg->depth)
@@ -1221,10 +1241,11 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 				}
 			}
 
+			// EXACT_V2: probe what is actually passed to the OSD, not a stale buffer.
 			dreamtwo_subprobe_region(reg->region_id, reg->width, reg->height,
-				reg->buffer.operator->(), palette, clut_size);
+				display_pixmap.operator->(), palette, clut_size);
 			eDVBSubtitleRegion Region;
-			Region.m_pixmap = reg->buffer;
+			Region.m_pixmap = display_pixmap;
 			Region.m_position.setX(x0);
 			Region.m_position.setY(y0);
 			Page.m_regions.push_back(Region);
@@ -1239,12 +1260,12 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 DEFINE_REF(eDVBSubtitleParser);
 
 eDVBSubtitleParser::eDVBSubtitleParser()
-	:m_pages(0), m_display_size(720,576)
+	:m_pages(0), m_seen_eod(false), m_display_size(720,576)
 {
 }
 
 eDVBSubtitleParser::eDVBSubtitleParser(iDVBDemux *demux)
-	:m_pages(0), m_display_size(720,576)
+	:m_pages(0), m_seen_eod(false), m_display_size(720,576)
 {
 	setStreamID(0xBD);
 
@@ -1264,7 +1285,11 @@ int eDVBSubtitleParser::stop()
 	if (m_pes_reader)
 	{
 		eDebug("[eDVBSubtitleParser] disable dvb subtitles");
-		return m_pes_reader->stop();
+		RESULT result = m_pes_reader->stop();
+		subtitle_reset();
+		resetParser();
+		m_seen_eod = false;
+		return result;
 	}
 	return -1;
 }
@@ -1274,7 +1299,14 @@ int eDVBSubtitleParser::start(int pid, int composition_page_id, int ancillary_pa
 	if (m_pes_reader && pid >= 0 && pid < 0x1fff)
 	{
 		eDebug("[eDVBSubtitleParser] start on pid 0x%04x with composition_page_id %d and ancillary_page_id %d",
-			pid, composition_page_id, ancillary_page_id);
+		pid, composition_page_id, ancillary_page_id);
+		// EXACT_V2: stop previous PID before clearing stale pages/PES data.
+		m_pes_reader->stop();
+		subtitle_reset();
+		resetParser();
+		m_seen_eod = false;
+		m_display_size = eSize(720, 576);
+		eDebug("[AML_SUBTITLE_V2_EXACT] Fresh subtitle state pid=%04x", pid);
 		m_composition_page_id = composition_page_id;
 		m_ancillary_page_id = ancillary_page_id;
 		return m_pes_reader->start(pid);
