@@ -1516,7 +1516,7 @@ int eTSMPEGDecoder::setState()
 		{
 			m_text->stop();
 			if (m_demux && m_decoder == 0)	// Tuxtxt caching actions only on primary decoder
-				eTuxtxtApp::getInstance()->stopCaching(this);
+				eTuxtxtApp::getInstance()->stopCaching();
 		}
 		m_text = 0;
 	}
@@ -1620,8 +1620,8 @@ int eTSMPEGDecoder::setState()
 			{
 				uint8_t demux = 0;
 				m_demux->getCADemuxID(demux);
-				eTuxtxtApp::getInstance()->initCache(eTSMPEGDecoder::m_debugTXT == 1);
-				eTuxtxtApp::getInstance()->startCaching(m_textpid, demux, this);
+				eTuxtxtApp::getInstance()->initCache();
+				eTuxtxtApp::getInstance()->startCaching(m_textpid, demux);
 			}
 		}
 		else if (m_demux && m_decoder == 0)	// Tuxtxt caching actions only on primary decoder
@@ -1813,7 +1813,7 @@ eTSMPEGDecoder::~eTSMPEGDecoder()
 	fccFreeFD();
 
 	if (m_demux && m_decoder == 0)	// Tuxtxt caching actions only on primary decoder
-		eTuxtxtApp::getInstance()->freeCache(this);
+		eTuxtxtApp::getInstance()->freeCache();
 }
 
 RESULT eTSMPEGDecoder::setVideoPID(int vpid, int type)

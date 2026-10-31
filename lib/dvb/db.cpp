@@ -10,7 +10,6 @@
 #include <lib/base/eenv.h>
 #include <lib/base/eerror.h>
 #include <lib/base/estring.h>
-#include <lib/base/esettings.h>
 #include <lib/base/esimpleconfig.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -267,7 +266,7 @@ int eDVBService::isPlayable(const eServiceReference &ref, const eServiceReferenc
 		if (res_mgr->canAllocateChannel(chid, chid_ignore, system, simulate))
 		{
 			std::string python_config_str;
-			if (eSettings::use_ci_assignment)
+			if (eSimpleConfig::getBool("config.cimisc.use_ci_assignment", false))
 			{
 				int is_ci_playable = 1;
 				PyObject *pName, *pModule, *pFunc;
@@ -299,7 +298,7 @@ int eDVBService::isPlayable(const eServiceReference &ref, const eServiceReferenc
 			}
 			return 1;
 		}
-		if (eSettings::remote_fallback_enabled)
+		if (eSimpleConfig::getBool("config.usage.remote_fallback_enabled", false))
 			return 2;
 	}
 
