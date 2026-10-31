@@ -27,6 +27,7 @@ dvb_libenigma_dvb_a_SOURCES = \
 	dvb/pesparse.cpp \
 	dvb/pmt.cpp \
 	dvb/pvrparse.cpp \
+	dvb/servicetsfilter.cpp \
 	dvb/radiotext.cpp \
 	dvb/rotor_calc.cpp \
 	dvb/scan.cpp \
