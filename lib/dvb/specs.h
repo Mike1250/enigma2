@@ -39,7 +39,14 @@ public:
 	{
 		m_spec.pid     = ServiceDescriptionSection::PID;
 		m_spec.tid     = ServiceDescriptionSection::TID;
-		m_spec.timeout = 60000; // ServiceDescriptionSection::TIMEOUT;
+		/*
+		 * from Digital Video Broadcasting (DVB) Guidelines on implementation and usage of Service Information (SI)
+		 * DVB Document A005 June 2017:
+		 *
+		 * "all sections of the SDT for the actual multiplex shall be transmitted at least every 2 s"
+		 * "all sections of the SDT for other TSs shall be transmitted at least every 10 s if present"
+		 */
+		m_spec.timeout = 2500; // ServiceDescriptionSection::TIMEOUT;
 		m_spec.flags   = eDVBTableSpec::tfAnyVersion |
 			eDVBTableSpec::tfHaveTID | eDVBTableSpec::tfCheckCRC |
 			eDVBTableSpec::tfHaveTimeout;
@@ -49,7 +56,14 @@ public:
 		m_spec.pid     = ServiceDescriptionSection::PID;
 		m_spec.tid     = ServiceDescriptionSection::TID;
 		m_spec.tidext  = tsid;
-		m_spec.timeout = 60000; // ServiceDescriptionSection::TIMEOUT;
+		/*
+		 * from Digital Video Broadcasting (DVB) Guidelines on implementation and usage of Service Information (SI)
+		 * DVB Document A005 June 2017:
+		 *
+		 * "all sections of the SDT for the actual multiplex shall be transmitted at least every 2 s"
+		 * "all sections of the SDT for other TSs shall be transmitted at least every 10 s if present"
+		 */
+		m_spec.timeout = other ? 10500 : 2500; // ServiceDescriptionSection::TIMEOUT;
 		m_spec.flags   = eDVBTableSpec::tfAnyVersion |
 			eDVBTableSpec::tfHaveTID | eDVBTableSpec::tfCheckCRC |
 			eDVBTableSpec::tfHaveTIDExt | eDVBTableSpec::tfHaveTimeout;
@@ -75,8 +89,7 @@ public:
 	{
 		m_spec.pid     = NetworkInformationSection::PID;
 		m_spec.tid     = NetworkInformationSection::TID;
-		//m_spec.timeout = NetworkInformationSection::TIMEOUT;
-		m_spec.timeout = 30000;  // Some Australian broadcasters don't send complete NIT every 10 seconds as required by standards
+		m_spec.timeout = NetworkInformationSection::TIMEOUT;
 		m_spec.flags   = eDVBTableSpec::tfAnyVersion |
 			eDVBTableSpec::tfHaveTID | eDVBTableSpec::tfCheckCRC |
 			eDVBTableSpec::tfHaveTimeout;

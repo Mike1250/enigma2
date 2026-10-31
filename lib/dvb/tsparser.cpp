@@ -11,14 +11,18 @@
 #include <lib/base/ebase.h>
 #include <lib/base/esimpleconfig.h>
 #include <lib/dvb/tsparser.h>
-#include <lib/dvb/decoder.h>     /* full eAudioDecoder definition */
-#include <lib/dvb/audiomanager.h>
+#include <lib/dvb/openatv_audio_backend.h>
+
 #include <lib/base/cfile.h>
 #endif
 
 #include <poll.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sched.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 
 static bool FastMpegCheck(const uint8_t *p)
 {
@@ -552,141 +556,35 @@ void eTsParser::parse(const uint8_t * data, int size,  int is_start)
                      * Values: "passthrough" forces bitstream regardless of global
                      *         "downmix"     forces PCM-decode regardless of global
                      *         empty/other   keeps the global toggle. */
-                    bool wantPassthrough = false;
-                    if (codec_id == AV_CODEC_ID_AC3
-                     || codec_id == AV_CODEC_ID_EAC3
-                     || codec_id == AV_CODEC_ID_DTS
-                     || codec_id == AV_CODEC_ID_TRUEHD
-                     || codec_id == AV_CODEC_ID_AC4) {
-                        static bool s_cached_wp = false;
-                        int dgraw = -1;
-                        CFile::parseInt(&dgraw, "/sys/class/audiodsp/digital_raw");
-                        if (dgraw >= 0)
-                            s_cached_wp = (dgraw != 0);
-                        wantPassthrough = s_cached_wp;
-
-                        std::string ov;
-                        if (codec_id == AV_CODEC_ID_EAC3)
-                            ov = eSimpleConfig::getString("config.av.transcodeac3plus", "");
-                        else if (codec_id == AV_CODEC_ID_DTS)
-                            ov = eSimpleConfig::getString("config.av.dtshd", "");
-                        else if (codec_id == AV_CODEC_ID_TRUEHD)
-                            ov = eSimpleConfig::getString("config.av.truehd", "");
-                        else if (codec_id == AV_CODEC_ID_AC4)
-                            ov = eSimpleConfig::getString("config.av.ac4", "");
-                        if      (ov == "passthrough") wantPassthrough = true;
-                        else if (ov == "downmix")     wantPassthrough = false;
-                        else if (ov == "hdmi_best")   wantPassthrough = true;  /* let sink-cap below decide */
-                        else if (ov == "force_ac3")   wantPassthrough = false; /* EAC3 → PCM → re-encode to AC3 */
-
-                        /* sink-capability gate: PCM fallback if AVR can't decode */
-                        if (wantPassthrough
-                            && !eAudioManager::getInstance()->hasFormat((enum AVCodecID)codec_id))
-                            wantPassthrough = false;
-                    }
-
-                    /* Force re-init when user toggles downmix while a stream
-                     * runs with unchanged codec_id. */
-                    bool route_mismatch =
-                        (wantPassthrough && !m_ePassthrough) ||
-                        (!wantPassthrough && m_ePassthrough);
-                    if (route_mismatch && m_pes.codec_id == codec_id) {
-                        eDebug("[eTsParser] downmix setting toggled, restart route");
-                        m_pes.codec_id = AV_CODEC_ID_NONE;
-                    }
-
+                    /* OpenATV PES/frame recognition retained. Audio output is
+                     * PCM-only until the matching IEC61937 backend is available.
+                     * Do not silently request HDMI bitstream passthrough. */
                     if (m_pes.codec_id != codec_id)
                     {
-                        eDebug("[eTsParser] codec (%s) (%dHz *%d) size(%d) frame(0x%02X%02X%02X%02X%02X%02X%02X%02X) -> %s",
-                               CodecStr(codec_id), samplingRate, channels, frameSize,
-                               q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7],
-                               wantPassthrough ? "PASSTHROUGH" : "PCM-DECODE");
-
-                        if(m_eAudioDecoder) { delete m_eAudioDecoder; m_eAudioDecoder = NULL; }
-                        if(m_ePassthrough)  { delete m_ePassthrough;  m_ePassthrough  = NULL; }
-
-                        /* Real route change to PCM-DECODE: reset codec + spdif
-                         * format mixer to 0 so HDMI link is PCM-consistent
-                         * (iec61937 destructor leaves them alone). */
-                        if (!wantPassthrough) {
-                            FILE *f = fopen("/sys/class/audiodsp/digital_codec", "w");
-                            if (f) { fputs("0\n", f); fclose(f); }
-                            snd_ctl_t *ctl = nullptr;
-                            if (snd_ctl_open(&ctl, "hw:0", 0) == 0) {
-                                snd_ctl_elem_id_t  *id;  snd_ctl_elem_id_alloca(&id);
-                                snd_ctl_elem_value_t *val; snd_ctl_elem_value_alloca(&val);
-                                snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
-                                snd_ctl_elem_id_set_name(id, "Audio spdif format");
-                                snd_ctl_elem_value_set_id(val, id);
-                                snd_ctl_elem_value_set_enumerated(val, 0, 0);
-                                snd_ctl_elem_write(ctl, val);
-                                snd_ctl_close(ctl);
-                            }
-                        }
-
-                        if (wantPassthrough) {
-                            /* HBR upgrade: TrueHD is HBR-only, DTS upgrades
-                             * to DTS-HD MA when the sink advertises DTS-HD. */
-                            bool wantHBR = false;
-                            if (codec_id == AV_CODEC_ID_TRUEHD)
-                                wantHBR = true;
-                            else if (codec_id == AV_CODEC_ID_DTS)
-                                wantHBR = eAudioManager::getInstance()->needsHBR(AV_CODEC_ID_DTS);
-                            m_ePassthrough = new eIec61937Passthrough();
-                            if (m_ePassthrough->start(codec_id, samplingRate, wantHBR) < 0) {
-                                /* HBR failed → retry with standard mode (DTS core fallback). */
-                                if (wantHBR && codec_id == AV_CODEC_ID_DTS) {
-                                    eDebug("[eTsParser] HBR start failed, fall back to DTS-core passthrough");
-                                    if (m_ePassthrough->start(codec_id, samplingRate, false) < 0) {
-                                        delete m_ePassthrough; m_ePassthrough = NULL;
-                                        wantPassthrough = false;
-                                    }
-                                } else {
-                                    delete m_ePassthrough; m_ePassthrough = NULL;
-                                    wantPassthrough = false;  /* fall back to PCM */
-                                }
-                            }
-                        }
-                        if (!wantPassthrough) {
-                            m_eAudioDecoder = new eAudioDecoder();
-                            /* AAC / EAC3 -> AC3 transcode for older AVRs that
-                             * prefer AC3 bitstream over LPCM on S/PDIF.
-                             * Only kicks in when sink advertises AC3. */
-                            const bool aac_force = (codec_id == AV_CODEC_ID_AAC || codec_id == AV_CODEC_ID_AAC_LATM)
-                                && eSimpleConfig::getString("config.av.transcodeaac", "") == "force_ac3";
-                            const bool eac3_force = (codec_id == AV_CODEC_ID_EAC3)
-                                && eSimpleConfig::getString("config.av.transcodeac3plus", "") == "force_ac3";
-                            if ((aac_force || eac3_force)
-                                && eAudioManager::getInstance()->hasFormat(AV_CODEC_ID_AC3)) {
-                                m_eAudioDecoder->m_transcode_to = AV_CODEC_ID_AC3;
-                            }
-                            if (m_eAudioDecoder->start(samplingRate, channels, BYTES_PER_SAMPLE, codec_id) < 0) {
-                                delete m_eAudioDecoder;
-                                m_eAudioDecoder = NULL;
-                                break;
-                            }
+                        if (m_eAudioDecoder) { delete m_eAudioDecoder; m_eAudioDecoder = NULL; }
+                        m_eAudioDecoder = new eAudioDecoder();
+                        if (m_eAudioDecoder->start(samplingRate, channels, BYTES_PER_SAMPLE, codec_id) < 0)
+                        {
+                            delete m_eAudioDecoder;
+                            m_eAudioDecoder = NULL;
+                            m_pes.codec_id = AV_CODEC_ID_NONE;
+                            break;
                         }
                         m_pes.codec_id = codec_id;
+                        eDebug("[eTsParser] PCM codec=%s rate=%u channels=%u", CodecStr(codec_id), samplingRate, channels);
                     }
-
-                    if (codec_id == AV_CODEC_ID_AC4) {
-                        /* Decoder and IEC 61937-13 burst both want raw_ac4_frame. */
-                        unsigned int hdr = ((q[2] << 8 | q[3]) == 0xFFFF) ? 7u : 4u;
-                        unsigned int crc = (q[1] == 0x41) ? 2u : 0u;
-                        const uint8_t *raw = q + hdr;
-                        unsigned int rawSize = frameSize - hdr - crc;
-                        if (m_ePassthrough)
-                            m_ePassthrough->pushFrame(raw, rawSize, m_pes.PTS);
-                        else if (m_eAudioDecoder)
-                            m_eAudioDecoder->decode((uint8_t *)raw, rawSize, m_pes.PTS, m_pes.DTS);
-                    } else if (m_ePassthrough) {
-                        m_ePassthrough->pushFrame((const uint8_t *)q, frameSize, m_pes.PTS);
-                    } else if (m_eAudioDecoder) {
-                        m_eAudioDecoder->decode((uint8_t *)q, frameSize, m_pes.PTS, m_pes.DTS);
+                    if (m_eAudioDecoder)
+                    {
+                        if (codec_id == AV_CODEC_ID_AC4)
+                        {
+                            unsigned int hdr = ((q[2] << 8 | q[3]) == 0xFFFF) ? 7u : 4u;
+                            unsigned int crc = (q[1] == 0x41) ? 2u : 0u;
+                            if (frameSize > hdr + crc)
+                                m_eAudioDecoder->decode((uint8_t *)(q + hdr), frameSize - hdr - crc, m_pes.PTS, m_pes.DTS);
+                        }
+                        else
+                            m_eAudioDecoder->decode((uint8_t *)q, frameSize, m_pes.PTS, m_pes.DTS);
                     }
-
-                    //m_pes.PTS = AV_NOPTS_VALUE;
-                    //m_pes.DTS = AV_NOPTS_VALUE;
                     m_pes.Skip += frameSize;
                     break;
                 }
@@ -853,7 +751,6 @@ next_packet:
 
 eTsParser::eTsParser():
     m_eAudioDecoder(0),
-    m_ePassthrough(0),
     m_stop(1),
     m_fd_demux(-1),
     m_pause(false),
@@ -880,6 +777,7 @@ eTsParser::~eTsParser()
 {
     eDebug("[eTsParser] delete eTsParser");
     stop();
+    if (m_pes.Buffer) { free(m_pes.Buffer); m_pes.Buffer = NULL; }
     freeTrueHdParser();
 }
 
@@ -943,6 +841,12 @@ bool eTsParser::trueHdCheck(const uint8_t *p, unsigned int size,
 
 int eTsParser::startPid(int fd_demux)
 {
+    if (!m_stop || fd_demux < 0) return -1;
+    if (!m_pes.Buffer) return -1;
+    m_pes.State = PES_INIT;
+    m_pes.Index = m_pes.Skip = 0;
+    m_pes.PTS = m_pes.DTS = AV_NOPTS_VALUE;
+    m_pes.codec_id = AV_CODEC_ID_NONE;
     m_fd_demux = fd_demux;
     m_stop = 0;
     run();
@@ -959,21 +863,17 @@ void eTsParser::stop()
 
     eDebug("[eTsParser] stop eTsParser");
 
-    /* Wake any blocked pushData before joining - avoids deadlock on kill(). */
-    if (m_eAudioDecoder && m_eAudioDecoder->m_AlsaOutput)
-        m_eAudioDecoder->m_AlsaOutput->stop();
-    if (m_ePassthrough)
-        m_ePassthrough->stop();
-
+    /* The PCM writer is non-blocking and checks for stop on each packet.
+     * Join the worker BEFORE closing ALSA to avoid use-after-close. */
     kill();
 
     av_log_set_callback(&av_log_default_callback);
 
-    if(m_pes.Buffer)
-    {
-        free(m_pes.Buffer);
-        m_pes.Buffer = NULL;
-    }
+    /* Keep PES buffer allocated: Enigma2 may reuse this audio decoder for
+     * a PID change after stop(). The destructor owns the buffer. */
+    m_pes.State = PES_INIT;
+    m_pes.Index = m_pes.Skip = 0;
+    m_pes.codec_id = AV_CODEC_ID_NONE;
 
     if(m_eAudioDecoder)
     {
@@ -981,27 +881,26 @@ void eTsParser::stop()
         m_eAudioDecoder = NULL;
     }
 
-    if(m_ePassthrough)
-    {
-        delete m_ePassthrough;
-        m_ePassthrough = NULL;
-    }
 
 }
 
 void eTsParser::flush()
 {
-
+    if (m_eAudioDecoder) m_eAudioDecoder->flush();
+    m_pes.PTS = AV_NOPTS_VALUE;
+    m_pes.DTS = AV_NOPTS_VALUE;
 }
 
 void eTsParser::freeze()
 {
     m_pause = true;
+    if (m_eAudioDecoder) m_eAudioDecoder->pause(true);
 }
 
 void eTsParser::unfreeze()
 {
     m_pause = false;
+    if (m_eAudioDecoder) m_eAudioDecoder->pause(false);
 }
 
 void eTsParser::setChannel(int channel)
@@ -1011,7 +910,9 @@ void eTsParser::setChannel(int channel)
 
 int eTsParser::getPTS(pts_t &now)
 {
-    now = m_pes.PTS;
+    int64_t value = g_dreamnextgen_audio_presented_pts.load();
+    if (value < 0) return -1;
+    now = (pts_t)value;
     return 0;
 }
 
@@ -1019,7 +920,7 @@ int eTsParser::getPTS(pts_t &now)
 void eTsParser::thread()
 {
 
-    unsigned int tsPktNum = 0;
+    ssize_t tsPktNum = 0;
     uint8_t tsBuffer[INBUF_SIZE]; //1022 * TS_PACKET_SIZE
     struct pollfd fds;
     int rc;
@@ -1058,7 +959,7 @@ void eTsParser::thread()
                 tsPktNum = read(m_fd_demux, tsBuffer, sizeof(tsBuffer));
                 if (tsPktNum <= 0)
                 {
-                    if ((errno == EWOULDBLOCK) | (errno == EAGAIN))
+                    if ((errno == EWOULDBLOCK) | ((errno == EAGAIN || errno == EOVERFLOW)))
                         continue;
                     goto to_end;
                 }

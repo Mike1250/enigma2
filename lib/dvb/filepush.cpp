@@ -1,6 +1,8 @@
 #include "filepush.h"
+#include "timeshiftgap.h"
+#include <stdlib.h>
+#include <string.h>
 #include <lib/base/eerror.h>
-#include <lib/base/esimpleconfig.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -9,22 +11,19 @@
 //#define SHOW_WRITE_TIME
 
 DEFINE_REF(eFilePushThread);
-eFilePushThread::eFilePushThread(int io_prio_class, int io_prio_level, int blocksize, size_t buffersize, int flags)
-	: prio_class(io_prio_class),
-	  prio(io_prio_level),
-	  m_sg(NULL),
-	  m_stop(1),
-	  m_send_pvr_commit(0),
-	  m_stream_mode(0),
-	  m_flags(flags),
-	  m_blocksize(blocksize),
-	  m_buffersize(buffersize),
-	  m_buffer((unsigned char *)malloc(buffersize)),
-	  m_messagepump(eApp, 0, "eFilePushThread"),
-	  m_run_state(0)
+
+eFilePushThread::eFilePushThread(int blocksize, size_t buffersize, int flags):
+	 m_sg(NULL),
+	 m_stop(1),
+	 m_send_pvr_commit(0),
+	 m_stream_mode(0),
+	 m_flags(flags),
+	 m_blocksize(blocksize),
+	 m_buffersize(buffersize),
+	 m_buffer((unsigned char *)malloc(buffersize)),
+	 m_messagepump(eApp, 0, "eFilePushThread"),
+	 m_run_state(0)
 {
-	m_current_position = 0;
-	m_force_position.store(-1, std::memory_order_relaxed); // S8417: no other shared data depends on this store
 	if (m_buffer == NULL)
 		eFatal("[eFilePushThread] Failed to allocate %zu bytes", buffersize);
 	CONNECT(m_messagepump.recv_msg, eFilePushThread::recvEvent);
@@ -43,16 +42,14 @@ static void signal_handler(int x)
 static void ignore_but_report_signals()
 {
 #ifndef HAVE_HISILICON
-	/* We must set a signal mask for the thread otherwise signals
-	 * don't have any effect on platforms other than HiSilicon. */
+	/* we must set a signal mask for the thread otherwise signals don't have any effect */
 	sigset_t sigmask;
 	sigemptyset(&sigmask);
 	sigaddset(&sigmask, SIGUSR1);
 	pthread_sigmask(SIG_UNBLOCK, &sigmask, NULL);
 #endif
 
-	/* Set signal to NOT restart syscalls so we can detect -EINTR.
-	 * SIG_IGN won't work here — we need the syscall to return. */
+	/* we set the signal to not restart syscalls, so we can detect our signal. */
 	struct sigaction act = {};
 	act.sa_handler = signal_handler; // no, SIG_IGN doesn't do it. we want to receive the -EINTR
 	act.sa_flags = 0;
@@ -63,9 +60,7 @@ void eFilePushThread::thread()
 {
 	ignore_but_report_signals();
 	hasStarted(); /* "start()" blocks until we get here */
-	setIoPrio(prio_class, prio);
 	eDebug("[eFilePushThread] START thread");
-	bool sourceReady = !m_source->isStream();
 
 	do
 	{
@@ -77,42 +72,29 @@ void eFilePushThread::thread()
 		size_t current_span_remaining = 0;
 		m_sof = 0;
 
+		/* Timeshift-only PTS gap compensator. No impact on ordinary PVR,
+		 * live DVB, MoviePlayer, or the recording writer. */
+		eTimeshiftGapClock ts_gap;
+		bool ts_gap_position_valid = false;
+		off_t ts_gap_next_position = 0;
+		uint64_t ts_gap_max_ms = 120000; // cap corrupt PTS, configurable up to ten minutes
+		const char *gap_enabled_env = getenv("OPENBH_TIMESHIFT_GAP");
+		const bool ts_gap_enabled = m_flags == 1 && m_blocksize == 188 &&
+			(!gap_enabled_env || strcmp(gap_enabled_env, "0") != 0);
+		if (m_flags == 1)
+			eDebug("[OPENBH_TIMESHIFT_GAP_V2] START enabled=%d blocksize=%d",
+				ts_gap_enabled ? 1 : 0, m_blocksize);
+		const char *max_ms_env = getenv("OPENBH_TIMESHIFT_GAP_MAX_MS");
+		if (max_ms_env && *max_ms_env)
+		{
+			char *end = NULL;
+			unsigned long long configured = strtoull(max_ms_env, &end, 10);
+			if (end != max_ms_env && *end == '\0' && configured >= 1000 && configured <= 600000)
+				ts_gap_max_ms = configured;
+		}
+
 		while (!m_stop)
 		{
-			if (!sourceReady)
-			{
-				if (m_source->isConnecting())
-				{
-					// Wait in the worker, without emitting EOF or polling the decoder.
-					usleep(100000);
-					continue;
-				}
-				if (!m_source->valid())
-				{
-					sendEvent(evtReadError);
-					// The initial connection failed; wait for stop/zap, not a busy loop.
-					while (!m_stop)
-						usleep(100000);
-					break;
-				}
-				sourceReady = true;
-				sendEvent(evtSourceReady);
-			}
-
-			/* Check if an external caller (e.g. RAM timeshift seek
-			 * or lap recovery) wants us to jump to a new position.
-			 *
-			 * exchange() atomically reads the value and resets to -1
-			 * in one operation.  Prevents the lost-update race that
-			 * exists with separate if(v>=0) / v=-1 on volatile. */
-			off_t forced = m_force_position.exchange(-1, std::memory_order_relaxed); // S8417: no other shared data depends on this value
-			if (forced >= 0)
-			{
-				m_current_position = forced;
-				current_span_remaining = 0;
-				eDebug("[eFilePushThread] applied forced position %lld", (long long)forced);
-			}
-
 			// eTrace("[FilePushThread][DATA] Pumping data at pos=%lld", (long long)m_current_position);
 			if (m_sg && !current_span_remaining)
 			{
@@ -127,6 +109,15 @@ void eFilePushThread::thread()
 			/* if we have a source span, don't read past the end */
 			if (m_sg && maxread > current_span_remaining)
 				maxread = current_span_remaining;
+
+			/* Timeshift seek/span change begins a new PTS epoch. */
+			if (ts_gap_enabled && ts_gap_position_valid &&
+				m_current_position != ts_gap_next_position)
+			{
+				ts_gap.reset();
+				eDebug("[OPENBH_TIMESHIFT_GAP_V2] RESET on seek/span pos=%lld expected=%lld",
+					(long long)m_current_position, (long long)ts_gap_next_position);
+			}
 
 			/* align to blocksize */
 			maxread -= maxread % m_blocksize;
@@ -179,14 +170,7 @@ void eFilePushThread::thread()
 					struct pollfd pfd = {};
 					pfd.fd = m_fd_dest;
 					pfd.events = POLLIN;
-#ifdef DREAMNEXTGEN
-					/* Shorter poll timeout for timeshift to reduce
-					 * latency when resuming playback. */
-					int poll_timeout = (m_flags & FLAGBIT_TIMESHIFT) ? 100 : 250;
-					switch (poll(&pfd, 1, poll_timeout))
-#else
-					switch (poll(&pfd, 1, 250)) /* wait for 250ms */
-#endif
+					switch (poll(&pfd, 1, 250)) // wait for 250ms
 					{
 					case 0:
 						if ((++poll_timeout_count % 20) == 0)
@@ -209,33 +193,26 @@ void eFilePushThread::thread()
 				if (m_stop)
 					break;
 
-				if (m_flags & FLAGBIT_TIMESHIFT) {
-					if (!(m_flags & FLAGBIT_RAM_MODE) || eofcount == 0) {
-						if (m_sof == 0)
-							sendEvent(evtEOF);
-						else
-							sendEvent(evtUser);
-					}
-					++eofcount;
-#ifdef DREAMNEXTGEN
-					usleep(15000);  /* 15ms — balance between responsiveness and CPU */
-#else
-					usleep(200000);  /* 200ms */
-#endif
-					continue;
-				}
-				/* In stream_mode, we send EOF events repeatedly until
-				 * somebody responds.  Think of evtEOF as "buffer underrun". */
+				/* in stream_mode, we are sending EOF events
+				   over and over until somebody responds.
+
+				   in stream_mode, think of evtEOF as "buffer underrun occurred". */
 				if (m_sof == 0)
 					sendEvent(evtEOF);
 				else
-					sendEvent(evtUser); /* start-of-file event */
+					sendEvent(evtUser); // start of file event
 
 				if (m_stream_mode) {
 					eDebug("[eFilePushThread] reached EOF, but we are in stream mode. delaying 1 second.");
 					sleep(1);
 					continue;
-				} else if (++eofcount < 10) {
+				}
+				else if (m_flags == 1) { // timeshift
+					usleep(200000);  // 200 milliseconds
+					continue;
+				}
+				else if (++eofcount < 10)
+				{
 					eDebug("[eFilePushThread] reached EOF, but the file may grow. delaying 1 second.");
 					sleep(1);
 					continue;
@@ -244,6 +221,32 @@ void eFilePushThread::thread()
 			}
 			else
 			{
+				/* Do not release recovered video and its audio before the missing
+				 * PTS interval has elapsed. Only flag=1, 188-byte timeshift TS.
+				 * This is playback pacing; it never fabricates encrypted TS or
+				 * mutates the original timeshift file/index. */
+				eTimeshiftGapClock::Decision ts_decision;
+				if (ts_gap_enabled)
+				{
+					ts_decision = ts_gap.inspect(m_buffer, buf_end,
+						eTimeshiftGapClock::monotonicMs(), 700, ts_gap_max_ms);
+					if (ts_decision.hold_ms)
+					{
+						eDebug("[OPENBH_TIMESHIFT_GAP_V2] HOLD pid=0x%x jump=%llu ms already_waited=%llu ms hold=%llu ms",
+							ts_decision.video_pid,
+							(unsigned long long)ts_decision.pts_jump_ms,
+							(unsigned long long)ts_decision.elapsed_ms,
+							(unsigned long long)ts_decision.hold_ms);
+						const uint64_t deadline = eTimeshiftGapClock::monotonicMs() + ts_decision.hold_ms;
+						while (!m_stop && eTimeshiftGapClock::monotonicMs() < deadline)
+						{
+							uint64_t remaining = deadline - eTimeshiftGapClock::monotonicMs();
+							usleep((remaining > 50 ? 50 : remaining) * 1000);
+						}
+					}
+				}
+				if (m_stop)
+					break;
 				/* Write data to mux */
 				int buf_start = 0;
 				filterRecordData(m_buffer, buf_end);
@@ -263,14 +266,8 @@ void eFilePushThread::thread()
 						}
 						if (w < 0 && (errno == EINTR || errno == EAGAIN || errno == EBUSY))
 						{
-#if HAVE_CPULOADFIX
-							sleep(2);
-#endif
 #if HAVE_HISILICON
-							usleep(100000); /* 100ms on HiSilicon */
-#endif
-#ifdef DREAMNEXTGEN
-							usleep(2000); /* 2ms — fast retry to keep audio fed */
+							usleep(100000);
 #endif
 							continue;
 						}
@@ -281,6 +278,12 @@ void eFilePushThread::thread()
 					buf_start += w;
 				}
 
+				if (ts_gap_enabled)
+				{
+					ts_gap.delivered(ts_decision, eTimeshiftGapClock::monotonicMs());
+					ts_gap_position_valid = true;
+					ts_gap_next_position = m_current_position + buf_end;
+				}
 				eofcount = 0;
 				m_current_position += buf_end;
 				bytes_read += buf_end;
@@ -312,19 +315,9 @@ void eFilePushThread::start(ePtr<iTsSource> &source, int fd_dest)
 	m_source = source;
 	m_fd_dest = fd_dest;
 	m_current_position = 0;
-	m_force_position.store(-1, std::memory_order_relaxed); // S8417: no other shared data depends on this store
 	m_run_state = 1;
 	m_stop = 0;
 	run();
-}
-
-void eFilePushThread::forcePosition(off_t pos)
-{
-	/* Atomically store the new position.  The push thread will pick
-	 * it up on its next loop iteration via exchange().
-	 * memory_order_relaxed is sufficient: the consumer only reads
-	 * m_force_position — no other shared data depends on this store. */
-	m_force_position.store(pos, std::memory_order_relaxed); // S8417
 }
 
 void eFilePushThread::stop()
@@ -334,17 +327,9 @@ void eFilePushThread::stop()
 		return;
 	m_stop = 1;
 	eDebug("[eFilePushThread] stopping thread");
-	/* A signal arriving between the m_stop check and a blocking
-	 * syscall is lost, so repeat it until the thread has exited. */
-	for (int attempt = 0;; ++attempt)
-	{
-		m_run_cond.signal(); /* Break out of pause if needed */
-		sendSignal(SIGUSR1);
-		if (join(100))
-			break;
-		if (attempt % 50 == 0)
-			eDebug("[eFilePushThread] thread still running, resending signal");
-	}
+	m_run_cond.signal(); /* Break out of pause if needed */
+	sendSignal(SIGUSR1);
+	kill(); /* Kill means join actually */
 }
 
 void eFilePushThread::pause()
@@ -355,7 +340,7 @@ void eFilePushThread::pause()
 		return;
 	}
 	/* Set thread into a paused state by setting m_stop to 2 and wait
-	 * for the thread to acknowledge. */
+	 * for the thread to acknowledge that */
 	eSingleLocker lock(m_run_mutex);
 	m_stop = 2;
 	sendSignal(SIGUSR1);
@@ -375,7 +360,7 @@ void eFilePushThread::resume()
 		return;
 	}
 	/* Resume the paused thread by resetting the flag and
-	 * signal the thread to release it. */
+	 * signal the thread to release it */
 	eSingleLocker lock(m_run_mutex);
 	m_stop = 0;
 	m_run_cond.signal(); /* Tell we're ready to resume */
@@ -398,8 +383,7 @@ void eFilePushThread::setScatterGather(iFilePushScatterGather *sg)
 
 void eFilePushThread::sendEvent(int evt)
 {
-	/* Add a ref to ensure the object isn't destroyed while the
-	 * messagepump contains unhandled messages. */
+	/* add a ref, to make sure the object is not destroyed while the messagepump contains unhandled messages */
 	AddRef();
 	m_messagepump.send(evt);
 }
@@ -407,7 +391,7 @@ void eFilePushThread::sendEvent(int evt)
 void eFilePushThread::recvEvent(const int &evt)
 {
 	m_event(evt);
-	/* Release the ref which we grabbed in sendEvent(). */
+	/* release the ref which we grabbed in sendEvent() */
 	Release();
 }
 
@@ -415,210 +399,24 @@ void eFilePushThread::filterRecordData(const unsigned char *data, int len)
 {
 }
 
-eFilePushThreadRecorder::eFilePushThreadRecorder(unsigned char *buffer, size_t buffersize, int packetSize) : m_fd_source(-1),
-																							 m_buffersize(buffersize),
-																							 m_buffer(buffer),
-																							 m_overflow_count(0),
-																							 m_buffer_fill(0),
-																							 m_stop(1),
-																							 m_packetSize(packetSize),
-																							 m_messagepump(eApp, 0, "eFilePushThreadRecorder")
+
+
+
+eFilePushThreadRecorder::eFilePushThreadRecorder(unsigned char* buffer, size_t buffersize):
+	m_fd_source(-1),
+	m_buffersize(buffersize),
+	m_buffer(buffer),
+	m_overflow_count(0),
+	m_buffer_fill(0),
+	m_stop(1),
+	m_messagepump(eApp, 0, "eFilePushThreadRecorder")
 {
 	m_protocol = m_stream_id = m_session_id = m_packet_no = 0;
 	CONNECT(m_messagepump.recv_msg, eFilePushThreadRecorder::recvEvent);
 
-	/* Ensure min_write doesn't exceed buffer size. */
+	/* Ensure min_write doesn't exceed buffer size */
 	if (m_buffer_min_write > m_buffersize)
 		m_buffer_min_write = m_buffersize;
-}
-
-void eFilePushThreadRecorder::setServiceFilter(int serviceId, int pmtPid, bool shared)
-{
-	if (serviceId <= 0 || serviceId > 0xffff || pmtPid <= 0 || pmtPid >= 0x1fff)
-		return;
-	// Once enabled, keep the output counters continuous even if the broadcaster
-	// stops sharing this PID. Normal transponders never enable the filter.
-	if (shared || m_serviceFilterConfig.load() != -1)
-		m_serviceFilterConfig.store((serviceId << 13) | pmtPid);
-}
-
-int eFilePushThreadRecorder::writeBuffer()
-{
-	int config = m_serviceFilterConfig.load();
-	if (!m_protocol && (m_packetSize == 188 || m_packetSize == 192) && !m_filteredBytes && config != m_appliedFilterConfig)
-	{
-		m_serviceFilter.configure(config >> 13, config & 0x1fff);
-		m_appliedFilterConfig = config;
-		eDebug("[eFilePushThreadRecorder] Filtering shared PMT PID %04x for service %04x", config & 0x1fff, config >> 13);
-	}
-	size_t length = m_buffer_fill;
-	unsigned char tail[192];
-	size_t remainder = 0;
-	if (m_serviceFilter.active())
-	{
-		// Retain an incomplete TS packet across reads, including buffer rotation
-		// by asynchronous writes. Never feed the same bytes to the filter twice.
-		remainder = length % m_packetSize;
-		length -= remainder;
-		memcpy(tail, m_buffer + length, remainder);
-		m_serviceFilter.process(m_buffer + m_filteredBytes, length - m_filteredBytes, m_packetSize);
-		m_filteredBytes = length;
-	}
-	if (!length)
-		return 0;
-	int result = writeData(length);
-	if (result > 0)
-	{
-		m_buffer_fill = remainder;
-		m_filteredBytes = 0;
-		if (remainder)
-			memcpy(m_buffer, tail, remainder);
-	}
-	return result;
-}
-
-#define copy16(a, i, v)           \
-	{                             \
-		a[i] = ((v) >> 8) & 0xFF; \
-		a[i + 1] = (v)&0xFF;      \
-	}
-#define copy32(a, i, v)                \
-	{                                  \
-		a[i] = ((v) >> 24) & 0xFF;     \
-		a[i + 1] = ((v) >> 16) & 0xFF; \
-		a[i + 2] = ((v) >> 8) & 0xFF;  \
-		a[i + 3] = (v)&0xFF;           \
-	}
-#define _PROTO_RTSP_UDP 1
-#define _PROTO_RTSP_TCP 2
-
-int eFilePushThreadRecorder::pushReply(void *buf, int len)
-{
-	m_reply.insert(m_reply.end(), (unsigned char *)buf, (unsigned char *)buf + len);
-	eDebug("pushed reply of %d bytes", len);
-	return 0;
-}
-
-static int errs;
-
-int64_t eFilePushThreadRecorder::getTick() /* ms */
-{
-	struct timespec ts = {};
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (ts.tv_nsec / 1000000) + (ts.tv_sec * 1000);
-}
-
-/* Wrapper around ::read that reads in multiples of 188 (non-blocking). */
-int eFilePushThreadRecorder::read_ts(int fd, unsigned char *buf, int size)
-{
-	int rb = 0, bytes = 0;
-	int left = size;
-	do
-	{
-		rb = ::read(fd, buf + bytes, left);
-		if (rb > 0 && ((bytes % 188) != 0))
-			eDebug("%s read %d out of %d bytes, total %d, size %d, fd %d", ((bytes + rb) % 188) ? "incomplete" : "completed", rb, left, bytes, size, fd);
-
-		if (rb <= 0 && errno != EAGAIN && errno != EINTR)
-			return rb;
-
-		if (rb > 0)
-		{
-			bytes += rb;
-			left -= rb;
-		}
-		if ((bytes % 188) != 0)
-		{
-			left = 188 - (bytes % 188);
-		}
-
-	} while ((bytes % 188) != 0);
-
-	if (bytes == 0)
-		return rb;
-
-	return bytes;
-}
-
-int eFilePushThreadRecorder::read_dmx(int fd, void *m_buffer, int size)
-{
-	unsigned char *buf;
-	int it = 0, pos = 0, bytes = 0;
-	int max_pack = 42;
-	int i, left;
-	static int cnt;
-	unsigned char *b;
-	uint64_t start = getTick();
-	while (size - pos > 188 + 16)
-	{
-		left = size - pos - 16;
-		left = (left > 188 * max_pack) ? 188 * max_pack : (((int)(left / 188) - 1) * 188);
-		if (left < 188)
-			break;
-
-		buf = (unsigned char *)m_buffer + pos;
-
-		bytes = read_ts(fd, buf + 16, left);
-
-		if (bytes <= 0 && errno != EAGAIN && errno != EINTR)
-		{
-			eDebug("error reading from DMX handle %d, errno %d: %m", fd, errno);
-			break;
-		}
-
-		if (bytes > 0)
-		{
-			if ((bytes % 188) != 0)
-				eDebug("incomplete packet read from %d with size %d", fd, bytes);
-
-			m_packet_no++;
-			it++;
-			for (i = 0; i < bytes; i += 188)
-			{
-				b = buf + 16 + i;
-				int pid = (b[1] & 0x1F) * 256 + b[2];
-
-				if ((b[3] & 0x80)) /* Mark decryption failed if not decrypted by enigma. */
-				{
-					if ((errs++ % 100) == 0)
-						eDebug("decrypt errs %d, pid %d, m_buffer %p, pos %d, buf %p, i %d: %02X %02X %02X %02X", errs, pid, m_buffer, pos, buf, i, b[0], b[1], b[2], b[3]);
-					b[1] |= 0x1F;
-					b[2] |= 0xFF;
-				}
-			}
-			buf[0] = 0x24;
-			buf[1] = 0;
-			copy16(buf, 2, (uint16_t)(bytes + 12));
-			copy16(buf, 4, 0x8021);
-			copy16(buf, 6, m_stream_id);
-			copy32(buf, 8, cnt);
-			copy32(buf, 12, m_session_id);
-			cnt++;
-			pos += bytes + 16;
-		}
-		if (m_reply.size() > 0)
-		{
-			pos = m_reply.size();
-			buf[0] = 0;
-			memcpy(m_buffer, m_reply.data(), pos);
-			eDebug("added reply of %d bytes", pos);
-			m_reply.clear();
-			break; /* Reply to the server ASAP. */
-		}
-		uint64_t ts = getTick() - start;
-
-		if ((pos > 0) && (bytes == -1) && (ts > 50)) /* Don't block more than 50ms if data is available. */
-			break;
-
-		if (bytes < 0)
-			usleep(5000);
-	}
-	uint64_t ts = getTick() - start;
-	if (ts > 1000)
-		eDebug("returning %d bytes from %d, last read %d bytes in %jd ms (iteration %d)", pos, size, bytes, ts, m_packet_no);
-	if (pos == 0)
-		return bytes;
-	return pos;
 }
 
 void eFilePushThreadRecorder::thread()
@@ -627,64 +425,51 @@ void eFilePushThreadRecorder::thread()
 	ignore_but_report_signals();
 	hasStarted(); /* "start()" blocks until we get here */
 #endif
-	setIoPrio(IOPRIO_CLASS_RT, 7);
 	eDebug("[eFilePushThreadRecorder] THREAD START (min_write=%zu KB, buffersize=%zu KB)", m_buffer_min_write >> 10, m_buffersize >> 10);
 
 #ifdef HAVE_HISILICON
-	/* Set signal to not restart syscalls so we can detect our signal. */
+	/* we set the signal to not restart syscalls, so we can detect our signal. */
 	struct sigaction act = {};
 	memset(&act, 0, sizeof(act));
-	act.sa_handler = signal_handler; /* SIG_IGN won't work — we need -EINTR. */
+	act.sa_handler = signal_handler; // no, SIG_IGN doesn't do it. we want to receive the -EINTR
 	act.sa_flags = 0;
 	sigaction(SIGUSR1, &act, 0);
 	hasStarted();
 #endif
 
-	if (m_protocol == _PROTO_RTSP_TCP)
-	{
-		int flags = fcntl(m_fd_source, F_GETFL, 0);
-		flags |= O_NONBLOCK;
-		if (fcntl(m_fd_source, F_SETFL, flags) == -1)
-			eDebug("[eFilePushThreadRecorder] failed setting DMX handle %d in non-blocking mode, error %d: %s", m_fd_source, errno, strerror(errno));
-	}
 
 	m_buffer_fill = 0;
-	m_filteredBytes = 0;
 
-	/* m_stop must be evaluated after each syscall to avoid deadlock
-	 * when recordings are finishing. */
+	/* m_stop must be evaluated after each syscall */
+	/* if it isn't, there's a chance of the thread becoming deadlocked when recordings are finishing */
 	while (!m_stop)
 	{
 		ssize_t bytes;
-		if (m_protocol == _PROTO_RTSP_TCP)
 		{
-			bytes = read_dmx(m_fd_source, m_buffer + m_buffer_fill, m_buffersize - m_buffer_fill);
-		}
-		else
-		{
-		/* Workaround for Broadcom encoder that always returns even
-		 * when there is no data (behaves like O_NONBLOCK).
-		 * All platforms now use poll() — replaces the HiSilicon-
-		 * specific usleep(100000) busy-wait. */
+		/* this works around the buggy Broadcom encoder that always returns even if there is no data */
+		/* (works like O_NONBLOCK even when not opened as such), prevent idle waiting for the data */
+		/* this won't ever hurt, because it will return immediately when there is data or an error condition */
+		/* All platforms now use poll() - this replaces the HiSilicon-specific usleep(100000) */
+
 		struct pollfd pfd = { m_fd_source, POLLIN, 0 };
 		int poll_ret = poll(&pfd, 1, 100);
-		/* m_stop *must* be checked after each syscall. */
+		/* Reminder: m_stop *must* be evaluated after each syscall. */
 		if (m_stop)
 			break;
 
 		if (poll_ret == 0)
 		{
-			/* Timeout — flush accumulated data if any. */
+			/* Timeout - flush accumulated data if any */
 			if (m_buffer_fill > 0)
 			{
-				int w = writeBuffer();
+				int w = writeData(m_buffer_fill);
 				if (w < 0)
 				{
-					int error = errno;
 					eDebug("[eFilePushThreadRecorder] WRITE ERROR on timeout flush: %m");
-					_setWriteError(error);
+					sendEvent(evtWriteError);
 					break;
 				}
+				m_buffer_fill = 0;
 			}
 			continue;
 		}
@@ -697,9 +482,9 @@ void eFilePushThreadRecorder::thread()
 			break;
 		}
 
-		/* Read into buffer at current fill position. */
+		/* Read into buffer at current fill position */
 		bytes = ::read(m_fd_source, m_buffer + m_buffer_fill, m_buffersize - m_buffer_fill);
-		/* Check m_stop regardless of read success. */
+		/* And again: Check m_stop regardless of read success. */
 		if (m_stop)
 			break;
 		}
@@ -711,17 +496,17 @@ void eFilePushThreadRecorder::thread()
 				break;
 			if (errno == EINTR || errno == EBUSY || errno == EAGAIN)
 			{
-				/* No data available — flush what we have if any. */
+				/* No data available - flush what we have if any */
 				if (m_buffer_fill > 0)
 				{
-					int w = writeBuffer();
+					int w = writeData(m_buffer_fill);
 					if (w < 0)
 					{
-						int error = errno;
 						eDebug("[eFilePushThreadRecorder] WRITE ERROR on EAGAIN flush: %m");
-						_setWriteError(error);
+						sendEvent(evtWriteError);
 						break;
 					}
+					m_buffer_fill = 0;
 				}
 				continue;
 			}
@@ -736,10 +521,10 @@ void eFilePushThreadRecorder::thread()
 			break;
 		}
 
-		/* Accumulate data. */
+		/* Accumulate data */
 		m_buffer_fill += bytes;
 
-		/* Write when we have enough data or the buffer is full. */
+		/* Check if we have enough data to write */
 		if (m_buffer_fill >= m_buffer_min_write || m_buffer_fill >= m_buffersize)
 		{
 #ifdef SHOW_WRITE_TIME
@@ -747,7 +532,7 @@ void eFilePushThreadRecorder::thread()
 			struct timeval now = {};
 			gettimeofday(&starttime, NULL);
 #endif
-			int w = writeBuffer();
+			int w = writeData(m_buffer_fill);
 #ifdef SHOW_WRITE_TIME
 			gettimeofday(&now, NULL);
 			suseconds_t diff = (1000000 * (now.tv_sec - starttime.tv_sec)) + now.tv_usec - starttime.tv_usec;
@@ -755,26 +540,28 @@ void eFilePushThreadRecorder::thread()
 #endif
 			if (w < 0)
 			{
-				int error = errno;
 				eDebug("[eFilePushThreadRecorder] WRITE ERROR, aborting thread: %m");
-				_setWriteError(error);
+				sendEvent(evtWriteError);
 				break;
 			}
 			if (w == 0)
 			{
-				/* writeData returned 0 (destination not ready).
-				 * Keep data in buffer and retry on next iteration. */
+				/* writeData returned 0 (destination not ready / poll timeout) */
+				/* Keep data in buffer and retry on next iteration */
 				usleep(1000);
+			}
+			else
+			{
+				/* Write successful, clear buffer */
+				m_buffer_fill = 0;
 			}
 		}
 	}
 
-	/* Flush remaining data. */
-	if (m_buffer_fill > 0 && !_writeError)
+	/* Flush remaining data */
+	if (m_buffer_fill > 0)
 	{
-		int result = writeBuffer();
-		if (result < 0 || (result == 0 && (!m_serviceFilter.active() || m_buffer_fill >= static_cast<size_t>(m_packetSize))))
-			_setWriteError(result < 0 ? errno : EIO);
+		writeData(m_buffer_fill);
 		m_buffer_fill = 0;
 	}
 
@@ -786,42 +573,24 @@ void eFilePushThreadRecorder::thread()
 void eFilePushThreadRecorder::start(int fd)
 {
 	m_fd_source = fd;
-	_writeError = 0;
 	m_stop = 0;
 	run();
 }
 
 void eFilePushThreadRecorder::stop()
 {
-	/* If we aren't running, don't bother stopping. */
+	/* if we aren't running, don't bother stopping. */
 	if (m_stop == 1)
 		return;
 	m_stop = 1;
-	eDebug("[eFilePushThreadRecorder] stopping thread.");
-	/* A signal arriving between the m_stop check and a blocking
-	 * read() is lost, so repeat it until the thread has exited. */
-	for (int attempt = 0;; ++attempt)
-	{
-		sendSignal(SIGUSR1);
-		if (join(100))
-			break;
-		if (attempt % 50 == 0)
-			eDebug("[eFilePushThreadRecorder] thread still running, resending signal");
-	}
+	eDebug("[eFilePushThreadRecorder] stopping thread."); /* just do it ONCE. it won't help to do this more than once. */
+	sendSignal(SIGUSR1);
+	kill();
 }
 
 void eFilePushThreadRecorder::sendEvent(int evt)
 {
 	m_messagepump.send(evt);
-}
-
-void eFilePushThreadRecorder::_setWriteError(int error)
-{
-	if (!_writeError)
-	{
-		_writeError = error ? error : EIO;
-		sendEvent(evtWriteError);
-	}
 }
 
 void eFilePushThreadRecorder::recvEvent(const int &evt)

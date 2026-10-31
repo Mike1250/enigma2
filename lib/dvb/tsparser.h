@@ -2,8 +2,6 @@
 #define __LIB_DVB_TSPARSER_H
 
 extern "C" {
-#include <libavformat/avformat.h>
-#include <libavdevice/avdevice.h>
 #include <libavcodec/avcodec.h>
 #include <libswresample/swresample.h>
 #include <libavutil/opt.h>
@@ -12,12 +10,12 @@ extern "C" {
 #include <libavutil/mem.h>
 }
 
-class eAudioDecoder;        /* defined in lib/dvb/decoder.h */
+class eAudioDecoder;        /* defined in lib/dvb/openatv_audio_backend.h */
 #if defined(__CYGWIN__) || defined(CUSTUM)
 #include "../base/thread.h"
 #include "../base/cfile.h"
 #else
-#include <lib/dvb/iec61937.h>
+
 #include <lib/base/thread.h>
 #include <lib/base/object.h>
 #include <lib/dvb/demux.h>
@@ -129,7 +127,6 @@ public:
     void thread();
 
     eAudioDecoder *m_eAudioDecoder;       /* FFmpeg + ALSA PCM (MP2/AAC) */
-    eIec61937Passthrough *m_ePassthrough; /* AC3/EAC3/DTS bitstream to HDMI */
     void parse(const uint8_t * data, int size,  int is_start);
     int play(const uint8_t * data, int size);
 

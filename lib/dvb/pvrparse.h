@@ -18,10 +18,9 @@ public:
 	~eMPEGStreamInformation();
 
 	int load(const char *filename);
-	void reset();
 
 		/* fixup timestamp near offset, i.e. convert to zero-based */
-	int fixupPTS(const off_t &offset, pts_t &ts, bool debug = false);
+	int fixupPTS(const off_t &offset, pts_t &ts);
 
 		/* get PTS before offset */
 	int getPTS(off_t &offset, pts_t &pts);
@@ -81,19 +80,11 @@ public:
 	/* Used by parser */
 	int startSave(const std::string& filename);
 	int stopSave(void);
-	void setSyncOnStop(bool enabled) { m_syncOnStop = enabled; }
 	virtual void addAccessPoint(off_t offset, pts_t pts, bool streamtime);
 	void writeStructureEntry(off_t offset, unsigned long long data);
 	void commit();
-	int getWriteError() const { return _writeError; }
-	size_t getAccessPointCount() const
-	{
-		return m_access_points.size()
-		     + m_streamtime_access_points.size();
-	}
 private:
 	void close();
-	void _setWriteError(int error);
 	struct AccessPoint
 	{
 		off_t off;
@@ -105,15 +96,11 @@ private:
 	{
 		PendingWrite();
 		~PendingWrite();
-		PendingWrite(const PendingWrite &) = delete;
-		PendingWrite &operator=(const PendingWrite &) = delete;
 		int start(int fd, off_t where, void* buffer, size_t buffer_size);
-		int poll(); // 1 pending, 0 complete, -1 failed; releases only completed requests
+		bool poll(); // releases resources when ready, returns true if released
 		int wait();
 		void* m_buffer;
 		struct aiocb m_aio;
-		bool _pending;
-		int _error;
 	};
 	std::deque<PendingWrite> m_pending_writes;
 	std::string m_filename;
@@ -121,8 +108,6 @@ private:
 	off_t m_structure_pos;
 	void* m_write_buffer;
 	size_t m_buffer_filled;
-	int _writeError;
-	bool m_syncOnStop = true;
 };
 
 
@@ -138,38 +123,37 @@ public:
 private:
 	unsigned char m_pkt[192];
 	int m_pktptr;
-	off_t m_pkt_offset = 0;
 	int processPacket(const unsigned char *pkt, off_t offset);
 	inline int wantPacket(const unsigned char *pkt) const;
 	void addAccessPoint(off_t offset, pts_t pts, bool streamtime = false);
 	void addAccessPoint(off_t offset, pts_t pts, timespec &now, bool streamtime = false);
-	void resetHEVCParserState();
-	void resetHEVCTail();
-	void scanHEVCNalUnits(const unsigned char *data, const unsigned char *end, off_t data_offset, off_t packet_offset, pts_t pts, int ptsvalid);
 	int m_pid;
-	int m_streamtype = -1;
-	int m_need_next_packet = 0;
-	int m_skip = 0;
-	int m_last_pts_valid = 0; /* m_last_pts contains a valid value */
-	pts_t m_last_pts = 0; /* last pts value, either from mpeg stream, or measured in streamtime */
+	int m_streamtype;
+	int m_need_next_packet;
+	int m_skip;
+	int m_last_pts_valid; /* m_last_pts contains a valid value */
+	pts_t m_last_pts; /* last pts value, either from mpeg stream, or measured in streamtime */
 	pts_t m_first_pts;
 	int m_packetsize;
 	int m_header_offset;
 	timespec m_last_access_point; /* timespec at which the previous access point was reported */
-	bool m_enable_accesspoints = true; /* set to false to prevent saving .ap files (e.g. timeshift) */
-	bool m_pts_found = false; /* 'real' mpeg pts has been found, no longer measuring streamtime */
-	bool m_has_accesspoints = false;
-	bool m_hevc_current_pts_valid = false;
-	pts_t m_hevc_current_pts = 0;
-	bool m_hevc_last_ap_pts_valid = false;
-	pts_t m_hevc_last_ap_pts = 0;
-	unsigned char m_hevc_tail[7];
-	off_t m_hevc_tail_offsets[7];
-	off_t m_hevc_tail_packet_offsets[7];
-	int m_hevc_tail_size = 0;
-	int m_last_cc = 0;
-	bool m_last_cc_valid = false;
-	unsigned int m_cc_errors = 0;
+	bool m_enable_accesspoints; /* set to false to prevent saving .ap files (e.g. timeshift) */
+	bool m_pts_found; /* 'real' mpeg pts has been found, no longer measuring streamtime */
+	bool m_has_accesspoints;
+	/* H.264/H.265 access points are normally triggered by the AUD's pic_type
+	 * hint ("this access unit is I-slices only"), which some encoders set
+	 * permissively/incorrectly and so never actually fires - confirmed in
+	 * production against real streams whose AUD pic_type never indicates a
+	 * keyframe even across genuine IDR access units, leaving .ap permanently
+	 * empty. A real IDR slice NAL (H.264 type 5, H.265 types 19/20) is a
+	 * spec-guaranteed random-access point that doesn't depend on that hint,
+	 * and is used as an additional, more reliable trigger alongside it (not
+	 * instead of it) - see processPacket()'s MPEG4_H264/H265_HEVC cases. This
+	 * flag gates it to at most one extra access point per access unit, reset
+	 * at each AUD; starts true so a lone IDR-type NAL seen before this
+	 * parser's first AUD (e.g. joining a stream mid-GOP) doesn't fire on a
+	 * partial access unit. */
+	bool m_idr_ap_written_this_au;
 };
 
 #endif

@@ -41,34 +41,10 @@ class OCSection : public LongCrcSection
 		void *getData() { return data; }
 };
 
-#include <list>
-#include <string>
-#include <vector>
-class HbbTVApplicationInfo
-{
-public:
-	int m_OrgId;
-	int m_AppId;
-	int m_ControlCode;
-	short m_ProfileCode;
-	int m_UsageType;
-	std::string m_HbbTVUrl;
-	std::string m_ApplicationName;
-public:
-	HbbTVApplicationInfo(int controlCode, int orgid, int appid, std::string hbbtvUrl, std::string applicationName, int profileCode, int usageType = 0)
-		: m_OrgId(orgid), m_AppId(appid), m_ControlCode(controlCode), m_ProfileCode(profileCode), m_UsageType(usageType),
-		m_HbbTVUrl(hbbtvUrl), m_ApplicationName(applicationName)
-	{}
-};
-typedef std::list<HbbTVApplicationInfo *> HbbTVApplicationInfoList;
-typedef HbbTVApplicationInfoList::iterator HbbTVApplicationInfoListIterator;
-typedef HbbTVApplicationInfoList::const_iterator HbbTVApplicationInfoListConstIterator;
-
 class eDVBServicePMTHandler: public eDVBPMTParser
 {
 #ifndef SWIG
 	friend class eDVBCAService;
-	friend class eRTSPStreamClient;
 	eServiceReferenceDVB m_reference;
 	ePtr<eDVBService> m_service;
 
@@ -80,7 +56,8 @@ class eDVBServicePMTHandler: public eDVBPMTParser
 	eAUTable<eTable<ApplicationInformationSection> > m_AIT;
 	eAUTable<eTable<OCSection> > m_OC;
 
-	eUsePtr<iDVBChannel> m_channel, m_sr_channel;
+	eUsePtr<iDVBChannel> m_channel;
+	eUsePtr<iDVBChannel> m_sr_channel;
 	eUsePtr<iDVBPVRChannel> m_pvr_channel;
 	ePtr<eDVBResourceManager> m_resourceManager;
 	ePtr<iDVBDemux> m_demux, m_pvr_demux_tmp;
@@ -101,24 +78,14 @@ class eDVBServicePMTHandler: public eDVBPMTParser
 
 	int m_pmt_pid;
 	int m_dsmcc_pid;
-	int m_ait_pid;
-	HbbTVApplicationInfoList m_HbbTVApplications;
 	std::string m_HBBTVUrl;
-	std::string m_ApplicationName;
-	unsigned char m_AITData[4096];
 
 	int m_use_decode_demux;
 	uint8_t m_decode_demux_num;
 	ePtr<eTimer> m_no_pat_entry_delay;
 
-	/* event handlers may stop the service, which frees or destroys this handler */
-	bool *m_destroyed;
-	unsigned int m_free_count;
-	bool sendServiceEvent(int event);
-
 	bool m_pmt_ready;
 	bool m_ca_disabled;
-	static int m_debug;
 public:
 	eDVBServicePMTHandler();
 	~eDVBServicePMTHandler();
@@ -151,8 +118,6 @@ public:
 		eventStopped,
 		eventStartPvrDescramble,   // start PVR Descramble Convert
 		eventChannelAllocated,
-		eventStreamCorrupt,
-		eventSignalLost,       // frontend signal lost during stable operation
 	};
 #ifndef SWIG
 	sigc::signal<void(int)> serviceEvent;
@@ -162,23 +127,17 @@ public:
 	int getDecodeDemux(ePtr<iDVBDemux> &demux);
 	void getAITApplications(std::map<int, std::string> &aitlist);
 	void getCaIds(std::vector<int> &caids, std::vector<int> &ecmpids, std::vector<std::string> &ecmdatabytes);
-	PyObject *getHbbTVApplications();
-	void getHbbTVApplicationInfos(std::vector<HbbTVApplicationInfo> &applications) const;
 
 	int getPVRChannel(ePtr<iDVBPVRChannel> &pvr_channel);
 	int getServiceReference(eServiceReferenceDVB &service) { service = m_reference; return 0; }
 	int getService(ePtr<eDVBService> &service) { service = m_service; return 0; }
 	int getPMT(ePtr<eTable<ProgramMapSection> > &ptr) { return m_PMT.getCurrent(ptr); }
-	bool hasSharedPmtPid(int pmtPid);
 	int getChannel(eUsePtr<iDVBChannel> &channel);
 	int getDemuxID() const { return m_decode_demux_num; }
 	void resetCachedProgram() { m_have_cached_program = false; }
 	void sendEventNoPatEntry();
 	void getHBBTVUrl(std::string &ret) const { ret = m_HBBTVUrl; }
 	void setCaDisable(bool disable) { m_ca_disabled = disable; }
-	void addCaHandler();
-	void removeCaHandler();
-	void allocatePVRChannel();
 
 	enum serviceType
 	{
@@ -204,8 +163,10 @@ public:
 	int tuneExt(eServiceReferenceDVB &ref, ePtr<iTsSource> &, const char *streaminfo_file, eCueSheet *sg=0, bool simulate=false, eDVBService *service = 0, serviceType type = livetv, bool descramble = true);
 
 	void free();
+	void addCaHandler();
+	void removeCaHandler();
 	bool isCiConnected();
-	bool isPmtReady() { return m_pmt_ready; }
+	void allocatePVRChannel();
 private:
 	bool m_have_cached_program;
 	program m_cached_program;

@@ -3,9 +3,288 @@
 #include <lib/dvb/volume.h>
 #include <stdio.h>
 #include <fcntl.h>
-#include <math.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+/* OpenBH IPAudioPlus V4: automatic native Master volume with lightweight player detection.
+ * Active only for the GStreamer audio-only playbin used by IPAudioPlus.
+ * The dlopen path avoids changing existing Enigma2 ALSA link flags.
+ * This section is intentionally built only for the non-HAVE_ALSA OpenBH
+ * volume backend; that backend retains its DVB volume behavior unchanged.
+ */
+#ifndef HAVE_ALSA
+#include <dirent.h>
+#include <dlfcn.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+namespace {
+/* Match exact IPAudioPlus audio-only gst-launch signature, not generic video.
+ * The private URL remains in /proc only and is never logged or copied out.
+ */
+/* Avoid scanning every /proc/<pid>/cmdline on every VOL button press or
+ * every timer tick.  First check the cached player PID; an idle search reads
+ * only /proc/<pid>/comm before opening any command line.
+ * Process discovery is only used for the audio-only GStreamer output, never
+ * for DVB tuner channels, movie files or protected IPAudioPlus URLs.
+ */
+static unsigned long ipaNativeTrackedPid = 0;
+
+static bool ipaNativeMatchesPid(unsigned long pid)
+{
+    if (!pid) return false;
+    char file[96];
+    snprintf(file, sizeof(file), "/proc/%lu/comm", pid);
+    int fd = open(file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char comm[40];
+    ssize_t c = read(fd, comm, sizeof(comm) - 1);
+    close(fd);
+    if (c <= 0) return false;
+    comm[c] = 0;
+    if (c > 0 && comm[c - 1] == '\n') comm[c - 1] = 0;
+    if (strcmp(comm, "gst-launch-1.0") != 0) return false;
+
+    snprintf(file, sizeof(file), "/proc/%lu/cmdline", pid);
+    fd = open(file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char cmd[16384];
+    const ssize_t n = read(fd, cmd, sizeof(cmd));
+    close(fd);
+    if (n <= 0) return false;
+
+    bool gst = false, playbin = false, video = false, audio = false;
+    size_t offset = 0;
+    bool first = true;
+    while (offset < static_cast<size_t>(n))
+    {
+        const char *arg = cmd + offset;
+        const size_t avail = static_cast<size_t>(n) - offset;
+        const size_t len = strnlen(arg, avail);
+        if (len == avail) break;
+        if (first)
+        {
+            const char *base = strrchr(arg, '/');
+            base = base ? base + 1 : arg;
+            gst = strcmp(base, "gst-launch-1.0") == 0;
+            if (!gst) break;
+            first = false;
+        }
+        else if (strcmp(arg, "playbin") == 0) playbin = true;
+        else if (strcmp(arg, "video-sink=fakesink") == 0) video = true;
+        else if (strncmp(arg, "audio-sink=alsasink", 19) == 0) audio = true;
+        offset += len + 1;
+    }
+    return gst && playbin && video && audio;
+}
+
+static bool ipaNativePlayerActive()
+{
+    if (ipaNativeTrackedPid)
+    {
+        if (ipaNativeMatchesPid(ipaNativeTrackedPid)) return true;
+        ipaNativeTrackedPid = 0;
+    }
+    DIR *dir = opendir("/proc");
+    if (!dir) return false;
+    bool active = false;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        char *end = NULL;
+        const unsigned long pid = strtoul(entry->d_name, &end, 10);
+        if (!end || *end != '\0' || pid == 0) continue;
+        if (ipaNativeMatchesPid(pid))
+        {
+            ipaNativeTrackedPid = pid;
+            active = true;
+            break;
+        }
+    }
+    closedir(dir);
+    return active;
+}
+
+/* No build-system or header dependency on ALSA: resolve public mixer ABI. */
+struct IpaNativeAlsa
+{
+    void *lib;
+    void *handle;
+    void *master;
+    int (*mixer_open)(void **, int);
+    int (*mixer_attach)(void *, const char *);
+    int (*mixer_register)(void *, void *, void *);
+    int (*mixer_load)(void *);
+    int (*mixer_close)(void *);
+    void *(*first_elem)(void *);
+    void *(*next_elem)(void *);
+    const char *(*elem_name)(void *);
+    unsigned int (*elem_index)(void *);
+    int (*has_volume)(void *);
+    int (*get_volume)(void *, int, long *);
+    int (*set_volume)(void *, int, long);
+    int (*set_all)(void *, long);
+    int (*get_range)(void *, long *, long *);
+    int (*get_db_range)(void *, long *, long *);
+    int (*set_db_all)(void *, long, int);
+    long min_raw, max_raw, min_db, max_db;
+    bool has_db;
+
+    IpaNativeAlsa() : lib(NULL), handle(NULL), master(NULL),
+        mixer_open(NULL), mixer_attach(NULL), mixer_register(NULL), mixer_load(NULL),
+        mixer_close(NULL), first_elem(NULL), next_elem(NULL), elem_name(NULL),
+        elem_index(NULL), has_volume(NULL), get_volume(NULL), set_volume(NULL),
+        set_all(NULL), get_range(NULL), get_db_range(NULL), set_db_all(NULL),
+        min_raw(0), max_raw(0), min_db(0), max_db(0), has_db(false) {}
+    ~IpaNativeAlsa() { close(); }
+    void close()
+    {
+        master = NULL;
+        if (handle && mixer_close) mixer_close(handle);
+        handle = NULL;
+        if (lib) dlclose(lib);
+        lib = NULL;
+    }
+    bool open()
+    {
+        if (master) return true;
+        if (!lib)
+        {
+            lib = dlopen("libasound.so.2", RTLD_NOW | RTLD_LOCAL);
+            if (!lib) return false;
+#define IPA_DLSYM(field, symbol) \
+            field = reinterpret_cast<decltype(field)>(dlsym(lib, symbol)); \
+            if (!field) { close(); return false; }
+            IPA_DLSYM(mixer_open, "snd_mixer_open")
+            IPA_DLSYM(mixer_attach, "snd_mixer_attach")
+            IPA_DLSYM(mixer_register, "snd_mixer_selem_register")
+            IPA_DLSYM(mixer_load, "snd_mixer_load")
+            IPA_DLSYM(mixer_close, "snd_mixer_close")
+            IPA_DLSYM(first_elem, "snd_mixer_first_elem")
+            IPA_DLSYM(next_elem, "snd_mixer_elem_next")
+            IPA_DLSYM(elem_name, "snd_mixer_selem_get_name")
+            IPA_DLSYM(elem_index, "snd_mixer_selem_get_index")
+            IPA_DLSYM(has_volume, "snd_mixer_selem_has_playback_volume")
+            IPA_DLSYM(get_volume, "snd_mixer_selem_get_playback_volume")
+            IPA_DLSYM(set_volume, "snd_mixer_selem_set_playback_volume")
+            IPA_DLSYM(set_all, "snd_mixer_selem_set_playback_volume_all")
+            IPA_DLSYM(get_range, "snd_mixer_selem_get_playback_volume_range")
+            IPA_DLSYM(get_db_range, "snd_mixer_selem_get_playback_dB_range")
+            IPA_DLSYM(set_db_all, "snd_mixer_selem_set_playback_dB_all")
+#undef IPA_DLSYM
+        }
+        if (mixer_open(&handle, 0) < 0 ||
+            mixer_attach(handle, "hw:0") < 0 ||
+            mixer_register(handle, NULL, NULL) < 0 ||
+            mixer_load(handle) < 0)
+        {
+            close();
+            return false;
+        }
+        for (void *elem = first_elem(handle); elem; elem = next_elem(elem))
+        {
+            const char *name = elem_name(elem);
+            if (name && strcmp(name, "Master") == 0 &&
+                elem_index(elem) == 0 && has_volume(elem))
+            {
+                master = elem;
+                break;
+            }
+        }
+        if (!master || get_range(master, &min_raw, &max_raw) < 0 ||
+            max_raw <= min_raw)
+        {
+            close();
+            return false;
+        }
+        has_db = get_db_range(master, &min_db, &max_db) == 0 && max_db > min_db;
+        return true;
+    }
+    bool read(long &left, long &right)
+    {
+        return master && get_volume(master, 0, &left) >= 0 &&
+            get_volume(master, 1, &right) >= 0;
+    }
+    bool restore(long left, long right)
+    {
+        return master && set_volume(master, 0, left) >= 0 &&
+            set_volume(master, 1, right) >= 0;
+    }
+    bool apply(int level)
+    {
+        if (!master) return false;
+        if (level <= 0) return set_all(master, min_raw) >= 0;
+        if (level >= 100) return set_all(master, max_raw) >= 0;
+        if (has_db)
+        {
+            long db = static_cast<long>(2000.0 * log10(static_cast<double>(level) / 100.0));
+            if (db < min_db) db = min_db;
+            if (db > max_db) db = max_db;
+            return set_db_all(master, db, 0) >= 0;
+        }
+        const long value = min_raw + (max_raw - min_raw) * level / 100;
+        return set_all(master, value) >= 0;
+    }
+};
+
+struct IpaNativeSession
+{
+    IpaNativeAlsa alsa;
+    bool active;
+    long saved_l, saved_r, written_l, written_r;
+    int last_level;
+    IpaNativeSession(): active(false), saved_l(0), saved_r(0),
+        written_l(0), written_r(0), last_level(-1) {}
+    ~IpaNativeSession() { finish(); }
+    void finish()
+    {
+        if (!active) return;
+        long current_l, current_r;
+        /* Only restore levels if nobody else altered Master meanwhile. */
+        if (alsa.read(current_l, current_r) &&
+            current_l == written_l && current_r == written_r)
+        {
+            if (alsa.restore(saved_l, saved_r))
+                eDebug("[IPA Native Master] Restored pre-IPAudioPlus ALSA Master");
+        }
+        active = false;
+        last_level = -1;
+        alsa.close();
+    }
+    void sync(int level, bool present)
+    {
+        if (!present)
+        {
+            finish();
+            return;
+        }
+        if (!active)
+        {
+            if (!alsa.open() || !alsa.read(saved_l, saved_r))
+            {
+                eDebug("[IPA Native Master] Cannot attach to ALSA Master");
+                alsa.close();
+                return;
+            }
+            active = true;
+            last_level = -1;
+            eDebug("[IPA Native Master] GStreamer IPAudioPlus detected");
+        }
+        if (level == last_level) return;
+        if (alsa.apply(level) && alsa.read(written_l, written_r))
+        {
+            last_level = level;
+            eDebug("[IPA Native Master] Applied %d%%", level);
+        }
+        else
+            eDebug("[IPA Native Master] ALSA Master set failed");
+    }
+};
+static IpaNativeSession ipaNativeSession;
+}  // namespace
+#endif // !HAVE_ALSA
+
 
 #include <linux/dvb/version.h>
 #if DVB_API_VERSION < 3
@@ -21,25 +300,17 @@
 #endif
 
 #ifdef HAVE_ALSA
-#ifndef ALSA_VOLUME_MIXER
-#define ALSA_VOLUME_MIXER "Master"
-#endif
-#ifndef ALSA_CARD
-#define ALSA_CARD "default"
-#endif
-#endif
-
-eDVBVolumecontrol *eDVBVolumecontrol::instance = NULL;
-
-#ifdef DREAMNEXTGEN
-eDVBVolumecontrol::VolumeChangeCb eDVBVolumecontrol::s_volume_change_cb = nullptr;
-void eDVBVolumecontrol::registerVolumeChangeCb(VolumeChangeCb cb)
-{
-	s_volume_change_cb = cb;
-}
+# ifndef ALSA_VOLUME_MIXER
+#  define ALSA_VOLUME_MIXER "Master"
+# endif
+# ifndef ALSA_CARD
+#  define ALSA_CARD "default"
+# endif
 #endif
 
-eDVBVolumecontrol *eDVBVolumecontrol::getInstance()
+eDVBVolumecontrol* eDVBVolumecontrol::instance = NULL;
+
+eDVBVolumecontrol* eDVBVolumecontrol::getInstance()
 {
 	if (instance == NULL)
 		instance = new eDVBVolumecontrol;
@@ -47,55 +318,48 @@ eDVBVolumecontrol *eDVBVolumecontrol::getInstance()
 }
 
 eDVBVolumecontrol::eDVBVolumecontrol()
-	: m_volsteps(5)
+:muted(false), leftVol(100), rightVol(100), m_volsteps(5)
 {
 #ifdef HAVE_ALSA
 	mainVolume = NULL;
-	alsaMixerHandle = NULL;
-#ifdef DREAMNEXTGEN
-	// AMLogic-specific ALSA mixer init
-	alsa_card    = ALSA_CARD;   // default device
-	alsa_has_db  = false;
-	alsa_min_raw = 0;
-	alsa_max_raw = 100;
-	alsa_min_db  = 0;
-	alsa_max_db  = 0;
-	// Mixer is opened lazily in ensureMixer()
-#else
-	// Other boxes: open eagerly
 	openMixer();
-#endif // DREAMNEXTGEN
-#endif // HAVE_ALSA
-	mute_zero = false;
-	m_VolumeOffset = 0;
+#endif
 	volumeUnMute();
 	setVolume(100, 100);
+#ifndef HAVE_ALSA
+	/* Native Master updates are event-driven; timer only watches process
+	 * start/stop. One-shot rescheduling reduces GUI-loop /proc work. */
+	if (eApp)
+	{
+		m_ipaNativeTimer = eTimer::create(eApp);
+		m_ipaNativeConnection = m_ipaNativeTimer->timeout.connect(
+			sigc::mem_fun(*this, &eDVBVolumecontrol::ipaNativeTick));
+		m_ipaNativeTimer->start(1200, true);
+		eDebug("[IPA Native Master V4] Automatic native gain; cached process detection");
+	}
+#endif
 }
 
 int eDVBVolumecontrol::openMixer()
 {
 #ifdef HAVE_ALSA
-#ifdef DREAMNEXTGEN
-	// AMLogic uses the robust lazy mixer init
-	return ensureMixer() ? 0 : -1;
-#else
 	if (!mainVolume)
 	{
 		int err;
 		char *card = ALSA_CARD;
 
-		eDebug("[eDVBVolumecontrol] Setup ALSA Mixer hw:0:0 - Master %s %s.", ALSA_CARD, ALSA_VOLUME_MIXER);
+		eDebug("[eDVBVolumecontrol] Setup ALSA Mixer %s - %s", ALSA_CARD, ALSA_VOLUME_MIXER);
 		/* Perform the necessary pre-amble to start up ALSA Mixer */
 		err = snd_mixer_open(&alsaMixerHandle, 0);
 		if (err < 0)
 		{
-			eDebug("[eDVBVolumecontrol] Error: Unable to open mixer %s!  (%s)", card, snd_strerror(err));
+			eDebug("[eDVBVolumecontrol] Mixer %s open error: %s", card, snd_strerror(err));
 			return err;
 		}
 		err = snd_mixer_attach(alsaMixerHandle, card);
 		if (err < 0)
 		{
-			eDebug("[eDVBVolumecontrol] Error: Unable to attach mixer to hw:0:0!  (No such device '%s' - %s)", card, snd_strerror(err));
+			eDebug("[eDVBVolumecontrol] Mixer attach %s error: %s", card, snd_strerror(err));
 			snd_mixer_close(alsaMixerHandle);
 			alsaMixerHandle = NULL;
 			return err;
@@ -103,7 +367,7 @@ int eDVBVolumecontrol::openMixer()
 		err = snd_mixer_selem_register(alsaMixerHandle, NULL, NULL);
 		if (err < 0)
 		{
-			eDebug("[eDVBVolumecontrol] Error: Unable to register mixer!  (%s)", snd_strerror(err));
+			eDebug("[eDVBVolumecontrol] Mixer register error: %s", snd_strerror(err));
 			snd_mixer_close(alsaMixerHandle);
 			alsaMixerHandle = NULL;
 			return err;
@@ -111,7 +375,7 @@ int eDVBVolumecontrol::openMixer()
 		err = snd_mixer_load(alsaMixerHandle);
 		if (err < 0)
 		{
-			eDebug("[eDVBVolumecontrol] Error: Unable to load mixer '%s'!  (%s)", card, snd_strerror(err));
+			eDebug("[eDVBVolumecontrol] Mixer %s load error: %s", card, snd_strerror(err));
 			snd_mixer_close(alsaMixerHandle);
 			alsaMixerHandle = NULL;
 			return err;
@@ -125,227 +389,35 @@ int eDVBVolumecontrol::openMixer()
 		mainVolume = snd_mixer_find_selem(alsaMixerHandle, sid);
 	}
 	return mainVolume ? 0 : -1;
-#endif // DREAMNEXTGEN
 #else
-	return open(AUDIO_DEV, O_RDWR);
+	return open( AUDIO_DEV, O_RDWR );
 #endif
 }
-
-#ifdef HAVE_ALSA
-#ifdef DREAMNEXTGEN
-
-/* Linear-amplitude curve dB = 20·log10(level/100) on the HW Master. */
-static void da_set_master(snd_mixer_elem_t *elem, int level,
-                          bool has_db, long min_db, long max_db)
-{
-    if (!elem) return;
-    if (has_db) {
-        long target_db;
-        if (level <= 0)        target_db = min_db;
-        else if (level >= 100) target_db = max_db;
-        else {
-            target_db = (long)(2000.0 * log10((double)level / 100.0));
-            if (target_db < min_db) target_db = min_db;
-            if (target_db > max_db) target_db = max_db;
-        }
-        snd_mixer_selem_set_playback_dB_all(elem, target_db, 0);
-    } else {
-        long rmin = 0, rmax = 100;
-        snd_mixer_selem_get_playback_volume_range(elem, &rmin, &rmax);
-        snd_mixer_selem_set_playback_volume_all(elem,
-            rmin + (rmax - rmin) * level / 100);
-    }
-}
-
-bool eDVBVolumecontrol::ensureMixer()
-{
-	if (alsaMixerHandle && mainVolume)
-		return true;
-
-	int err;
-
-	if (!alsaMixerHandle)
-	{
-		if ((err = snd_mixer_open(&alsaMixerHandle, 0)) < 0)
-		{
-			eDebug("[eDVBVolumecontrol] mixer open failed: %s", snd_strerror(err));
-			alsaMixerHandle = NULL;
-			return false;
-		}
-		if ((err = snd_mixer_attach(alsaMixerHandle, alsa_card)) < 0)
-		{
-			eDebug("[eDVBVolumecontrol] attach '%s' failed: %s", alsa_card, snd_strerror(err));
-			snd_mixer_close(alsaMixerHandle);
-			alsaMixerHandle = NULL;
-			return false;
-		}
-		if ((err = snd_mixer_selem_register(alsaMixerHandle, NULL, NULL)) < 0)
-		{
-			eDebug("[eDVBVolumecontrol] selem_register failed: %s", snd_strerror(err));
-			snd_mixer_close(alsaMixerHandle);
-			alsaMixerHandle = NULL;
-			return false;
-		}
-		if ((err = snd_mixer_load(alsaMixerHandle)) < 0)
-		{
-			eDebug("[eDVBVolumecontrol] mixer_load failed: %s", snd_strerror(err));
-			snd_mixer_close(alsaMixerHandle);
-			alsaMixerHandle = NULL;
-			return false;
-		}
-	}
-
-	if (!mainVolume)
-	{
-		// Try common control names (first match wins)
-		const char *candidates[] = {
-			"Master",
-			"PCM Playback Volume",
-			"LPCM Playback Volume",
-			"PCM"
-		};
-
-		snd_mixer_selem_id_t *sid = 0;
-		snd_mixer_selem_id_alloca(&sid);
-		snd_mixer_selem_id_set_index(sid, 0);
-
-		for (unsigned i = 0; i < sizeof(candidates)/sizeof(candidates[0]); ++i)
-		{
-			snd_mixer_selem_id_set_name(sid, candidates[i]);
-			snd_mixer_elem_t *e = snd_mixer_find_selem(alsaMixerHandle, sid);
-			if (e && snd_mixer_selem_has_playback_volume(e))
-			{
-				mainVolume = e;
-				break;
-			}
-		}
-
-		if (!mainVolume)
-		{
-			eDebug("[eDVBVolumecontrol] no suitable mixer element found");
-			return false;
-		}
-
-		// Decide whether to use dB or raw scaling
-		if (snd_mixer_selem_get_playback_dB_range(mainVolume, &alsa_min_db, &alsa_max_db) == 0
-		    && alsa_max_db > alsa_min_db)
-		{
-			alsa_has_db = true;
-		}
-		else
-		{
-			alsa_has_db = false;
-			long rmin = 0, rmax = 0;
-			snd_mixer_selem_get_playback_volume_range(mainVolume, &rmin, &rmax);
-			alsa_min_raw = rmin;
-			alsa_max_raw = rmax;
-		}
-	}
-
-	return true;
-}
-
-long eDVBVolumecontrol::uiToHw(int ui) const
-{
-	if (ui < 0) ui = 0;
-	if (ui > 100) ui = 100;
-
-	if (alsa_has_db)
-	{
-		// Map 0..100 to millibels [alsa_min_db..alsa_max_db]
-		const long span = alsa_max_db - alsa_min_db;
-		long val = alsa_min_db + (span * ui + 50) / 100;
-		if (val < alsa_min_db) val = alsa_min_db;
-		if (val > alsa_max_db) val = alsa_max_db;
-		return val;
-	}
-	else
-	{
-		// Map 0..100 to raw [alsa_min_raw..alsa_max_raw]
-		const long span = alsa_max_raw - alsa_min_raw;
-		long val = alsa_min_raw + (span * ui + 50) / 100;
-		if (val < alsa_min_raw) val = alsa_min_raw;
-		if (val > alsa_max_raw) val = alsa_max_raw;
-		return val;
-	}
-}
-
-int eDVBVolumecontrol::hwToUi(long hw) const
-{
-	if (alsa_has_db)
-	{
-		const long span = alsa_max_db - alsa_min_db;
-		if (span <= 0) return 0;
-		long ui = ((hw - alsa_min_db) * 100 + span / 2) / span;
-		if (ui < 0) ui = 0;
-		if (ui > 100) ui = 100;
-		return (int)ui;
-	}
-	else
-	{
-		const long span = alsa_max_raw - alsa_min_raw;
-		if (span <= 0) return 0;
-		long ui = ((hw - alsa_min_raw) * 100 + span / 2) / span;
-		if (ui < 0) ui = 0;
-		if (ui > 100) ui = 100;
-		return (int)ui;
-	}
-}
-
-#endif // DREAMNEXTGEN
-#endif // HAVE_ALSA
-
 
 void eDVBVolumecontrol::closeMixer(int fd)
 {
 #ifdef HAVE_ALSA
 	/* we want to keep the alsa mixer */
 #else
-	if (fd >= 0)
-		close(fd);
+	if (fd >= 0) close(fd);
 #endif
 }
 
-/**
- * @brief Increases the volume for the left and right channels.
- *
- * This function increases the volume for the left and right audio channels by the specified amounts.
- * If the specified amount is zero, the volume is increased by a default step value.
- *
- * @param left The amount to increase the left channel volume. If zero, the volume is increased by the default step value.
- * @param right The amount to increase the right channel volume. If zero, the volume is increased by the default step value.
- * @return The new volume level for the left channel.
- */
-int eDVBVolumecontrol::volumeUp(int left, int right)
+void eDVBVolumecontrol::setVolumeSteps(int steps)
+{
+	m_volsteps = steps;
+}
+
+void eDVBVolumecontrol::volumeUp(int left, int right)
 {
 	setVolume(leftVol + (left ? left : m_volsteps), rightVol + (right ? right : m_volsteps));
-	return leftVol;
 }
 
-/**
- * Decreases the volume for the left and right channels.
- *
- * @param left The amount to decrease the left channel volume. If zero, the default volume step is used.
- * @param right The amount to decrease the right channel volume. If zero, the default volume step is used.
- * @return The new volume level for the left channel after the decrease.
- */
-int eDVBVolumecontrol::volumeDown(int left, int right)
+void eDVBVolumecontrol::volumeDown(int left, int right)
 {
 	setVolume(leftVol - (left ? left : m_volsteps), rightVol - (right ? right : m_volsteps));
-	return leftVol;
 }
 
-/**
- * @brief Adjusts the volume to ensure it is within the valid range.
- *
- * This function takes an integer volume value and checks if it is within the
- * acceptable range of 0 to 100. If the volume is less than 0, it sets it to 0.
- * If the volume is greater than 100, it sets it to 100. Otherwise, it returns
- * the original volume value.
- *
- * @param vol The volume value to be checked and adjusted.
- * @return The adjusted volume value, guaranteed to be within the range [0, 100].
- */
 int eDVBVolumecontrol::checkVolume(int vol)
 {
 	if (vol < 0)
@@ -355,133 +427,82 @@ int eDVBVolumecontrol::checkVolume(int vol)
 	return vol;
 }
 
-/**
- * @brief Sets the volume for the left and right channels.
- *
- * This function adjusts the volume levels for the left and right audio channels.
- * The input volume levels are expected to be in the range of 0 to 100.
- * Depending on the system configuration, it either uses ALSA or a custom mixer
- * to set the volume.
- *
- * @param left The volume level for the left channel (0 to 100).
- * @param right The volume level for the right channel (0 to 100).
- * @return The adjusted left volume level.
- */
-int eDVBVolumecontrol::setVolume(int left, int right)
+void eDVBVolumecontrol::setVolume(int left, int right)
 {
-	/* left, right is 0..100 */
-	leftVol = checkVolume(left);
-	rightVol = checkVolume(right);
-
-	m_BaseVolume = (m_VolumeOffset != 0) ? checkVolume(leftVol - m_VolumeOffset) : leftVol;
+		/* left, right is 0..100 */
+	const int checkedLeft = checkVolume(left);
+	const int checkedRight = checkVolume(right);
+	const bool volumeActuallyChanged = (checkedLeft != leftVol || checkedRight != rightVol);
+	leftVol = checkedLeft;
+	rightVol = checkedRight;
+	/* Movie notification is only necessary on a change.  During live DVB
+	 * zapping Enigma2 may reassert the same volume repeatedly; do not wake
+	 * a local-media callback unless the gain really changed. */
+	if (volumeActuallyChanged)
+		volumeChanged.emit();
+	/* V4: use the cached native session; /proc discovery happens on a timer.
+	 * Gain still reaches IPAudioPlus before the original DVB early-return. */
+#ifndef HAVE_ALSA
+	if (ipaNativeSession.active)
+		ipaNativeSession.sync(muted ? 0 : leftVol, true);
+#endif
 
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA leftVol=%d", leftVol);
-#ifdef DREAMNEXTGEN
-	/* HW Master applies to all paths going through default→softvol→dmix. */
-	if (ensureMixer() && mainVolume)
-	{
-		da_set_master(mainVolume, muted ? 0 : leftVol,
-		              alsa_has_db, alsa_min_db, alsa_max_db);
-		if (snd_mixer_selem_has_playback_switch(mainVolume))
-			snd_mixer_selem_set_playback_switch_all(mainVolume, muted ? 0 : 1);
-	}
-	if (s_volume_change_cb)
-		s_volume_change_cb(muted ? 0 : leftVol);
-#else
 	if (mainVolume)
 		snd_mixer_selem_set_playback_volume_all(mainVolume, muted ? 0 : leftVol);
-#endif // DREAMNEXTGEN
 #else
-	/* convert to -1dB steps */
-
-	int minVol = 63;
-	left = minVol - leftVol * minVol / 100;
-	right = minVol - rightVol * minVol / 100;
-	/* now range is 63..0, where 0 is loudest */
+		/* convert to -1dB steps */
+	left = 63 - leftVol * 63 / 100;
+	right = 63 - rightVol * 63 / 100;
+		/* now range is 63..0, where 0 is loudest */
 
 	audio_mixer_t mixer;
 
 	mixer.volume_left = left;
 	mixer.volume_right = right;
 
-	eDebug("[eDVBVolumecontrol] Set volume raw: L=%d R=%d, -1db: L=%d R=%d.", leftVol, rightVol, left, right);
+	eDebug("[eDVBVolumecontrol] Setvolume: raw: %d %d, -1db: %d %d", leftVol, rightVol, left, right);
 
 	int fd = openMixer();
 	if (fd >= 0)
 	{
 #ifdef DVB_API_VERSION
-		if (ioctl(fd, AUDIO_SET_MIXER, &mixer) < 0)
-		{
-			eDebug("[eDVBVolumecontrol] Error: Set volume failed!  (%m)");
-		}
-		// Force mute if vol = 0 because some boxes will not be complete silent.
-		if (leftVol == 0)
-		{
-			mute_zero = true;
-			ioctl(fd, AUDIO_SET_MUTE, true);
-		}
-		else if (mute_zero)
-		{
-			mute_zero = false;
-			if(!muted)
-				ioctl(fd, AUDIO_SET_MUTE, false);
+		if (ioctl(fd, AUDIO_SET_MIXER, &mixer) < 0) {
+			eDebug("[eDVBVolumecontrol] Setvolume failed: %m");
 		}
 #endif
 		closeMixer(fd);
+		return;
 	}
-	else
-	{
-		eTrace("[eDVBVolumecontrol] Error: Unable to open mixer!  (%m)");
-		// Workaround because the mixer is opened exclusive in the driver
-		CFile::writeInt("/proc/stb/avs/0/volume", left); /* in -1dB */
+	else {
+		eDebug("[eDVBVolumecontrol] SetVolume failed to open mixer: %m");
+	}
 
-		// Force mute if vol = 0 because some boxes will not be complete silent.
-		if (leftVol == 0)
-		{
-			mute_zero = true;
-			CFile::writeInt("/proc/stb/audio/j1_mute", 1);
-		}
-		else if (mute_zero)
-		{
-			mute_zero = false;
-			if(!muted)
-				CFile::writeInt("/proc/stb/audio/j1_mute", 0);
-		}
-	}
+	//HACK?
+	CFile::writeInt("/proc/stb/avs/0/volume", left); /* in -1dB */
 #endif
+}
+
+int eDVBVolumecontrol::getVolume()
+{
 	return leftVol;
 }
 
-/**
- * @brief Mutes the volume for the DVB (Digital Video Broadcasting) system.
- *
- * This function mutes the volume by setting the playback volume to zero if ALSA (Advanced Linux Sound Architecture) 
- * is available. If ALSA is not available, it uses the DVB API to mute the audio. Additionally, it writes to a 
- * specific file to ensure the mixer is muted due to exclusive access in the driver.
- *
- * @note The function sets the `muted` member variable to true to indicate that the volume is muted.
- */
+bool eDVBVolumecontrol::isMuted()
+{
+	return muted;
+}
+
+
 void eDVBVolumecontrol::volumeMute()
 {
+	const bool muteActuallyChanged = !muted;
 #ifdef HAVE_ALSA
-	eDebug("[eDVBVolumecontrol] Set volume ALSA Mute.");
-#ifdef DREAMNEXTGEN
-	muted = true;
-	if (ensureMixer() && mainVolume)
-	{
-		da_set_master(mainVolume, 0,
-		              alsa_has_db, alsa_min_db, alsa_max_db);
-		if (snd_mixer_selem_has_playback_switch(mainVolume))
-			snd_mixer_selem_set_playback_switch_all(mainVolume, 0);
-	}
-	if (s_volume_change_cb)
-		s_volume_change_cb(0);
-#else
+	eDebug("[eDVBVolumecontrol] Setvolume: ALSA Mute");
 	if (mainVolume)
 		snd_mixer_selem_set_playback_volume_all(mainVolume, 0);
 	muted = true;
-#endif
 #else
 	int fd = openMixer();
 	if (fd >= 0)
@@ -493,47 +514,25 @@ void eDVBVolumecontrol::volumeMute()
 	}
 	muted = true;
 
-	// Workaround because the mixer is opened exclusive in the driver
+	//HACK?
 	CFile::writeInt("/proc/stb/audio/j1_mute", 1);
+#endif
+	if (muteActuallyChanged)
+		volumeChanged.emit();
+#ifndef HAVE_ALSA
+	if (ipaNativeSession.active)
+		ipaNativeSession.sync(0, true);
 #endif
 }
 
-/**
- * @brief Unmutes the volume control.
- *
- * This function unmutes the volume control by setting the appropriate
- * volume levels and flags. It handles both ALSA and non-ALSA systems.
- *
- * For ALSA systems, it sets the playback volume to the stored left volume
- * level and updates the muted flag.
- *
- * For non-ALSA systems, it opens the mixer device, sends an ioctl command
- * to unmute the audio, and closes the mixer device. Additionally, it writes
- * to a specific file to handle a workaround for exclusive mixer access in
- * the driver.
- *
- * @note This function modifies the `muted` member variable.
- */
 void eDVBVolumecontrol::volumeUnMute()
 {
+	const bool muteActuallyChanged = muted;
 #ifdef HAVE_ALSA
-	eDebug("[eDVBVolumecontrol] Set volume ALSA unMute to L=%d.", leftVol);
-#ifdef DREAMNEXTGEN
-	muted = false;
-	if (ensureMixer() && mainVolume)
-	{
-		da_set_master(mainVolume, leftVol,
-		              alsa_has_db, alsa_min_db, alsa_max_db);
-		if (snd_mixer_selem_has_playback_switch(mainVolume))
-			snd_mixer_selem_set_playback_switch_all(mainVolume, 1);
-	}
-	if (s_volume_change_cb)
-		s_volume_change_cb(leftVol);
-#else
+	eDebug("[eDVBVolumecontrol] Setvolume: ALSA unMute to %d", leftVol);
 	if (mainVolume)
 		snd_mixer_selem_set_playback_volume_all(mainVolume, leftVol);
 	muted = false;
-#endif
 #else
 	int fd = openMixer();
 	if (fd >= 0)
@@ -545,50 +544,35 @@ void eDVBVolumecontrol::volumeUnMute()
 	}
 	muted = false;
 
-	// Workaround because the mixer is opened exclusive in the driver
+	//HACK?
 	CFile::writeInt("/proc/stb/audio/j1_mute", 0);
+#endif
+	if (muteActuallyChanged)
+		volumeChanged.emit();
+#ifndef HAVE_ALSA
+	if (ipaNativeSession.active)
+		ipaNativeSession.sync(leftVol, true);
 #endif
 }
 
-/**
- * @brief Toggles the mute state of the volume.
- *
- * This function checks the current mute state of the volume. If the volume is
- * currently muted, it will unmute the volume. If the volume is not muted, it
- * will mute the volume.
- *
- * @return The new mute state after toggling.
- */
-bool eDVBVolumecontrol::volumeToggleMute()
+void eDVBVolumecontrol::volumeToggleMute()
 {
 	if (isMuted())
 		volumeUnMute();
 	else
 		volumeMute();
-	return muted;
 }
 
-/**
- * @brief Sets the volume offset within the range of -100 to 100.
- *
- * This function adjusts the volume offset to ensure it is within the
- * acceptable range of -100 to 100. It then calculates the new volume
- * based on the base volume and the provided offset, sets the volume,
- * and updates the internal volume offset state.
- *
- * @param offset The desired volume offset, which will be clamped
- *               between -100 and 100 if it falls outside this range.
- * @return The clamped volume offset.
- */
-int eDVBVolumecontrol::setVolumeOffset(int offset)
+#ifndef HAVE_ALSA
+void eDVBVolumecontrol::ipaNativeTick()
 {
-	if (offset < -100)
-		offset = -100;
-	else if (offset > 100)
-		offset = 100;
-
-	int newVol = checkVolume(m_BaseVolume + offset);
-	setVolume(newVol, newVol);
-	m_VolumeOffset = offset;
-	return offset;
+    /* Only player start/stop discovery runs here.  When inactive, scan /proc
+     * about once every 1.2s (never on remote keys); while active validate
+     * the cached PID once per 0.8s. No external program, flag or JSON file.
+     */
+    const bool present = ipaNativePlayerActive();
+    ipaNativeSession.sync(muted ? 0 : leftVol, present);
+    if (m_ipaNativeTimer)
+        m_ipaNativeTimer->start(present ? 800 : 1200, true);
 }
+#endif

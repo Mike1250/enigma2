@@ -1,7 +1,6 @@
 #ifndef __dvb_idemux_h
 #define __dvb_idemux_h
 
-#include <cerrno>
 #include <lib/dvb/idvb.h>
 #include <lib/service/iservicescrambled.h>
 
@@ -60,8 +59,16 @@ public:
 
 	// Set write accumulation threshold (0 = continuous writing)
 	virtual void setMinWrite(size_t size) = 0;
-	// Single-service output only. Other demux implementations may leave PSI unchanged.
-	virtual void setServiceFilter(int serviceId, int pmtPid, bool shared) { }
+
+	/* Attach (or, with fd=-1, detach) a passive monitor fd. When set, a
+	 * best-effort, non-blocking copy of the data actually written to the
+	 * target fd - i.e. already descrambled, when a descrambler is set -
+	 * is also written to the monitor fd. Writes are silently dropped on
+	 * backpressure or error; this must never be allowed to block or
+	 * otherwise affect the primary recording/decode path. The caller is
+	 * responsible for making the fd non-blocking and for closing it -
+	 * detach with fd=-1 before closing. */
+	virtual RESULT setMonitorFD(int fd) = 0;
 
 	enum {
 		eventWriteError,
@@ -74,10 +81,6 @@ public:
 		eventStreamCorrupt
 	};
 	virtual RESULT connectEvent(const sigc::slot<void(int)> &event, ePtr<eConnection> &conn)=0;
-	// Append optional methods so existing recorder vtable slots stay unchanged.
-	virtual RESULT setSplitSize(off_t bytes) { errno = ENOSYS; return -1; }
-	virtual long long getWrittenBytes() { errno = ENOSYS; return -1; }
-	virtual void setSyncOnStop(bool enabled) { }
 };
 
 #endif

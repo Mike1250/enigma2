@@ -20,12 +20,12 @@ StringSegment::~StringSegment()
 {
 }
 
-const uint8_t StringSegment::getMode(void) const
+uint8_t StringSegment::getMode(void) const
 {
 	return mode;
 }
 
-const uint8_t StringSegment::getCompression(void) const
+uint8_t StringSegment::getCompression(void) const
 {
 	return compression;
 }
@@ -175,7 +175,7 @@ const std::string StringValue::getValue(void) const
 	return value;
 }
 
-const uint32_t StringValue::getSize(void) const
+uint32_t StringValue::getSize(void) const
 {
 	return size;
 }
@@ -378,7 +378,7 @@ MasterGuideTable::MasterGuideTable(const uint8_t * const buffer)
 	numberBytes = UINT32(&buffer[5]);
 	descriptorsLoopLength = UINT16(&buffer[9]) & 0xfff;
 
-	for (uint32_t i = 11; i < descriptorsLoopLength + 11u; i += buffer[i + 1] + 2)
+	for (uint16_t i = 11; i < descriptorsLoopLength + 11; i += buffer[i + 1] + 2)
 	{
 		descriptor(&buffer[i], SCOPE_SI);
 	}
@@ -435,7 +435,7 @@ const MasterGuideTableList *MasterGuideTableSection::getTables(void) const
 
 ATSCEvent::ATSCEvent(const uint8_t * const buffer)
 {
-	uint32_t i;
+	uint16_t i;
 	eventId = UINT16(&buffer[0]) & 0x3fff;
 	startTime = UINT32(&buffer[2]);
 	ETMLocation = (buffer[6] >> 4) & 0x3;
@@ -446,7 +446,7 @@ ATSCEvent::ATSCEvent(const uint8_t * const buffer)
 
 	descriptorsLoopLength = DVB_LENGTH(&buffer[10 + titleLength]) & 0xfff;
 
-	for (i = 12 + titleLength; i < 12u + titleLength + descriptorsLoopLength; i += buffer[i + 1] + 2)
+	for (i = 12 + titleLength; i < 12 + titleLength + descriptorsLoopLength; i += buffer[i + 1] + 2)
 		descriptor(&buffer[i], SCOPE_SI);
 }
 

@@ -7,11 +7,6 @@
 #include <lib/base/message.h>
 #include <sys/types.h>
 #include <lib/base/rawfile.h>
-#include <atomic>
-#include <lib/dvb/servicetsfilter.h>
-
-#define FLAGBIT_TIMESHIFT  (1 << 0)
-#define FLAGBIT_RAM_MODE   (1 << 1)
 
 class iFilePushScatterGather
 {
@@ -24,8 +19,8 @@ class eFilePushThread: public eThread, public sigc::trackable, public iObject
 {
 	DECLARE_REF(eFilePushThread);
 public:
-	eFilePushThread(int prio_class=IOPRIO_CLASS_BE, int prio_level=0, int blocksize=188, size_t buffersize=188*1024, int flags=0);
-	~eFilePushThread() override;
+	eFilePushThread(int blocksize=188, size_t buffersize=188*1024, int flags=0);
+	~eFilePushThread();
 	void thread();
 	void stop();
 	void start(ePtr<iTsSource> &source, int destfd);
@@ -38,18 +33,7 @@ public:
 	void setStreamMode(int);
 	void setScatterGather(iFilePushScatterGather *);
 
-	/* Force the read position to the given byte offset.
-	 * Thread-safe: stored via std::atomic, picked up by the push
-	 * thread on its next loop iteration via exchange().  Used by RAM
-	 * timeshift for seek and lap-recovery because the normal cue-sheet
-	 * path goes through tstools which has no valid .ap data for RAM.
-	 *
-	 * exchange() atomically reads the current value and resets to -1
-	 * in one operation — prevents the lost-update race that exists
-	 * with separate read+write on volatile (as in the original code). */
-	void forcePosition(off_t pos);
-
-	enum { evtEOF, evtReadError, evtWriteError, evtUser, evtStopped, evtSourceReady };
+	enum { evtEOF, evtReadError, evtWriteError, evtUser, evtStopped };
 	sigc::signal<void(int)> m_event;
 
 		/* you can send private events if you want */
@@ -57,10 +41,9 @@ public:
 protected:
 	virtual void filterRecordData(const unsigned char *data, int len);
 private:
-	int prio_class;
-	int prio;
 	iFilePushScatterGather *m_sg;
 	int m_stop;
+	bool m_stopped;
 	int m_fd_dest;
 	int m_send_pvr_commit;
 	int m_stream_mode;
@@ -70,7 +53,6 @@ private:
 	size_t m_buffersize;
 	unsigned char* m_buffer;
 	off_t m_current_position;
-	std::atomic<off_t> m_force_position;
 
 	ePtr<iTsSource> m_source;
 
@@ -85,8 +67,7 @@ private:
 class eFilePushThreadRecorder: public eThread, public sigc::trackable
 {
 public:
-	eFilePushThreadRecorder(unsigned char* buffer, size_t buffersize=188*1024, int packetSize=188);
-	int getWriteError() const { return _writeError; }
+	eFilePushThreadRecorder(unsigned char* buffer, size_t buffersize=188*1024);
 	void thread();
 	void stop();
 	void start(int sourcefd);
@@ -95,42 +76,28 @@ public:
 	sigc::signal<void(int)> m_event;
 
 	int getProtocol() { return m_protocol;}
-	void setProtocol(int i){ m_protocol = i;}
 	void setSession(int se, int st) { m_session_id = se; m_stream_id = st;}
 	static const size_t minWriteDefault = 32 * 1024;
 	static const size_t minWriteMPEG = 4 * 1024;
 	void setMinWrite(size_t s) { m_buffer_min_write = s; }
-	void setServiceFilter(int serviceId, int pmtPid, bool shared);
-	int read_dmx(int fd, void *m_buffer, int size);
-	int pushReply(void *buf, int len);
 	void sendEvent(int evt);
-	static int64_t getTick();
-	static int read_ts(int fd, unsigned char *buf, int size);
 protected:
-	/* Write data to the output destination. Returns bytes written.
-	 * On failure returns <0 and sets errno. The implementation may
-	 * freely modify m_buffer. */
+	// This method should write the data out and return the number of bytes written.
+	// If result <0, set 'errno'. The simplest implementation is just "::write(m_buffer, ...)"
+	// The method may freely modify m_buffer and m_buffersize
 	virtual int writeData(int len) = 0;
-	/* Called when the recording thread is stopping. Allows cleanup
-	 * of memory, flushing buffers, and terminating outstanding IO. */
+	// Called when terminating the recording thread. Allows to clean up memory and
+	// flush buffers, terminate outstanding IO requests.
 	virtual void flush() = 0;
-	void _setWriteError(int error);
 
 	int m_fd_source;
 	size_t m_buffersize;
 	unsigned char* m_buffer;
 	unsigned int m_overflow_count;
+	int m_stop;
 	size_t m_buffer_fill;
 	size_t m_buffer_min_write = minWriteDefault;
-	std::atomic<int> m_stop;
-	int _writeError = 0;
 private:
-	int writeBuffer();
-	int m_packetSize;
-	std::atomic<int> m_serviceFilterConfig{-1};
-	int m_appliedFilterConfig = -1;
-	size_t m_filteredBytes = 0;
-	eDVBServiceTSFilter m_serviceFilter;
 	eFixedMessagePump<int> m_messagepump;
 	void recvEvent(const int &evt);
 	int m_protocol, m_session_id, m_stream_id, m_packet_no;

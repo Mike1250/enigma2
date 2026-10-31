@@ -14,8 +14,6 @@
 
 #include <linux/dvb/ca.h>
 #include <sys/socket.h>
-#include <lib/dvb/csaengine.h>
-#include <lib/dvb/csasession.h>
 #include <lib/dvb/cwhandler.h>
 #include <map>
 #include <vector>
@@ -28,7 +26,7 @@ ePMTClient::ePMTClient(eDVBCAHandler *handler, int socket) : eUnixDomainSocket(s
 {
 	receivedTag[0] = 0;
 	receivedLength = 0;
-	receivedData = nullptr;
+	receivedData = NULL;
 	m_protocolVersion = -1;
 	m_serverInfoReceived = false;
 	memset(m_capmt_buffer, 0, sizeof(m_capmt_buffer));
@@ -112,7 +110,7 @@ void ePMTClient::dataAvailable()
 		}
 
 		delete[] receivedData;
-		receivedData = nullptr;
+		receivedData = NULL;
 		receivedLength = 0;
 		memset(receivedHeader, 0, 5);
 	}
@@ -142,7 +140,7 @@ bool ePMTClient::processCaSetDescrPacket()
 	int read;
 	uint32_t serviceId;
 
-	if (receivedData == nullptr)
+	if (receivedData == NULL)
 		receivedData = new unsigned char[fixDataLength];
 	if (bytesAvailable() < fixDataLength - readDataLength) return false;
 	read = readBlock((char*)receivedData + readDataLength, fixDataLength - readDataLength);
@@ -183,8 +181,8 @@ bool ePMTClient::processServerInfoPacket()
 	int fixDataLength = 3; // fix part: 2 byte protocol version + 1 byte info len
 	int read;
 
-	if (receivedData == nullptr)
-		receivedData = new unsigned char[260]{}; // max 256 byte info + 2 bytes protocol version + 1 byte info len + 1 NULL byte
+	if (receivedData == NULL)
+		receivedData = new unsigned char[260]; // max 256 byte info + 2 bytes protocol version + 1 byte info len + 1 NULL byte
 
 	if (readDataLength < fixDataLength)
 	{
@@ -231,7 +229,7 @@ bool ePMTClient::processEcmInfoPacket()
 {
 	int readDataLength = receivedLength - 4;
 	int fixDataLength = 15; // fix part: 2 byte program number + 2 byte caid + 2 byte pid + 4 byte prov + 4 byte ecmtime + 1 hops
-	int read, pos = 0, i = 0, old_pos = 0;
+	int read, pos = 0, i = 0, old_pos;
 	uint32_t serviceId, providerId, ecmTime;
 	uint16_t program, caid, pid;
 	int hops = -1;
@@ -239,9 +237,9 @@ bool ePMTClient::processEcmInfoPacket()
 	unsigned char reader[257];
 	unsigned char from[257];
 	unsigned char protocol[257];
-	unsigned char* dest = nullptr;
+	unsigned char* dest;
 
-	if (receivedData == nullptr)
+	if (receivedData == NULL)
 	{
 		receivedData = new unsigned char[1041]; // fix part 15 byte + 4 strings * a max 256 byte + 1 byte hop
 		memset(receivedData, 0 , 1041);
@@ -404,7 +402,7 @@ static bool isProtocol3CapableClient(int socket_fd)
 	return true;
 }
 
-eDVBCAHandler *eDVBCAHandler::instance = nullptr;
+eDVBCAHandler *eDVBCAHandler::instance = NULL;
 
 DEFINE_REF(eDVBCAHandler);
 
@@ -413,7 +411,7 @@ eDVBCAHandler::eDVBCAHandler()
 {
 	serviceIdCounter = 1;
 	m_protocol3_established = false;
-	if (instance == nullptr)
+	if (instance == NULL)
 	{
 		instance = this;
 	}
@@ -424,7 +422,7 @@ eDVBCAHandler::~eDVBCAHandler()
 {
 	if (instance == this)
 	{
-		instance = nullptr;
+		instance = NULL;
 	}
 	for (ePtrList<ePMTClient>::iterator it = clients.begin(); it != clients.end(); )
 	{
@@ -545,11 +543,11 @@ int eDVBCAHandler::registerService(const eServiceReferenceDVB &ref, int adapter,
 		if (iter < max_demux_slots)
 		{
 			caservice->setUsedDemux(iter, demux_nums[i] & 0xFF);
-			eDebug("[eDVBCAService] add demux %d to slot %d service %s", demux_nums[i] & 0xFF, iter, ref.toString().c_str());
+			eDebug("[eDVBCAHandler] add demux %d to slot %d service %s", demux_nums[i] & 0xFF, iter, ref.toString().c_str());
 		}
 		else
 		{
-			eDebug("[eDVBCAService] no more demux slots free for service %s!!", ref.toString().c_str());
+			eDebug("[eDVBCAHandler] no more demux slots free for service %s!!", ref.toString().c_str());
 			return -1;
 		}
 	}
@@ -570,11 +568,7 @@ int eDVBCAHandler::registerService(const eServiceReferenceDVB &ref, int adapter,
 		// the same service, the PMT is unchanged so buildCAPMT() would skip
 		// sending ("don't build the same CA PMT twice"). Force the softcam to
 		// restart descrambling so it resends CWs for the new CSA session.
-		// Not needed without libdvbcsa or when the service is known to be hardware
-		// descrambled: the restart would only unbind the PIDs briefly and the main
-		// picture stutters.
-		if (service_already_registered && (servicetype == 0 || servicetype == 12)
-			&& eDVBCSAEngine::isAvailable() && eDVBCSASession::cachedCsaAlt(ref) != 0)
+		if (service_already_registered && (servicetype == 0 || servicetype == 12))
 		{
 			// PiP/swap (livetv=0, scrambled_livetv=12): DEFER the CW resend
 			// to handlePMT() so the new CSA session is already activated and
@@ -600,7 +594,7 @@ int eDVBCAHandler::unregisterService(const eServiceReferenceDVB &ref, int adapte
 	CAServiceMap::iterator it = services.find(ref);
 	if (it == services.end())
 	{
-		eDebug("[eDVBCAService] try to unregister non registered %s", ref.toString().c_str());
+		eDebug("[eDVBCAHandler] try to unregister non registered %s", ref.toString().c_str());
 		return -1;
 	}
 	else
@@ -619,7 +613,7 @@ int eDVBCAHandler::unregisterService(const eServiceReferenceDVB &ref, int adapte
 				{
 					if (!freed && caservice->getUsedDemux(iter) == demux_nums[i])
 					{
-						eDebug("[eDVBCAService] free slot %d demux %d for service %s", iter, demux_nums[i], caservice->toString().c_str());
+						eDebug("[eDVBCAHandler] free slot %d demux %d for service %s", iter, demux_nums[i], caservice->toString().c_str());
 						caservice->setUsedDemux(iter, 0xFF);
 						freed = true;
 					}
@@ -633,7 +627,7 @@ int eDVBCAHandler::unregisterService(const eServiceReferenceDVB &ref, int adapte
 			}
 			if (!freed)
 			{
-				eDebug("[eDVBCAService] couldn't free demux slot for demux %d", demux_nums[i]);
+				eDebug("[eDVBCAHandler] couldn't free demux slot for demux %d", demux_nums[i]);
 			}
 			if (i || loops == 1)
 			{
@@ -911,7 +905,7 @@ eDVBCAService::eDVBCAService(const eServiceReferenceDVB &service, uint32_t id)
 
 eDVBCAService::~eDVBCAService()
 {
-	eDebug("[eDVBCAService] free service %s", m_service.toString().c_str());
+	eDebug("[eDVBCAHandler] free service %s", m_service.toString().c_str());
 }
 
 std::string eDVBCAService::toString()
@@ -1003,7 +997,7 @@ int eDVBCAService::buildCAPMT(eTable<ProgramMapSection> *ptr)
 
 	if (data_demux == -1)
 	{
-		eDebug("[eDVBCAService] no data demux found for service %s", m_service.toString().c_str());
+		eDebug("[eDVBCAHandler] no data demux found for service %s", m_service.toString().c_str());
 		return -1;
 	}
 
@@ -1048,14 +1042,14 @@ int eDVBCAService::buildCAPMT(eTable<ProgramMapSection> *ptr)
 		crc = (*i)->getCrc32();
 		if (build_hash == m_prev_build_hash && crc == m_crc32 && !m_force_cw_send)
 		{
-			eDebug("[eDVBCAService] don't build/send the same CA PMT twice");
+			eDebug("[eDVBCAHandler] don't build/send the same CA PMT twice");
 			return -1;
 		}
 		CaProgramMapSection capmt(*i++, m_prev_build_hash ? LIST_UPDATE : LIST_ONLY, CMD_OK_DESCRAMBLING);
 
 		while( i != ptr->getSections().end() )
 		{
-//			eDebug("[eDVBCAService] append");
+//			eDebug("[eDVBCAHandler] append");
 			capmt.append(*i++);
 		}
 
@@ -1162,7 +1156,7 @@ int eDVBCAService::buildCAPMT(ePtr<eDVBService> &dvbservice)
 
 	if (data_demux == -1)
 	{
-		eDebug("[eDVBCAService] no data demux found for service %s", m_service.toString().c_str());
+		eDebug("[eDVBCAHandler] no data demux found for service %s", m_service.toString().c_str());
 		return -1;
 	}
 
