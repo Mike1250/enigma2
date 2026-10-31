@@ -277,7 +277,7 @@ public:
 	}
 
 	eServiceReferenceDVB(eDVBNamespace dvbnamespace, eTransportStreamID transport_stream_id, eOriginalNetworkID original_network_id, eServiceID service_id, int service_type, int source_id = 0)
-		:eServiceReference(eServiceReference::idDVB, eServiceReference::noFlags)
+		:eServiceReference(eServiceReference::idDVB, 0)
 	{
 		setTransportStreamID(transport_stream_id);
 		setOriginalNetworkID(original_network_id);
@@ -300,7 +300,7 @@ public:
 	}
 
 	eServiceReferenceDVB()
-		:eServiceReference(eServiceReference::idDVB, eServiceReference::noFlags)
+		:eServiceReference(eServiceReference::idDVB, 0)
 	{
 	}
 
