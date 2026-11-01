@@ -130,15 +130,20 @@ bool hasNativeMovieAudioSink(GstElement *playbin)
     return native;
 }
 
-/* Run only after PLAYING->PAUSED has completed: an in-place FLUSH seek here
- * discards buffered audio and re-prerolls A/V from one timestamp, matching the
- * recovery observed after the user's manual rewind without a visible jump.
- * No synchronous state wait and no seek while the pipeline is PLAYING. */
-void flushPausedNativeMovie(GstElement *playbin)
+/* [AML_LOCAL_AVSYNC_V6]
+ * The old ACCURATE flush can re-preroll at a non-keyframe on Amlogic's HEVC
+ * hardware decoder.  Existing Enigma2 code independently documents broken
+ * decoder-time reporting across ACCURATE seeks and uses KEY_UNIT instead.
+ * Use a keyframe-aligned flush at PAUSED; never seek a running decoder.
+ * This can snap backward to a keyframe, unlike V5's accurate target.  The
+ * previous V5 mode remains selectable by a runtime marker for comparison.
+ * Return TRUE ONLY when GStreamer accepted the new seek.
+ */
+bool flushPausedNativeMovie(GstElement *playbin)
 {
     const int status = moviePauseFlushState(playbin);
     if ((status & 3) != MoviePauseFlushWaitPaused)
-        return;
+        return false;
 
     gint64 position = -1;
     if (!gst_element_query_position(playbin, GST_FORMAT_TIME, &position) || position < 0)
@@ -147,23 +152,25 @@ void flushPausedNativeMovie(GstElement *playbin)
         setMoviePauseFlushState(playbin, MoviePauseFlushNone);
         if (status & MoviePauseFlushResumeQueued)
             gst_element_set_state(playbin, GST_STATE_PLAYING);
-        return;
+        return false;
     }
 
     /* Persist resume-request bit through the seek's asynchronous preroll. */
     setMoviePauseFlushState(playbin, MoviePauseFlushWaitSeek | (status & MoviePauseFlushResumeQueued));
-    eDebug("[AML_LOCAL_AVSYNC_V5] PAUSED; flushing native audio at %lld ms",
-        (long long)(position / GST_MSECOND));
+    const bool exact = g_file_test("/tmp/dreamtwo_movie_use_accurate_seek", G_FILE_TEST_EXISTS);
+    const GstSeekFlags flags = (GstSeekFlags)(GST_SEEK_FLAG_FLUSH |
+        (exact ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT));
+    eDebug("[AML_LOCAL_AVSYNC_V6] PAUSED; flush requested at %lld ms, mode=%s",
+        (long long)(position / GST_MSECOND), exact ? "accurate (V5)" : "key-unit (V6)");
     const gboolean ok = gst_element_seek(playbin, 1.0, GST_FORMAT_TIME,
-        (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
-        GST_SEEK_TYPE_SET, position, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+        flags, GST_SEEK_TYPE_SET, position, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
     if (!ok)
     {
         eWarning("[AML_LOCAL_AVSYNC_V5] flush seek rejected; retaining normal pause/resume");
         setMoviePauseFlushState(playbin, MoviePauseFlushNone);
         if (status & MoviePauseFlushResumeQueued)
             gst_element_set_state(playbin, GST_STATE_PLAYING);
-        return;
+        return false;
     }
     /* Seek might complete synchronously for a small local file.  Otherwise
      * GST_MESSAGE_ASYNC_DONE below unblocks any queued resume. */
@@ -177,6 +184,7 @@ void flushPausedNativeMovie(GstElement *playbin)
         if (status & MoviePauseFlushResumeQueued)
             gst_element_set_state(playbin, GST_STATE_PLAYING);
     }
+    return true;
 }
 
 
@@ -5717,7 +5725,19 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 					if (moviePauseFlushState(m_gst_playbin) & MoviePauseFlushWaitPaused)
 					{
 						if (m_audio_switch_flush_phase == AudioSwitchFlushNone)
-							flushPausedNativeMovie(m_gst_playbin);
+						{
+							if (flushPausedNativeMovie(m_gst_playbin))
+							{
+								/* Mirror seekToImpl() only after an accepted seek. */
+								m_prev_decoder_time = -1;
+								m_decoder_time_valid_state = 0;
+								if (m_position_baseline_valid)
+									m_position_correction_enabled = false;
+								else
+									m_position_baseline_provisional = -1;
+								eDebug("[AML_LOCAL_AVSYNC_V6] pause flush accepted: reset decoder-time baseline");
+							}
+						}
 						else
 							setMoviePauseFlushState(m_gst_playbin, MoviePauseFlushNone);
 					}
