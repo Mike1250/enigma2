@@ -82,6 +82,104 @@ typedef enum
 namespace
 {
 
+/* [AML_LOCAL_AVSYNC_V5]
+ * Movie-only pause flush state stored on the GstPlayBin itself.  This avoids
+ * changing the public eServiceMP3 ABI and resets automatically on STOP.
+ * The legacy OpenBH path and non-dreamaudiosink paths never arm it.
+ */
+enum MoviePauseFlushPhase
+{
+    MoviePauseFlushNone = 0,
+    MoviePauseFlushWaitPaused = 1,
+    MoviePauseFlushWaitSeek = 2,
+    MoviePauseFlushResumeQueued = 4
+};
+
+GQuark moviePauseFlushQuark()
+{
+    static GQuark quark = g_quark_from_static_string("dreamtwo-movie-pause-flush-v5");
+    return quark;
+}
+
+int moviePauseFlushState(GstElement *pipeline)
+{
+    return pipeline ? GPOINTER_TO_INT(g_object_get_qdata(G_OBJECT(pipeline), moviePauseFlushQuark())) : 0;
+}
+
+void setMoviePauseFlushState(GstElement *pipeline, int state)
+{
+    if (pipeline)
+        g_object_set_qdata(G_OBJECT(pipeline), moviePauseFlushQuark(), GINT_TO_POINTER(state));
+}
+
+/* Explicitly restrict the experiment to the same native sink already used by
+ * working local-movie audio.  It must not affect dvbaudiosink, streams, PiP,
+ * or a fallback audio sink if dreamaudiosink was unavailable. */
+bool hasNativeMovieAudioSink(GstElement *playbin)
+{
+    if (!playbin)
+        return false;
+    GstElement *sink = NULL;
+    g_object_get(G_OBJECT(playbin), "audio-sink", &sink, NULL);
+    if (!sink)
+        return false;
+    GstElementFactory *factory = gst_element_get_factory(sink);
+    const gchar *name = factory ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)) : NULL;
+    const bool native = name && !strcmp(name, "dreamaudiosink");
+    gst_object_unref(sink);
+    return native;
+}
+
+/* Run only after PLAYING->PAUSED has completed: an in-place FLUSH seek here
+ * discards buffered audio and re-prerolls A/V from one timestamp, matching the
+ * recovery observed after the user's manual rewind without a visible jump.
+ * No synchronous state wait and no seek while the pipeline is PLAYING. */
+void flushPausedNativeMovie(GstElement *playbin)
+{
+    const int status = moviePauseFlushState(playbin);
+    if ((status & 3) != MoviePauseFlushWaitPaused)
+        return;
+
+    gint64 position = -1;
+    if (!gst_element_query_position(playbin, GST_FORMAT_TIME, &position) || position < 0)
+    {
+        eWarning("[AML_LOCAL_AVSYNC_V5] pause position unavailable, skipping flush");
+        setMoviePauseFlushState(playbin, MoviePauseFlushNone);
+        if (status & MoviePauseFlushResumeQueued)
+            gst_element_set_state(playbin, GST_STATE_PLAYING);
+        return;
+    }
+
+    /* Persist resume-request bit through the seek's asynchronous preroll. */
+    setMoviePauseFlushState(playbin, MoviePauseFlushWaitSeek | (status & MoviePauseFlushResumeQueued));
+    eDebug("[AML_LOCAL_AVSYNC_V5] PAUSED; flushing native audio at %lld ms",
+        (long long)(position / GST_MSECOND));
+    const gboolean ok = gst_element_seek(playbin, 1.0, GST_FORMAT_TIME,
+        (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
+        GST_SEEK_TYPE_SET, position, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+    if (!ok)
+    {
+        eWarning("[AML_LOCAL_AVSYNC_V5] flush seek rejected; retaining normal pause/resume");
+        setMoviePauseFlushState(playbin, MoviePauseFlushNone);
+        if (status & MoviePauseFlushResumeQueued)
+            gst_element_set_state(playbin, GST_STATE_PLAYING);
+        return;
+    }
+    /* Seek might complete synchronously for a small local file.  Otherwise
+     * GST_MESSAGE_ASYNC_DONE below unblocks any queued resume. */
+    GstState current = GST_STATE_VOID_PENDING, pending = GST_STATE_VOID_PENDING;
+    GstStateChangeReturn ret = gst_element_get_state(playbin, &current, &pending, 0);
+    if (ret == GST_STATE_CHANGE_SUCCESS && current == GST_STATE_PAUSED &&
+        pending == GST_STATE_VOID_PENDING)
+    {
+        setMoviePauseFlushState(playbin, MoviePauseFlushNone);
+        eDebug("[AML_LOCAL_AVSYNC_V5] native audio flush completed synchronously");
+        if (status & MoviePauseFlushResumeQueued)
+            gst_element_set_state(playbin, GST_STATE_PLAYING);
+    }
+}
+
+
 bool isDTSStartupSkipbackContainer(const std::string &path)
 {
 	size_t end = path.find_first_of("?#");
@@ -3147,6 +3245,16 @@ RESULT eServiceMP3::pause()
 		}
 		eDebug("[AML_LOCAL_PAUSE_TOGGLE_V4] play -> PAUSE (current=%s pending=%s)",
 			gst_element_state_get_name(current), gst_element_state_get_name(pending));
+		/* [AML_LOCAL_AVSYNC_V5] Only arm after initial playback, and only
+		 * for native dreamaudiosink.  The PAUSED bus message performs the
+		 * flush; a rapid second key press is queued until that finishes. */
+		if (m_initial_start &&
+			!g_file_test("/tmp/dreamtwo_disable_movie_pause_flush", G_FILE_TEST_EXISTS) &&
+			hasNativeMovieAudioSink(m_gst_playbin))
+		{
+			setMoviePauseFlushState(m_gst_playbin, MoviePauseFlushWaitPaused);
+			eDebug("[AML_LOCAL_AVSYNC_V5] armed native movie pause flush");
+		}
 	}
 	eDebug("[eServiceMP3] pause");
 	return trickSeek(0.0);
@@ -3156,6 +3264,18 @@ RESULT eServiceMP3::unpause()
 {
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
+
+	/* [AML_LOCAL_AVSYNC_V5] A quick second press must not resume the
+	 * pipeline while the native sink still contains audio from before PAUSE.
+	 * Finish the PAUSED + FLUSH seek before requesting PLAYING. */
+	int movie_flush = moviePauseFlushState(m_gst_playbin);
+	if ((movie_flush & 3) == MoviePauseFlushWaitPaused ||
+		(movie_flush & 3) == MoviePauseFlushWaitSeek)
+	{
+		setMoviePauseFlushState(m_gst_playbin, movie_flush | MoviePauseFlushResumeQueued);
+		eDebug("[AML_LOCAL_AVSYNC_V5] queued resume until native audio flush completes");
+		return 0;
+	}
 
 	/* [AML_LOCAL_RESUME_V2] m_paused changes only when the bus message
 	 * arrives.  A quick Pause->Play can see it still false while the playbin
@@ -5413,6 +5533,9 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 				case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
 				{
 					m_paused = false;
+					/* An unrelated state change also cancels a stale pause-flush. */
+					if (moviePauseFlushState(m_gst_playbin))
+						setMoviePauseFlushState(m_gst_playbin, MoviePauseFlushNone);
 
 					if (m_subtitle_switch_deferred && pipelineSettledInPlaying(m_gst_playbin))
 					{
@@ -5589,6 +5712,15 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 				case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
 				{
 					m_paused = true;
+					/* [AML_LOCAL_AVSYNC_V5] Native movie sink has stopped
+					 * accepting new samples; drop the buffered sound now. */
+					if (moviePauseFlushState(m_gst_playbin) & MoviePauseFlushWaitPaused)
+					{
+						if (m_audio_switch_flush_phase == AudioSwitchFlushNone)
+							flushPausedNativeMovie(m_gst_playbin);
+						else
+							setMoviePauseFlushState(m_gst_playbin, MoviePauseFlushNone);
+					}
 					if (m_audio_switch_flush_phase == AudioSwitchFlushWaitPaused)
 					{
 						/* beginAudioSwitchPauseFlush()'s own PAUSED request
@@ -5764,6 +5896,25 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 		{
 			if(GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
 				break;
+
+			/* [AML_LOCAL_AVSYNC_V5] Resume only after the flush seek has
+			 * finished prerolling.  Ignore an earlier PAUSED ASYNC_DONE if
+			 * the new seek is still reporting an async state transition. */
+			int movie_flush = moviePauseFlushState(m_gst_playbin);
+			if ((movie_flush & 3) == MoviePauseFlushWaitSeek)
+			{
+				GstState current = GST_STATE_VOID_PENDING, pending = GST_STATE_VOID_PENDING;
+				GstStateChangeReturn ret = gst_element_get_state(m_gst_playbin, &current, &pending, 0);
+				if (ret != GST_STATE_CHANGE_ASYNC && current == GST_STATE_PAUSED &&
+					pending == GST_STATE_VOID_PENDING)
+				{
+					setMoviePauseFlushState(m_gst_playbin, MoviePauseFlushNone);
+					eDebug("[AML_LOCAL_AVSYNC_V5] native audio flush prerolled, resume=%d",
+						!!(movie_flush & MoviePauseFlushResumeQueued));
+					if (movie_flush & MoviePauseFlushResumeQueued)
+						gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+				}
+			}
 
 			/* [AML_LOCAL_RESUME_V2] Retry an early rejected local start-offset
 			 * seek after preroll completes.  Do not retry on live streams or
