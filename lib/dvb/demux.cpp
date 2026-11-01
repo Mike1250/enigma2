@@ -393,7 +393,9 @@ RESULT eDVBPESReader::start(int pid)
 	dmx_pes_filter_params flt = {};
 	memset(&flt, 0, sizeof(flt));
 
-	flt.pes_type = DMX_PES_OTHER;
+	// This reader is created for DVB subtitle PES, not OpenBH software audio.
+	// Select Amlogic SUB_PES instead of sharing the OTHER_PES DMA buffer.
+	flt.pes_type = DMX_PES_SUBTITLE;
 	flt.pid     = pid;
 	flt.input   = DMX_IN_FRONTEND;
 	flt.output  = DMX_OUT_TAP;
