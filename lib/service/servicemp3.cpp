@@ -3124,10 +3124,32 @@ RESULT eServiceMP3::pause()
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
+	/* [AML_LOCAL_PAUSE_TOGGLE_V4]
+	 * Some OpenBH MediaPlayerActions maps emit pause() for every
+	 * KEY_PLAYPAUSE press and never call unpause().  For local files only,
+	 * treat a second pause() while GST is PAUSED (or moving to PAUSED)
+	 * as the user's resume request.  This also covers an immediate second
+	 * press before the asynchronous PAUSED bus message arrives.
+	 * Keep explicit pause() behavior unchanged on streams, DVB/timeshift
+	 * and while GStreamer is transitioning toward PLAYING. */
+	if (!m_sourceinfo.is_streaming && !m_is_live)
+	{
+		GstState current = GST_STATE_VOID_PENDING;
+		GstState pending = GST_STATE_VOID_PENDING;
+		gst_element_get_state(m_gst_playbin, &current, &pending, 0);
+		const bool already_paused = pending != GST_STATE_PLAYING &&
+			(m_paused || current == GST_STATE_PAUSED || pending == GST_STATE_PAUSED);
+		if (already_paused)
+		{
+			eDebug("[AML_LOCAL_PAUSE_TOGGLE_V4] repeated pause -> RESUME (current=%s pending=%s)",
+				gst_element_state_get_name(current), gst_element_state_get_name(pending));
+			return unpause();
+		}
+		eDebug("[AML_LOCAL_PAUSE_TOGGLE_V4] play -> PAUSE (current=%s pending=%s)",
+			gst_element_state_get_name(current), gst_element_state_get_name(pending));
+	}
 	eDebug("[eServiceMP3] pause");
-	trickSeek(0.0);
-
-	return 0;
+	return trickSeek(0.0);
 }
 
 RESULT eServiceMP3::unpause()
