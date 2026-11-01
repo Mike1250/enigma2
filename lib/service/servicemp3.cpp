@@ -2652,11 +2652,8 @@ void eServiceMP3::tryApplyPendingStartOffset()
 	 * resume point instead of leaving it at pos. Disable correction
 	 * outright and discard any in-progress candidate so it can't still
 	 * confirm later from stale (pre-seek) readings. */
-	if (pos > 0)
-	{
-		m_position_correction_enabled = false;
-		m_position_baseline_provisional = -1;
-	}
+	/* [AML_LOCAL_RESUME_V2] Only disable startup timestamp correction
+	 * after the resume seek was actually accepted. */
 
 	/*
 	 * Deliberately NOT wrapped in an explicit PAUSE -> (blocking wait) ->
@@ -2666,13 +2663,35 @@ void eServiceMP3::tryApplyPendingStartOffset()
 	 * identical, long-proven, non-blocking mechanism every ordinary user
 	 * seek in this class already relies on.
 	 */
-	seekTo(pos);
+	RESULT resume_result = seekTo(pos);
+	if (resume_result < 0)
+	{
+		/* One or two later ASYNC_DONE messages may establish preroll.
+		 * Keep the target and retry without a blocking get_state() call.
+		 * Always release the deferred start event even if no retry arrives. */
+		int attempts = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(m_gst_playbin),
+			"aml-local-start-seek-fails"));
+		if (attempts < 2)
+		{
+			m_pending_start_position = pos;
+			 g_object_set_data(G_OBJECT(m_gst_playbin), "aml-local-start-seek-fails",
+				GINT_TO_POINTER(attempts + 1));
+			eWarning("[AML_LOCAL_RESUME_V2] startup seek rejected, retry %d queued", attempts + 1);
+		}
+		else
+			eWarning("[AML_LOCAL_RESUME_V2] startup seek rejected after retries");
+		if (m_start_events_deferred)
+			fireDeferredStartEvents();
+		return;
+	}
 
-	/* Tell the outside world the resume seek actually landed and playback is
-	 * running from it, not merely requested - see evResumed's own doc
-	 * comment in iservice.h. */
+	if (pos > 0)
+	{
+		m_position_correction_enabled = false;
+		m_position_baseline_provisional = -1;
+	}
+	eDebug("[AML_LOCAL_RESUME_V2] startup resume seek accepted at %lld pts", (long long)pos);
 	m_event((iPlayableService*)this, evResumed);
-
 	if (m_start_events_deferred)
 		fireDeferredStartEvents();
 }
@@ -3116,10 +3135,16 @@ RESULT eServiceMP3::unpause()
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
-	/* no need to unpase if we are not paused already */
-	if (m_currentTrickRatio == 1.0 && !m_paused)
+	/* [AML_LOCAL_RESUME_V2] m_paused changes only when the bus message
+	 * arrives.  A quick Pause->Play can see it still false while the playbin
+	 * has already queued PAUSED.  Check the real/pending pipeline state too. */
+	GstState current = GST_STATE_VOID_PENDING;
+	GstState pending = GST_STATE_VOID_PENDING;
+	gst_element_get_state(m_gst_playbin, &current, &pending, 0);
+	if (m_currentTrickRatio == 1.0 && !m_paused &&
+		current != GST_STATE_PAUSED && pending != GST_STATE_PAUSED)
 	{
-		eDebug("[eServiceMP3] trickSeek no need to unpause!");
+		eDebug("[AML_LOCAL_RESUME_V2] unpause: already playing, skipping");
 		return 0;
 	}
 
@@ -3223,8 +3248,17 @@ RESULT eServiceMP3::trickSeek(gdouble ratio)
 	GstState state, pending;
 	if (ratio > -0.01 && ratio < 0.01)
 	{
-		gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
+		GstStateChangeReturn pause_result = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
 		setHDAudioAuxState(m_gst_playbin, GST_STATE_PAUSED);
+		/* [AML_LOCAL_RESUME_V2] Do not wait on the UI thread or reselect
+		 * audio merely because a local file's PAUSED transition is ASYNC. */
+		if (!m_sourceinfo.is_streaming && !m_is_live &&
+			pause_result != GST_STATE_CHANGE_FAILURE)
+		{
+			eDebug("[AML_LOCAL_RESUME_V2] local pause requested (%s)",
+				gst_element_state_change_return_get_name(pause_result));
+			return 0;
+		}
 		/* pipeline sometimes block due to audio track issue off gstreamer.
 		If the pipeline is blocked up on pending state change to paused ,
         this issue is solved be just reselecting the current audio track.*/
@@ -3242,6 +3276,21 @@ RESULT eServiceMP3::trickSeek(gdouble ratio)
 	}
 
 	bool unpause = (m_currentTrickRatio == 1.0 && ratio == 1.0);
+	/* [AML_LOCAL_RESUME_V2] No flush/seek for local PAUSED->PLAYING.
+	 * Check the source category, not the source factory name: playbin can
+	 * wrap filesrc and not expose it during a transitional state. */
+	if (unpause && !m_sourceinfo.is_streaming && !m_is_live)
+	{
+		GstStateChangeReturn change = gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+		if (change != GST_STATE_CHANGE_FAILURE)
+		{
+			setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
+			eDebug("[AML_LOCAL_RESUME_V2] direct local resume (%s), no flush seek",
+				gst_element_state_change_return_get_name(change));
+			return 0;
+		}
+		eWarning("[AML_LOCAL_RESUME_V2] direct local resume rejected; using legacy recovery");
+	}
 	if (unpause)
 	{
 		GstElement *source = NULL;
@@ -5398,6 +5447,22 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						 * it here would only restart the whole pause-flush-
 						 * resume sequence, forever. */
 					}
+					/* [AML_LOCAL_RESUME_V2] A normal local PAUSED->PLAYING
+					 * is not an audio-track change.  Reapplying current-audio
+					 * can trigger a selector reconfigure or audio restart, even
+					 * when the same track was already selected.  Preserve explicit
+					 * track changes (different active stream) and initial startup. */
+					else if (!m_sourceinfo.is_streaming && !m_is_live &&
+						m_initial_start && m_currentAudioStream >= 0 &&
+						m_currentAudioStream < (int)m_audioStreams.size())
+					{
+						gint active_audio = -1;
+						g_object_get(G_OBJECT(m_gst_playbin), "current-audio", &active_audio, NULL);
+						if (active_audio != m_currentAudioStream)
+							selectAudioStream(m_currentAudioStream);
+						else
+							eDebug("[AML_LOCAL_RESUME_V2] local resume: preserving audio track %d", active_audio);
+					}
 					else if (m_currentAudioStream < 0)
 					{
 						int autoaudio = -1; // -1 = no configured-language match found; track 0 is a valid match and must not be confused with "nothing to select"
@@ -5677,6 +5742,17 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 		{
 			if(GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
 				break;
+
+			/* [AML_LOCAL_RESUME_V2] Retry an early rejected local start-offset
+			 * seek after preroll completes.  Do not retry on live streams or
+			 * while another audio-switch seek is in progress. */
+			if (m_pending_start_position >= 0 && m_initial_start &&
+				!m_sourceinfo.is_streaming && !m_is_live &&
+				m_audio_switch_flush_phase == AudioSwitchFlushNone)
+			{
+			eDebug("[AML_LOCAL_RESUME_V2] retrying deferred start offset after ASYNC_DONE");
+				tryApplyPendingStartOffset();
+			}
 
 			if (m_audio_switch_flush_phase == AudioSwitchFlushWaitSeek)
 			{
