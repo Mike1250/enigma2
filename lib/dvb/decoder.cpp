@@ -120,6 +120,9 @@ eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 int eDVBAudio::startPid(int pid, int type)
 {
 #ifdef DREAMNEXTGEN
+	/* Stop producing TS before waiting for the consumer to exit. */
+	if (m_fd_demux >= 0)
+		::ioctl(m_fd_demux, DMX_STOP);
 	if (m_TsParser) m_TsParser->stop();
 #endif
 	if (m_fd_demux >= 0)
@@ -266,6 +269,9 @@ int eDVBAudio::startPid(int pid, int type)
 void eDVBAudio::stop()
 {
 #ifdef DREAMNEXTGEN
+	/* Stop producing TS before waiting for the consumer to exit. */
+	if (m_fd_demux >= 0)
+		::ioctl(m_fd_demux, DMX_STOP);
 	if (m_TsParser) m_TsParser->stop();
 #endif
 	if (m_fd >= 0)

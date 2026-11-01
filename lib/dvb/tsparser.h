@@ -1,5 +1,6 @@
 #ifndef __LIB_DVB_TSPARSER_H
 #define __LIB_DVB_TSPARSER_H
+#include <atomic>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -140,7 +141,7 @@ public:
     int getPTS(pts_t &now);
 
 private:
-    int m_stop;
+    std::atomic<bool> m_stop;
     int m_fd_demux;
     bool m_pause;
 

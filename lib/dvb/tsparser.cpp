@@ -563,6 +563,7 @@ void eTsParser::parse(const uint8_t * data, int size,  int is_start)
                     {
                         if (m_eAudioDecoder) { delete m_eAudioDecoder; m_eAudioDecoder = NULL; }
                         m_eAudioDecoder = new eAudioDecoder();
+                        m_eAudioDecoder->m_AlsaOutput->setStopFlag(&m_stop);
                         if (m_eAudioDecoder->start(samplingRate, channels, BYTES_PER_SAMPLE, codec_id) < 0)
                         {
                             delete m_eAudioDecoder;

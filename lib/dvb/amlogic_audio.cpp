@@ -41,7 +41,7 @@ int64_t eAVSyncCore::delta90k(int64_t lhs, int64_t rhs)
     return d;
 }
 
-eAlsaOutput::eAlsaOutput(): m_pcm(nullptr), m_rate(0), m_presentedPTS(-1),
+eAlsaOutput::eAlsaOutput(): m_stopFlag(nullptr), m_pcm(nullptr), m_rate(0), m_presentedPTS(-1),
     m_nextPTS(-1), m_paused(false) {}
 eAlsaOutput::~eAlsaOutput() { stop(); }
 int eAlsaOutput::start(unsigned int rate)
@@ -108,6 +108,7 @@ int eAlsaOutput::pushData(const int16_t *pcm, unsigned int frames, int64_t pts90
 {
 	unsigned int e2_v4_eagain_retries = 0;
     if (!m_pcm || !m_rate || !pcm) return -ENODEV;
+    if (m_stopFlag && m_stopFlag->load()) return 0;
     if (pts90k >= 0) {
         pts90k &= ((1LL << 33)-1);
         if (m_nextPTS < 0 ||
@@ -135,7 +136,7 @@ int eAlsaOutput::pushData(const int16_t *pcm, unsigned int frames, int64_t pts90
             } else if (err > 9000) {
                 /* Audio ahead: wait briefly. No fixed global audio offset. */
                 unsigned int hold = (unsigned int)std::min<int64_t>(12000, ((err - 4500)*1000000/90000));
-                if (hold) usleep(hold);
+                if (hold && !(m_stopFlag && m_stopFlag->load())) usleep(hold);
             }
         }
     }
@@ -154,7 +155,8 @@ int eAlsaOutput::pushData(const int16_t *pcm, unsigned int frames, int64_t pts90
     }
     unsigned int remaining = frames;
     unsigned int tries = 0;
-    while (remaining && !m_paused.load() && tries++ < 500) {
+    while (remaining && !m_paused.load() &&
+           !(m_stopFlag && m_stopFlag->load()) && tries++ < 500) {
         snd_pcm_sframes_t n = snd_pcm_writei(m_pcm, pcm, remaining);
         if (n == -EAGAIN) { if (++e2_v4_eagain_retries == 225 && snd_pcm_state(m_pcm) == SND_PCM_STATE_RUNNING)
 		{

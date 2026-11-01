@@ -33,7 +33,9 @@ public:
     void pause(bool p);
     int pushData(const int16_t *pcm, unsigned int frames, int64_t pts90k);
     int getPTS(pts_t &pts) const;
+    void setStopFlag(const std::atomic<bool> *flag) { m_stopFlag = flag; }
 private:
+    const std::atomic<bool> *m_stopFlag;
     snd_pcm_t *m_pcm;
     unsigned int m_rate;
     std::atomic<int64_t> m_presentedPTS;
