@@ -186,7 +186,7 @@ class MediaPlayer(Screen, InfoBarBase, InfoBarScreenSaver, InfoBarSeek, InfoBarA
 		self["MediaPlayerActions"] = HelpableActionMap(self, "MediaPlayerActions",
 			{
 				"play": (self.xplayEntry, _("Play entry")),
-				"pause": (self.pauseEntry, _("Pause")),
+				"pause": (self._aml_toggle_local_movie_v3, _("Pause")),
 				"stop": (self.stopEntry, _("Stop entry")),
 				"previous": (self.previousMarkOrEntry, _("Play from previous mark or playlist entry")),
 				"next": (self.nextMarkOrEntry, _("Play from next mark or playlist entry")),
@@ -997,6 +997,30 @@ class MediaPlayer(Screen, InfoBarBase, InfoBarScreenSaver, InfoBarSeek, InfoBarA
 			self.playlist.forwardFile()
 		elif self.isStateBackward(self.seekstate):
 			self.playlist.rewindFile()
+
+	def _aml_toggle_local_movie_v3(self):
+		"""Toggle local GStreamer movie playback, independently of MediaPlayer UI visibility."""
+		try:
+			ref = self.session.nav.getCurrentlyPlayingServiceReference()
+			service = self.session.nav.getCurrentService()
+			path = ref.getPath() if ref is not None else ""
+			token = ref.toString() if ref is not None else ""
+		except Exception:
+			return self.pauseEntry()
+		if not service or not path.lower().split("?", 1)[0].endswith(('.mkv', '.mp4', '.avi', '.mov', '.m4v', '.webm', '.flv', '.wmv', '.mpg', '.mpeg', '.vob', '.divx', '.3gp')):
+			return self.pauseEntry()
+		if getattr(self, "_aml_movie_toggle_ref", None) != token:
+			self._aml_movie_toggle_ref = token
+			self._aml_movie_toggle_paused = (self.seekstate == self.SEEK_STATE_PAUSE)
+		was_paused = self._aml_movie_toggle_paused or (self.seekstate == self.SEEK_STATE_PAUSE)
+		target = self.SEEK_STATE_PLAY if was_paused else self.SEEK_STATE_PAUSE
+		print("[AML_MEDIAPLAYER_TOGGLE_V3] action=%s ui_state=%r" % ("RESUME" if was_paused else "PAUSE", self.seekstate))
+		result = self.setSeekState(target)
+		if result is False:
+			print("[AML_MEDIAPLAYER_TOGGLE_V3] state change rejected")
+			return result
+		self._aml_movie_toggle_paused = not was_paused
+		return result
 
 	def pauseEntry(self):
 		self.pauseService()
