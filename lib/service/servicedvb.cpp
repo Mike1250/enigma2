@@ -3898,7 +3898,8 @@ RESULT eDVBServicePlay::enableSubtitles(iSubtitleUser *user, SubtitleTrack &trac
 			return subtitle_result;
 		}
 		m_subtitle_widget = user;
-		m_subtitle_parser->start(pid, composition_page_id, ancillary_page_id);
+		// The parser has already started successfully above. Restarting it
+		// loses the first PES and unnecessarily tears down the demux filter.
 		if (m_dvb_service){
 			m_dvb_service->setCacheEntry(eDVBService::cSUBTITLE, ((pid&0xFFFF)<<16)|((composition_page_id&0xFF)<<8)|(ancillary_page_id&0xFF));
 		}

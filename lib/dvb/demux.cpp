@@ -322,9 +322,12 @@ void eDVBPESReader::data(int)
 {
 	while (1)
 	{
-		uint8_t buffer[16384] = {};
+		// A PES payload may be up to 65535 bytes plus its six-byte header.
+		// 16 KiB reads can return EOVERFLOW on DVB drivers that require
+		// a complete PES packet to fit in the read buffer.
+		uint8_t buffer[65536 + 6];
 		int r;
-		r = ::read(m_fd, buffer, 16384);
+		r = ::read(m_fd, buffer, sizeof(buffer));
 		if (!r)
 			return;
 		if(r < 0)
@@ -339,7 +342,7 @@ void eDVBPESReader::data(int)
 			m_read(buffer, r);
 		else
 			eWarning("[eDVBPESReader] PES reader not active");
-		if (r != 16384)
+		if (r != (int)sizeof(buffer))
 			break;
 	}
 }
@@ -350,7 +353,7 @@ eDVBPESReader::eDVBPESReader(eDVBDemux *demux, eMainloop *context, RESULT &res):
 	m_fd = m_demux->openDemux();
 	if (m_fd >= 0)
 	{
-		setBufferSize(64*1024);
+		setBufferSize(256*1024); // Allow bursts of large DVB subtitle PES packets.
 		::fcntl(m_fd, F_SETFL, O_NONBLOCK);
 		m_notifier = eSocketNotifier::create(context, m_fd, eSocketNotifier::Read, false);
 		CONNECT(m_notifier->activated, eDVBPESReader::data);
