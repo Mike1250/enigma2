@@ -383,19 +383,30 @@ eDVBPESReader::~eDVBPESReader()
 
 RESULT eDVBPESReader::start(int pid)
 {
+	return startPES(pid, false);
+}
+
+RESULT eDVBPESReader::startSubtitle(int pid)
+{
+	return startPES(pid, true);
+}
+
+RESULT eDVBPESReader::startPES(int pid, bool subtitle)
+{
 	RESULT res;
 	if (m_fd < 0)
 		return -ENODEV;
 
-	eDebug("[eDVBPESReader] DMX_SET_PES_FILTER pid=%04x", pid);
+	eDebug("[eDVBPESReader] DMX_SET_PES_FILTER pid=%04x mode=%s",
+	       pid, subtitle ? "SUBTITLE" : "OTHER");
 	m_notifier->start();
 
 	dmx_pes_filter_params flt = {};
 	memset(&flt, 0, sizeof(flt));
 
-	// This reader is created for DVB subtitle PES, not OpenBH software audio.
-	// Select Amlogic SUB_PES instead of sharing the OTHER_PES DMA buffer.
-	flt.pes_type = DMX_PES_SUBTITLE;
+	// Generic PES readers (including audio/teletext) must never claim
+	// the dedicated subtitle channel. Only eDVBSubtitleParser opts in.
+	flt.pes_type = subtitle ? DMX_PES_SUBTITLE : DMX_PES_OTHER;
 	flt.pid     = pid;
 	flt.input   = DMX_IN_FRONTEND;
 	flt.output  = DMX_OUT_TAP;
@@ -405,8 +416,12 @@ RESULT eDVBPESReader::start(int pid)
 	res = ::ioctl(m_fd, DMX_SET_PES_FILTER, &flt);
 
 	if (res)
-		eWarning("[eDVBPESReader] DMX_SET_PES_FILTER pid=%04x:  %m", pid);
-	if (!res)
+	{
+		eWarning("[eDVBPESReader] DMX_SET_PES_FILTER pid=%04x mode=%s: %m",
+		         pid, subtitle ? "SUBTITLE" : "OTHER");
+		m_notifier->stop();
+	}
+	else
 		m_active = 1;
 	return res;
 }

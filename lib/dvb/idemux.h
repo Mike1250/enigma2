@@ -20,6 +20,9 @@ class iDVBPESReader: public iObject
 public:
 	virtual RESULT setBufferSize(int size)=0;
 	virtual RESULT start(int pid)=0;
+	// DVB subtitles require a separate PES type; other readers keep OTHER.
+	// The default preserves other iDVBPESReader implementations.
+	virtual RESULT startSubtitle(int pid) { return start(pid); }
 	virtual RESULT stop()=0;
 	virtual RESULT connectRead(const sigc::slot<void(const uint8_t*,int)> &read, ePtr<eConnection> &conn)=0;
 	virtual ~iDVBPESReader() { };

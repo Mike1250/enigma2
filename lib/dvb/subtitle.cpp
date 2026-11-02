@@ -1356,7 +1356,7 @@ int eDVBSubtitleParser::start(int pid, int composition_page_id, int ancillary_pa
 		eDebug("[AML_SUBTITLE_V2_EXACT] Fresh subtitle state pid=%04x", pid);
 		m_composition_page_id = composition_page_id;
 		m_ancillary_page_id = ancillary_page_id;
-		return m_pes_reader->start(pid);
+		return m_pes_reader->startSubtitle(pid);
 	}
 	return -1;
 }

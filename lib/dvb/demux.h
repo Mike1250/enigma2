@@ -84,12 +84,14 @@ class eDVBPESReader: public iDVBPESReader, public sigc::trackable
 	ePtr<eDVBDemux> m_demux;
 	int m_active;
 	void data(int);
+	RESULT startPES(int pid, bool subtitle);
 	ePtr<eSocketNotifier> m_notifier;
 public:
 	eDVBPESReader(eDVBDemux *demux, eMainloop *context, RESULT &res);
 	virtual ~eDVBPESReader();
 	RESULT setBufferSize(int size);
 	RESULT start(int pid);
+	RESULT startSubtitle(int pid);
 	RESULT stop();
 	RESULT connectRead(const sigc::slot<void(const uint8_t*,int)> &read, ePtr<eConnection> &conn);
 };
