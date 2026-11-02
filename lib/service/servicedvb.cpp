@@ -72,6 +72,45 @@ using namespace std;
 
 bool m_is_streamx = false;
 
+/* OpenBH V12 live-DVB subtitle presentation clock. */
+static long long openbhSubtitlePtsDifference(pts_t future, pts_t current)
+{
+    const unsigned long long mask = (1ULL << 33) - 1;
+    long long delta = (long long)(((unsigned long long)future -
+                                   (unsigned long long)current) & mask);
+    if (delta >= (1LL << 32))
+        delta -= (1LL << 33);
+    return delta;
+}
+
+static bool openbhSubtitlePresentedVideoPTS(pts_t demux, pts_t &presented,
+                                            long long &behind90k)
+{
+    if (demux <= 0)
+        return false;
+    FILE *f = fopen("/sys/class/tsync/pts_video", "r");
+    if (!f)
+        return false;
+    char text[48] = {};
+    const bool ok = fgets(text, sizeof(text), f) != NULL;
+    fclose(f);
+    if (!ok)
+        return false;
+    char *end = NULL;
+    unsigned long long raw = strtoull(text, &end, 0);
+    if (end == text || !raw || raw > 0xffffffffULL)
+        return false;
+    const unsigned int distance32 = (unsigned int)demux - (unsigned int)raw;
+    const long long behind = (long long)(int)distance32;
+    if (behind < 0 || behind > 5LL * 90000)
+        return false;
+    behind90k = behind;
+    presented = (pts_t)(((unsigned long long)demux -
+                        (unsigned long long)behind) & ((1ULL << 33) - 1));
+    return true;
+}
+
+
 /* DreamTwo/OpenBH subtitle clock experiment V11.
  * Live DVB video ioctl PTS is the most recently DEMUXED video PES PTS on
  * this Amlogic port; that need not be the frame currently on screen.
@@ -4188,15 +4227,34 @@ void eDVBServicePlay::checkSubtitleTiming()
 		m_decoder->getPTS(0, pos);
 	}
 
-	/* V11 opt-in live-DVB-only clock switch. No changes for recordings,
-	 * timeshift, local movies, or normal operation when marker is absent. */
-	pts_t presented_pos = 0;
-	bool using_presented_pts = !m_is_pvr && !m_timeshift_enabled &&
-		!m_timeshift_active &&
-		access("/tmp/e2subtitle_use_presented_pts", F_OK) == 0 &&
-		e2_subtitle_presentation_pts(pos, presented_pos);
-	if (using_presented_pts)
-		pos = presented_pos;
+
+	/* V12: use the displayed-video clock on live DVB only. */
+	const bool live_dvb_subtitles = !m_is_pvr &&
+		!m_timeshift_enabled && !m_timeshift_active &&
+		!m_dvb_subtitle_pages.empty() && pos > 0;
+	pts_t dvb_video_pos = pos;
+	bool use_live_clock = false;
+	long long clock_lag90k = 0;
+	if (live_dvb_subtitles)
+	{
+		pts_t presented = 0;
+		if (openbhSubtitlePresentedVideoPTS(pos, presented, clock_lag90k))
+		{
+			dvb_video_pos = presented;
+			use_live_clock = true;
+		}
+		else if (!eConfigManager::getConfigIntValue(
+			"config.subtitles.subtitle_bad_timing_delay", 0))
+		{
+			/* Empirical fallback for this receiver: delay live DVB 1500 ms. */
+			dvb_video_pos = (pts_t)(((unsigned long long)pos - 135000ULL) &
+				((1ULL << 33) - 1));
+			use_live_clock = true;
+		}
+		if (access("/tmp/e2subtitle_clock_debug", F_OK) == 0)
+			eDebug("[E2_SUB_SYNC_V12] demux=%lld clock=%lld delta_ms=%lld",
+				(long long)pos, (long long)dvb_video_pos, clock_lag90k / 90);
+	}
 
 	while (1)
 	{
@@ -4221,10 +4279,16 @@ void eDVBServicePlay::checkSubtitleTiming()
 
 		// If subtitle is overdue or within 20ms the video timing then display it.
 		// If not, pause subtitle processing until the subtitle should be shown
-		/* In the opt-in mode compare the broadcast's 33-bit PTS clock
-		 * modulo 33 bits so wrap-around never creates an hours-long wait. */
-		long long delta = using_presented_pts ?
-			e2_subtitle_delta33(show_time, pos) : (long long)(show_time - pos);
+		/* V12: compare live DVB subtitle PTS to displayed-video PTS. */
+		const bool corrected = type == DVB && use_live_clock;
+		const pts_t clock = corrected ? dvb_video_pos : pos;
+		long long delta = corrected ?
+			openbhSubtitlePtsDifference(show_time, clock) :
+			(long long)(show_time - clock);
+		if (delta < -10LL * 90000)
+			delta = -10LL * 90000;
+		if (delta > 60LL * 90000)
+			delta = 60LL * 90000;
 		int diff = (int)delta;
 		if (diff < 20*90)
 		{
@@ -4243,10 +4307,9 @@ void eDVBServicePlay::checkSubtitleTiming()
 		else
 		{
 			//eDebug("[eDVBServicePlay] Delay early subtitle by %.03fs. Page stack size %d", diff / 90000.0f, m_dvb_subtitle_pages.size());
-			/* In display-clock mode recheck the actual presented clock
-			 * every <=100 ms; do not assume decoding continues smoothly. */
+			/* Recheck live DVB video PTS regularly during buffer delays. */
 			int wait_ms = diff / 90;
-			if (using_presented_pts && wait_ms > 100)
+			if (corrected && wait_ms > 100)
 				wait_ms = 100;
 			if (wait_ms < 1)
 				wait_ms = 1;
