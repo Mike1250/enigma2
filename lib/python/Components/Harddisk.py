@@ -5,6 +5,7 @@ from os import listdir, major, mkdir, remove, rmdir, sep as ossep, stat, statvfs
 from os.path import abspath, dirname, exists, isdir, ismount, join, realpath
 from re import sub
 from string import ascii_letters, digits
+from threading import Thread
 from time import sleep, time
 
 from enigma import getDeviceDB, eTimer
@@ -477,14 +478,25 @@ class Harddisk:
 		data = data.split()
 		return int(data[0]), int(data[4])  # Return read I/O's, write I/O's.
 
-	def startIdle(self):
-		# Disable HDD standby timer.
+	def _configureDriveStandby(self):
+		# Shell commands can block (particularly some USB bridges).  This
+		# helper must not use Enigma2 GUI objects because it can run on a worker.
 		if self.internal:
 			runCommand(f"hdparm -S0 {self.disk_path}")
 		else:
 			exitCode = runCommand(f"sdparm --set=SCT=0 {self.disk_path}")
 			if exitCode:
 				runCommand(f"hdparm -S0 {self.disk_path}")
+
+	def startIdle(self):
+		# Optional boot-time optimization for external disks only.  Keep eTimer
+		# creation and its callback registration on the main Enigma2 thread.
+		# To enable, create /tmp/e2_async_hdd_idle before starting Enigma2.
+		if not self.internal and exists("/tmp/e2_async_hdd_idle"):
+			Thread(target=self._configureDriveStandby,
+				name=f"e2-hdd-idle-{self.device}", daemon=True).start()
+		else:
+			self._configureDriveStandby()
 		self.timer = eTimer()
 		self.timer.callback.append(self.runIdle)
 		self.idle_running = True
@@ -790,6 +802,10 @@ class HarddiskManager:
 		# print(f"[Harddisk][enumerateBlockDevices] rootMajor = '{rootMajor}'")
 		# print(f"[Harddisk][enumerateBlockDevices] Box model:{MODEL}")
 		for device in sorted(listdir("/sys/block")):
+			# Virtual RAM/compressed block devices are not physical disks.
+			# Never issue storage power-management commands against them.
+			if device.startswith(("zram", "ram", "loop")):
+				continue
 			try:
 				physicalDevice = realpath(join("/sys/block", device, "device"))
 			except (IOError, OSError) as err:
