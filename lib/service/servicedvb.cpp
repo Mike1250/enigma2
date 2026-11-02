@@ -42,6 +42,10 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <unistd.h>
 #include <chrono>
 #include <thread>
 #include <lib/dvb_ci/descrambler.h>
@@ -67,6 +71,55 @@ using namespace std;
 #include <iomanip>
 
 bool m_is_streamx = false;
+
+/* DreamTwo/OpenBH subtitle clock experiment V11.
+ * Live DVB video ioctl PTS is the most recently DEMUXED video PES PTS on
+ * this Amlogic port; that need not be the frame currently on screen.
+ * /sys/class/tsync/pts_video is a candidate presentation clock.
+ * Marker files permit A/B testing without changing any kernel or audio path.
+ */
+static long long e2_subtitle_delta33(pts_t future, pts_t current)
+{
+    const unsigned long long mask = (1ULL << 33) - 1;
+    long long difference = (long long)(((unsigned long long)(future - current)) & mask);
+    if (difference >= (1LL << 32))
+        difference -= (1LL << 33);
+    return difference;
+}
+
+static bool e2_subtitle_presentation_pts(pts_t reference, pts_t &presented)
+{
+    if (reference <= 0)
+        return false;
+    FILE *f = fopen("/sys/class/tsync/pts_video", "r");
+    if (!f)
+        return false;
+    char text[48] = {};
+    const bool got = fgets(text, sizeof(text), f) != 0;
+    fclose(f);
+    if (!got)
+        return false;
+    char *end = 0;
+    unsigned long long raw = strtoull(text, &end, 0);
+    if (end == text || !raw)
+        return false;
+
+    /* pts_video exports 32-bit Amlogic PTS. Reconstruct the nearest
+     * 33-bit epoch using the valid VIDEO_GET_PTS reference. */
+    long long distance = (long long)(raw & 0xffffffffULL) -
+                         (long long)((unsigned long long)reference & 0xffffffffULL);
+    if (distance > 0x7fffffffLL)
+        distance -= 0x100000000LL;
+    else if (distance < -0x80000000LL)
+        distance += 0x100000000LL;
+
+    /* Prevent unrelated/stale clocks from moving subtitle presentation.
+     * 90 seconds is only a sanity bound; log when this rejects samples. */
+    if (distance < -90LL * 90000 || distance > 90LL * 90000)
+        return false;
+    presented = (pts_t)(((unsigned long long)(reference + distance)) & ((1ULL << 33) - 1));
+    return true;
+}
 
 class eStaticServiceDVBInformation: public iStaticServiceInformation
 {
@@ -4135,6 +4188,16 @@ void eDVBServicePlay::checkSubtitleTiming()
 		m_decoder->getPTS(0, pos);
 	}
 
+	/* V11 opt-in live-DVB-only clock switch. No changes for recordings,
+	 * timeshift, local movies, or normal operation when marker is absent. */
+	pts_t presented_pos = 0;
+	bool using_presented_pts = !m_is_pvr && !m_timeshift_enabled &&
+		!m_timeshift_active &&
+		access("/tmp/e2subtitle_use_presented_pts", F_OK) == 0 &&
+		e2_subtitle_presentation_pts(pos, presented_pos);
+	if (using_presented_pts)
+		pos = presented_pos;
+
 	while (1)
 	{
 		enum { TELETEXT, DVB } type;
@@ -4158,7 +4221,11 @@ void eDVBServicePlay::checkSubtitleTiming()
 
 		// If subtitle is overdue or within 20ms the video timing then display it.
 		// If not, pause subtitle processing until the subtitle should be shown
-		int diff = show_time - pos;
+		/* In the opt-in mode compare the broadcast's 33-bit PTS clock
+		 * modulo 33 bits so wrap-around never creates an hours-long wait. */
+		long long delta = using_presented_pts ?
+			e2_subtitle_delta33(show_time, pos) : (long long)(show_time - pos);
+		int diff = (int)delta;
 		if (diff < 20*90)
 		{
 			//eDebug("[eDVBServicePlay] Showing subtitle with pts:%lld Video pts:%lld diff:%.03fs. Page stack size %d", show_time, pos, diff / 90000.0f, m_dvb_subtitle_pages.size());
@@ -4176,7 +4243,14 @@ void eDVBServicePlay::checkSubtitleTiming()
 		else
 		{
 			//eDebug("[eDVBServicePlay] Delay early subtitle by %.03fs. Page stack size %d", diff / 90000.0f, m_dvb_subtitle_pages.size());
-			m_subtitle_sync_timer->start(diff / 90, 1);
+			/* In display-clock mode recheck the actual presented clock
+			 * every <=100 ms; do not assume decoding continues smoothly. */
+			int wait_ms = diff / 90;
+			if (using_presented_pts && wait_ms > 100)
+				wait_ms = 100;
+			if (wait_ms < 1)
+				wait_ms = 1;
+			m_subtitle_sync_timer->start(wait_ms, 1);
 			break;
 		}
 	}
@@ -4192,6 +4266,19 @@ void eDVBServicePlay::newDVBSubtitlePage(const eDVBSubtitlePage &p)
 			m_soft_decoder->getPTS(0, pos);
 		else if (m_decoder)
 			m_decoder->getPTS(0, pos);
+
+		/* V11: optional one-line report per decoded subtitle page.
+		 * Positive delta means subtitle scheduled in the future;
+		 * negative delta means the subtitle is already late. */
+		if (access("/tmp/e2subtitle_clock_debug", F_OK) == 0) {
+			pts_t presented = 0;
+			bool ok = e2_subtitle_presentation_pts(pos, presented);
+			eDebug("[E2_SUB_CLOCK_V11] subtitle=%lld video_ioctl=%lld video_presented=%lld valid=%d delta_ioctl_ms=%lld delta_presented_ms=%lld test=%d",
+				(long long)p.m_show_time, (long long)pos, (long long)presented, ok ? 1 : 0,
+				pos ? e2_subtitle_delta33(p.m_show_time, pos) / 90 : -999999LL,
+				ok ? e2_subtitle_delta33(p.m_show_time, presented) / 90 : -999999LL,
+				access("/tmp/e2subtitle_use_presented_pts", F_OK) == 0 ? 1 : 0);
+		}
 
 		// Where subtitles are delivered out of sync with video, only treat subtitles in the past as having bad timing.
 		// Those that are delivered too early are cached for displaying at the appropriate later time
