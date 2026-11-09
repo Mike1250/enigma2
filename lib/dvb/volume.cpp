@@ -408,13 +408,64 @@ void eDVBVolumecontrol::setVolumeSteps(int steps)
 	m_volsteps = steps;
 }
 
+/* DREAMTWO_EXT3_PCM_VOLUME_V2: native Enigma2 -> ExtPlayer3 decoded-PCM
+ * volume/mute state. ExtPlayer3 alone reads this file. The DVB/ALSA mixer
+ * and GStreamer paths remain untouched. The receiver process runs as root.
+ */
+#ifdef DREAMNEXTGEN
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void dreamtwoExt3PublishPcmVolume(eDVBVolumecontrol *volume)
+{
+    int left = volume->getVolume();
+    int right = volume->getVolume();
+    const int muted = volume->isMuted() ? 1 : 0;
+    if (left < 0) left = 0;
+    if (left > 100) left = 100;
+    if (right < 0) right = 0;
+    if (right > 100) right = 100;
+    char buffer[64];
+    int n = snprintf(buffer, sizeof(buffer), "%d %d %d\n", left, right, muted);
+    if (n <= 0 || n >= (int)sizeof(buffer)) return;
+
+    const char *pending = "/run/ext3-native-volume.tmp";
+    const char *active = "/run/ext3-native-volume";
+    int fd = open(pending, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    ssize_t written = write(fd, buffer, (size_t)n);
+    int closed = close(fd);
+    if (written != n || closed < 0 || rename(pending, active))
+        unlink(pending);
+}
+
+class DreamTwoExt3NativeVolumeScope
+{
+    eDVBVolumecontrol *volume;
+public:
+    explicit DreamTwoExt3NativeVolumeScope(eDVBVolumecontrol *v) : volume(v) {}
+    ~DreamTwoExt3NativeVolumeScope() { dreamtwoExt3PublishPcmVolume(volume); }
+};
+#endif
+
+
 void eDVBVolumecontrol::volumeUp(int left, int right)
 {
+#ifdef DREAMNEXTGEN
+    DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
+#endif
+
 	setVolume(leftVol + (left ? left : m_volsteps), rightVol + (right ? right : m_volsteps));
 }
 
 void eDVBVolumecontrol::volumeDown(int left, int right)
 {
+#ifdef DREAMNEXTGEN
+    DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
+#endif
+
 	setVolume(leftVol - (left ? left : m_volsteps), rightVol - (right ? right : m_volsteps));
 }
 
@@ -429,6 +480,10 @@ int eDVBVolumecontrol::checkVolume(int vol)
 
 void eDVBVolumecontrol::setVolume(int left, int right)
 {
+#ifdef DREAMNEXTGEN
+    DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
+#endif
+
 		/* left, right is 0..100 */
 	const int checkedLeft = checkVolume(left);
 	const int checkedRight = checkVolume(right);
@@ -497,6 +552,10 @@ bool eDVBVolumecontrol::isMuted()
 
 void eDVBVolumecontrol::volumeMute()
 {
+#ifdef DREAMNEXTGEN
+    DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
+#endif
+
 	const bool muteActuallyChanged = !muted;
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA Mute");
@@ -527,6 +586,10 @@ void eDVBVolumecontrol::volumeMute()
 
 void eDVBVolumecontrol::volumeUnMute()
 {
+#ifdef DREAMNEXTGEN
+    DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
+#endif
+
 	const bool muteActuallyChanged = muted;
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA unMute to %d", leftVol);
@@ -557,6 +620,10 @@ void eDVBVolumecontrol::volumeUnMute()
 
 void eDVBVolumecontrol::volumeToggleMute()
 {
+#ifdef DREAMNEXTGEN
+    DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
+#endif
+
 	if (isMuted())
 		volumeUnMute();
 	else
