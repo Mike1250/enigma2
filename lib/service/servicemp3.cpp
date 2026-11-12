@@ -2430,8 +2430,21 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			GstElement *movie_audio = gst_element_factory_make("dreamaudiosink", NULL);
 			if (movie_audio)
 			{
-				g_object_set(G_OBJECT(movie_audio), "device", "dreamhdmi", NULL);
-				g_object_set(G_OBJECT(movie_audio), "volume", (gdouble)1.0, NULL);
+				/* DreamAudioSink source contract: e2-sync=TRUE suppresses audio
+				 * timestamps because pure-audio services lack a video clock.
+				 * Local VIDEO needs e2-sync=FALSE: pass 90 kHz audio PTS into
+				 * dream_alsa's userspace A/V loop against the video PTS.
+				 * tsync-mode=0 leaves this sink as the clock owner while active.
+				 * Recovery flag restores historical behavior without rebuilding. */
+				const gboolean video_avsync = !g_file_test(
+					"/etc/enigma2/dreamaudiosink_disable_video_sync", G_FILE_TEST_EXISTS);
+				g_object_set(G_OBJECT(movie_audio),
+					"device", "dreamhdmi",
+					"e2-sync", video_avsync ? FALSE : TRUE,
+					"tsync-mode", 0,
+					"volume", (gdouble)1.0, NULL);
+				eDebug("[DREAM_SINK_E2_V1] movie e2-sync=%d (video-avsync=%d); dreamhdmi unchanged",
+					video_avsync ? 0 : 1, video_avsync ? 1 : 0);
 				/* Resolve the floating reference before assigning the sink.
 				 * playbin then owns its own property reference. */
 				gst_object_ref_sink(movie_audio);
@@ -3561,8 +3574,13 @@ RESULT eServiceMP3::seekRelative(int direction, pts_t to)
 
 	int res = seekTo(ppos);
 
-	// Do double seek to same position so to overcome problem with seeking backward and passthrough on for some boxes
-	if (res > -1 && !getHDAudioAuxState(m_gst_playbin))
+	/* Historically some vendor sinks needed a second flush seek on backward
+	 * seeks. DreamAudioSink handles one discontinuity itself; repeating the
+	 * seek just discards preroll and increases latency after every skip.
+	 * Keep the old workaround for all other sink types and streams. */
+	const bool nativeMovieSink = !m_sourceinfo.is_streaming &&
+		!m_sourceinfo.is_audio && hasNativeMovieAudioSink(m_gst_playbin);
+	if (res > -1 && !getHDAudioAuxState(m_gst_playbin) && !nativeMovieSink)
 		seekTo(ppos);
 
 	return res;

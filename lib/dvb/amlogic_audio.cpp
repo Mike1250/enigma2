@@ -142,7 +142,10 @@ int eAlsaOutput::pushData(const int16_t *pcm, unsigned int frames, int64_t pts90
     }
     /* Honor Enigma2's volume/mute state even on raw ALSA hw PCM, which
      * does not go through the /dev/dvb/audio volume ioctl. */
-    std::vector<int16_t> adjusted;
+    /* Reuse scratch space for live DVB PCM gain, instead of allocating on
+     * every audio frame. Thread-local ownership keeps decoder callbacks from
+     * separate worker threads from sharing a mutable buffer. */
+    static thread_local std::vector<int16_t> adjusted;
     eDVBVolumecontrol *vc = eDVBVolumecontrol::getInstance();
     if (vc) {
         int volume = vc->isMuted() ? 0 : std::max(0,std::min(100,vc->getVolume()));
