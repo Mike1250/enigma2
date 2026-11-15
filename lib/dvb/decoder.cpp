@@ -268,12 +268,6 @@ int eDVBAudio::startPid(int pid, int type)
 
 void eDVBAudio::stop()
 {
-#ifdef DREAMNEXTGEN
-	/* Stop producing TS before waiting for the consumer to exit. */
-	if (m_fd_demux >= 0)
-		::ioctl(m_fd_demux, DMX_STOP);
-	if (m_TsParser) m_TsParser->stop();
-#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_STOP ", m_dev);
@@ -290,13 +284,14 @@ void eDVBAudio::stop()
 		else
 			eDebugNoNewLine("ok\n");
 	}
+#ifdef DREAMNEXTGEN
+	/* Stop the TS producer before joining its userspace consumer. */
+	if (m_TsParser) m_TsParser->stop();
+#endif
 }
 
 void eDVBAudio::flush()
 {
-#ifdef DREAMNEXTGEN
-	if (m_TsParser) m_TsParser->flush();
-#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_CLEAR_BUFFER ", m_dev);
@@ -305,13 +300,13 @@ void eDVBAudio::flush()
 		else
 			eDebugNoNewLine("ok\n");
 	}
+#ifdef DREAMNEXTGEN
+	if (m_TsParser) m_TsParser->flush();
+#endif
 }
 
 void eDVBAudio::freeze()
 {
-#ifdef DREAMNEXTGEN
-	if (m_TsParser) m_TsParser->freeze();
-#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_PAUSE ", m_dev);
@@ -320,13 +315,13 @@ void eDVBAudio::freeze()
 		else
 			eDebugNoNewLine("ok\n");
 	}
+#ifdef DREAMNEXTGEN
+	if (m_TsParser) m_TsParser->freeze();
+#endif
 }
 
 void eDVBAudio::unfreeze()
 {
-#ifdef DREAMNEXTGEN
-	if (m_TsParser) m_TsParser->unfreeze();
-#endif
 	if (m_fd >= 0)
 	{
 		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_CONTINUE ", m_dev);
@@ -335,6 +330,9 @@ void eDVBAudio::unfreeze()
 		else
 			eDebugNoNewLine("ok\n");
 	}
+#ifdef DREAMNEXTGEN
+	if (m_TsParser) m_TsParser->unfreeze();
+#endif
 }
 
 void eDVBAudio::setChannel(int channel)
