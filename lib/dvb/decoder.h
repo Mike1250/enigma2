@@ -14,7 +14,7 @@ class eDVBAudio: public iObject
 	DECLARE_REF(eDVBAudio);
 private:
 	ePtr<eDVBDemux> m_demux;
-	int m_fd, m_fd_demux, m_dev, m_is_freezed;
+	int m_fd, m_fd_demux, m_dev, m_is_freezed, m_bypass;
 #ifdef DREAMNEXTGEN
 	eTsParser *m_TsParser;
 #endif

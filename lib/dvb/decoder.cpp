@@ -82,7 +82,7 @@ static int openDecoderDeviceWithRetry(const char *filename)
 DEFINE_REF(eDVBAudio);
 
 eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
-	:m_demux(demux), m_dev(dev)
+	:m_demux(demux), m_dev(dev), m_bypass(-1)
 #ifdef DREAMNEXTGEN
 	, m_TsParser(nullptr)
 #endif
@@ -178,7 +178,7 @@ int eDVBAudio::startPid(int pid, int type)
 #ifdef DREAMNEXTGEN
     // OpenATV DreamNextGen keeps the standard DVB audio-device control
     // sequence even when the audio stream is consumed via TSDEMUX_TAP.
-    // Mirror AUDIO_SET_BYPASS_MODE -> AUDIO_PLAY -> userspace consumer start.
+    // Configure bypass / pause as needed, then AUDIO_PLAY and start TS parser.
     // The userspace audio consumer is now the TS parser with PCM output.
     if (m_fd >= 0) {
         int bypass = 0;
@@ -195,8 +195,15 @@ int eDVBAudio::startPid(int pid, int type)
         case aAC4:
         default:     bypass = 0;    break;
         }
-        if (::ioctl(m_fd, AUDIO_SET_BYPASS_MODE, bypass) < 0)
-            eWarning("[eDVBAudio%d] AUDIO_SET_BYPASS_MODE(%d) failed: %m", m_dev, bypass);
+        // Match the native audio-device startup sequence: configure bypass
+        // and issue AUDIO_PAUSE before AUDIO_PLAY when the mode changes.
+        // Do not reconfigure the device for an unchanged mode.
+        if (m_bypass != bypass) {
+            if (::ioctl(m_fd, AUDIO_SET_BYPASS_MODE, bypass) < 0)
+                eWarning("[eDVBAudio%d] AUDIO_SET_BYPASS_MODE(%d) failed: %m", m_dev, bypass);
+            freeze();
+            m_bypass = bypass;
+        }
         if (::ioctl(m_fd, AUDIO_PLAY) < 0)
             eWarning("[eDVBAudio%d] AUDIO_PLAY failed: %m", m_dev);
     }
