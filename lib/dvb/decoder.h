@@ -3,10 +3,6 @@
 
 #include <lib/base/object.h>
 #include <lib/dvb/demux.h>
-#ifdef DREAMNEXTGEN
-class eTsParser;
-#endif
-
 class eSocketNotifier;
 
 class eDVBAudio: public iObject
@@ -14,10 +10,8 @@ class eDVBAudio: public iObject
 	DECLARE_REF(eDVBAudio);
 private:
 	ePtr<eDVBDemux> m_demux;
-	int m_fd, m_fd_demux, m_dev, m_is_freezed, m_bypass;
-#ifdef DREAMNEXTGEN
-	eTsParser *m_TsParser;
-#endif
+	int m_fd, m_fd_demux, m_dev, m_is_freezed;
+	int m_bypass;
 public:
 	enum { aMPEG, aAC3, aDTS, aAAC, aAACHE, aLPCM, aDTSHD, aDDP, aDRA, aAC4 };
 	eDVBAudio(eDVBDemux *demux, int dev);

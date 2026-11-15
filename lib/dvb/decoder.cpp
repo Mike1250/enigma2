@@ -5,7 +5,7 @@
 #include <lib/base/wrappers.h>
 #include <lib/dvb/decoder.h>
 #ifdef DREAMNEXTGEN
-#include <lib/dvb/tsparser.h>
+#include <lib/dvb/avsync_core.h>
 #endif
 #ifdef HAVE_EGL
 #include <lib/gdi/egl/gegldc.h>
@@ -83,12 +83,14 @@ DEFINE_REF(eDVBAudio);
 
 eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 	:m_demux(demux), m_dev(dev), m_bypass(-1)
-#ifdef DREAMNEXTGEN
-	, m_TsParser(nullptr)
-#endif
 {
 	char filename[128] = {};
+#ifdef DREAMNEXTGEN
+	/* OpenATV DreamNextGen: dreamaudiod owns the DVB audio decoder. */
+	sprintf(filename, "/dev/dvb/adapter%d/dreamaudio%d", demux ? demux->adapter : 0, dev);
+#else
 	sprintf(filename, "/dev/dvb/adapter%d/audio%d", demux ? demux->adapter : 0, dev);
+#endif
 	m_fd = openDecoderDeviceWithRetry(filename);
 	if (m_fd < 0)
 		eWarning("[eDVBAudio] %s: %m", filename);
@@ -104,27 +106,14 @@ eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 		m_fd_demux = -1;
 	}
 
-#ifdef DREAMNEXTGEN
-	if (m_fd_demux >= 0)
-		m_TsParser = new eTsParser();
-#endif
-
-#ifndef DREAMNEXTGEN
 	if (m_fd >= 0)
 	{
 		::ioctl(m_fd, AUDIO_SELECT_SOURCE, demux ? AUDIO_SOURCE_DEMUX : AUDIO_SOURCE_HDMI);
 	}
-#endif
 }
 
 int eDVBAudio::startPid(int pid, int type)
 {
-#ifdef DREAMNEXTGEN
-	/* Stop producing TS before waiting for the consumer to exit. */
-	if (m_fd_demux >= 0)
-		::ioctl(m_fd_demux, DMX_STOP);
-	if (m_TsParser) m_TsParser->stop();
-#endif
 	if (m_fd_demux >= 0)
 	{
 		dmx_pes_filter_params pes = {};
@@ -132,11 +121,8 @@ int eDVBAudio::startPid(int pid, int type)
 
 		pes.pid      = pid;
 		pes.input    = DMX_IN_FRONTEND;
-#ifdef DREAMNEXTGEN
-		pes.output   = DMX_OUT_TSDEMUX_TAP;
-#else
+		/* OpenATV audio contract: decoder feed, not a TS reader. */
 		pes.output   = DMX_OUT_DECODER;
-#endif
 		switch (m_dev)
 		{
 		case 0:
@@ -153,12 +139,6 @@ int eDVBAudio::startPid(int pid, int type)
 			break;
 		}
 		pes.flags    = 0;
-#ifdef DREAMNEXTGEN
-		// OpenATV DreamNextGen uses a 2 MB TSDEMUX_TAP audio buffer.
-		// Reduces overflow when FFmpeg/ALSA briefly stalls under load.
-		if (::ioctl(m_fd_demux, DMX_SET_BUFFER_SIZE, 2 * 1024 * 1024) < 0)
-			eWarning("[eDVBAudio%d] 2MB audio buffer request failed: %m", m_dev);
-#endif
 		eDebugNoNewLineStart("[eDVBAudio%d] DMX_SET_PES_FILTER pid=0x%04x ", m_dev, pid);
 		if (::ioctl(m_fd_demux, DMX_SET_PES_FILTER, &pes) < 0)
 		{
@@ -175,101 +155,41 @@ int eDVBAudio::startPid(int pid, int type)
 		eDebugNoNewLine("ok\n");
 	}
 
-#ifdef DREAMNEXTGEN
-    // OpenATV DreamNextGen keeps the standard DVB audio-device control
-    // sequence even when the audio stream is consumed via TSDEMUX_TAP.
-    // Configure bypass / pause as needed, then AUDIO_PLAY and start TS parser.
-    // The userspace audio consumer is now the TS parser with PCM output.
-    if (m_fd >= 0) {
-        int bypass = 0;
-        switch (type) {
-        case aMPEG:  bypass = 1;    break;
-        case aDTS:   bypass = 2;    break;
-        case aAAC:   bypass = 8;    break;
-        case aAACHE: bypass = 9;    break;
-        case aLPCM:  bypass = 6;    break;
-        case aDTSHD:bypass = 0x10; break;
-        case aDRA:   bypass = 0x40; break;
-        case aDDP:   bypass = 0x22; break;
-        case aAC3:
-        case aAC4:
-        default:     bypass = 0;    break;
-        }
-        // Match the native audio-device startup sequence: configure bypass
-        // and issue AUDIO_PAUSE before AUDIO_PLAY when the mode changes.
-        // Do not reconfigure the device for an unchanged mode.
-        if (m_bypass != bypass) {
-            if (::ioctl(m_fd, AUDIO_SET_BYPASS_MODE, bypass) < 0)
-                eWarning("[eDVBAudio%d] AUDIO_SET_BYPASS_MODE(%d) failed: %m", m_dev, bypass);
-            freeze();
-            m_bypass = bypass;
-        }
-        if (::ioctl(m_fd, AUDIO_PLAY) < 0)
-            eWarning("[eDVBAudio%d] AUDIO_PLAY failed: %m", m_dev);
-    }
-    if (m_TsParser) {
-        const int result = m_TsParser->startPid(m_fd_demux);
-        if (result < 0) {
-            eWarning("[DreamNextGen-AUDIO] start failed for PID 0x%x type %d: %d", pid, type, result);
-            // Fail the whole audio PID start rather than claim successful
-            // playback with no running audio consumer. Keep demux clean.
-            if (m_fd_demux >= 0)
-                ::ioctl(m_fd_demux, DMX_STOP);
-            if (m_fd >= 0)
-                ::ioctl(m_fd, AUDIO_STOP);
-            return result;
-        }
-    }
-#else
+	/* Same bypass-mode and audio-device lifecycle as OpenATV's
+	 * native dreamaudio audio path. No userspace eTsParser worker. */
 	if (m_fd >= 0)
 	{
 		int bypass = 0;
-
 		switch (type)
 		{
-		case aMPEG:
-			bypass = 1;
+		case aMPEG:   bypass = 1;    break;
+		case aDTS:    bypass = 2;    break;
+		case aAAC:    bypass = 8;    break;
+		case aAACHE:  bypass = 9;    break;
+		case aLPCM:   bypass = 6;    break;
+		case aDTSHD:  bypass = 0x10; break;
+		case aDRA:    bypass = 0x40; break;
+		case aDDP:
+#ifdef DREAMBOX
+			bypass = 7;
+#else
+			bypass = 0x22;
+#endif
 			break;
 		case aAC3:
-		case aAC4: /* FIXME: AC4 most probably will use other bypass value */
-			bypass = 0;
-			break;
-		case aDTS:
-			bypass = 2;
-			break;
-		case aAAC:
-			bypass = 8;
-			break;
-		case aAACHE:
-			bypass = 9;
-			break;
-		case aLPCM:
-			bypass = 6;
-			break;
-		case aDTSHD:
-			bypass = 0x10;
-			break;
-		case aDRA:
-			bypass = 0x40;
-			break;
-		case aDDP:
-			bypass = 0x22;
-			break;
+		case aAC4:
+		default:      bypass = 0;    break;
 		}
-
-		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_SET_BYPASS bypass=%d ", m_dev, bypass);
-		if (::ioctl(m_fd, AUDIO_SET_BYPASS_MODE, bypass) < 0)
-			eDebugNoNewLine("failed: %m\n");
-		else
-			eDebugNoNewLine("ok\n");
-		freeze();  // why freeze here?!? this is a problem when only a pid change is requested... because of the unfreeze logic in Decoder::setState
-		eDebugNoNewLineStart("[eDVBAudio%d] AUDIO_PLAY ", m_dev);
+		if (m_bypass != bypass)
+		{
+			if (::ioctl(m_fd, AUDIO_SET_BYPASS_MODE, bypass) < 0)
+				eWarning("[eDVBAudio%d] AUDIO_SET_BYPASS_MODE(%d) failed: %m", m_dev, bypass);
+			freeze();
+			m_bypass = bypass;
+		}
 		if (::ioctl(m_fd, AUDIO_PLAY) < 0)
-			eDebugNoNewLine("failed: %m\n");
-		else
-			eDebugNoNewLine("ok\n");
+			eWarning("[eDVBAudio%d] AUDIO_PLAY failed: %m", m_dev);
 	}
-#endif // DREAMNEXTGEN
 	return 0;
 }
 
@@ -291,10 +211,6 @@ void eDVBAudio::stop()
 		else
 			eDebugNoNewLine("ok\n");
 	}
-#ifdef DREAMNEXTGEN
-	/* Stop the TS producer before joining its userspace consumer. */
-	if (m_TsParser) m_TsParser->stop();
-#endif
 }
 
 void eDVBAudio::flush()
@@ -307,9 +223,6 @@ void eDVBAudio::flush()
 		else
 			eDebugNoNewLine("ok\n");
 	}
-#ifdef DREAMNEXTGEN
-	if (m_TsParser) m_TsParser->flush();
-#endif
 }
 
 void eDVBAudio::freeze()
@@ -322,9 +235,6 @@ void eDVBAudio::freeze()
 		else
 			eDebugNoNewLine("ok\n");
 	}
-#ifdef DREAMNEXTGEN
-	if (m_TsParser) m_TsParser->freeze();
-#endif
 }
 
 void eDVBAudio::unfreeze()
@@ -337,9 +247,6 @@ void eDVBAudio::unfreeze()
 		else
 			eDebugNoNewLine("ok\n");
 	}
-#ifdef DREAMNEXTGEN
-	if (m_TsParser) m_TsParser->unfreeze();
-#endif
 }
 
 void eDVBAudio::setChannel(int channel)
@@ -363,16 +270,6 @@ void eDVBAudio::setChannel(int channel)
 
 int eDVBAudio::getPTS(pts_t &now)
 {
-#ifdef DREAMNEXTGEN
-    if (m_TsParser) {
-        // The kernel audiodsp is not the PCM consumer for TSDEMUX_TAP.
-        // Never report the stub AUDIO_GET_PTS (often zero) as valid APTS.
-        pts_t presented = 0;
-        if (m_TsParser->getPTS(presented)) return -1;
-        now = presented;
-        return 0;
-    }
-#endif
 	if (m_fd >= 0)
 	{
 		if (::ioctl(m_fd, AUDIO_GET_PTS, &now) < 0)
@@ -383,10 +280,6 @@ int eDVBAudio::getPTS(pts_t &now)
 
 eDVBAudio::~eDVBAudio()
 {
-#ifdef DREAMNEXTGEN
-	delete m_TsParser;
-	m_TsParser = nullptr;
-#endif
 	unfreeze();  // why unfreeze here... but not unfreeze video in ~eDVBVideo ?!?
 	if (m_fd >= 0)
 		::close(m_fd);
@@ -1048,6 +941,52 @@ int eTSMPEGDecoder::setState()
 		}
 		m_text = 0;
 	}
+
+#ifdef DREAMNEXTGEN
+	/* OpenATV b4aa368 DreamNextGen PCRMASTER bootstrap before video start. */
+	if (m_decoder == 0 && (changed & (changeState | changeVideo | changePCR)))
+	{
+		eAVSyncCore *avsync = eAVSyncCore::getInstance();
+		const bool stopping = (m_state != statePlay && m_state != statePause);
+		static int last_vpid = -1;
+		static int last_pcr = -1;
+		static int last_dmx = -1;
+		const int vpid = (m_vpid > 0 && m_vpid < 0x1FFF) ? m_vpid : 0x1FFF;
+		const int apid = (m_apid > 0 && m_apid < 0x1FFF) ? m_apid : 0x1FFF;
+		const int pcr  = (m_pcrpid > 0 && m_pcrpid < 0x1FFF) ? m_pcrpid : 0x1FFF;
+		int dmx = -1;
+		if (m_demux)
+		{
+			uint8_t did = 0;
+			m_demux->getCADemuxID(did);
+			dmx = did;
+		}
+		const bool video_unchanged = !stopping &&
+			last_vpid == vpid && last_pcr == pcr &&
+			last_dmx == dmx && vpid != 0x1FFF;
+		if (video_unchanged)
+		{
+			/* Audio-only update: preserve the running kernel PCR clock. */
+		}
+		else if (stopping)
+		{
+			avsync->stopPCRSync();
+			last_vpid = last_pcr = last_dmx = -1;
+		}
+		else if (vpid != 0x1FFF || apid != 0x1FFF || pcr != 0x1FFF)
+		{
+			avsync->stopPCRSync();
+			avsync->enableKernelSync();
+			avsync->setPCROffset(0x1a5e);
+			avsync->setAutoPCROffset(0);
+			if (dmx >= 0)
+				avsync->setDemuxInfo(dmx, 0, vpid, apid, pcr);
+			last_vpid = vpid;
+			last_pcr = pcr;
+			last_dmx = dmx;
+		}
+	}
+#endif
 	if (m_changed & changePCR)
 	{
 		if ((m_pcrpid >= 0) && (m_pcrpid < 0x1FFF))

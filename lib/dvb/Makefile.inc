@@ -95,5 +95,6 @@ dvbinclude_HEADERS = \
 
 # OpenBH DreamOne/DreamTwo FFmpeg + ALSA audio backend
 if DREAMNEXTGEN
-dvb_libenigma_dvb_a_SOURCES += dvb/amlogic_audio.cpp
+dvb_libenigma_dvb_a_SOURCES += dvb/avsync_core.cpp
+dvbinclude_HEADERS += dvb/avsync_core.h
 endif
