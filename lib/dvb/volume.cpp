@@ -282,6 +282,45 @@ struct IpaNativeSession
     }
 };
 static IpaNativeSession ipaNativeSession;
+
+/* DREAMNEXTGEN_NATIVE_MASTER_VOLUME_V1
+ * dreamaudiod reads the hw:0 ALSA 'Master' mixer and applies the gain in
+ * userspace; the DVB AUDIO_SET_MIXER ioctl alone does not change that gain.
+ * Reuse the already-loaded OpenBH IPAudioPlus ALSA symbols, but do NOT tie
+ * native DVB gain to IPAudioPlus process detection or change DVB ioctls.
+ *
+ * dreamaudiod::Output::gain() calculates 10^((-51 + 0.2*raw)/20): its
+ * hw:0 Master has raw values 0..255 (255 = unity, 0 = mute). Invert that
+ * conversion for approximately LINEAR perceived amplitude from UI 1..100.
+ * For an unusual mixer range, preserve the original IPA ALSA mapping.
+ */
+#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
+static IpaNativeAlsa dreamNextGenMaster;
+static void dreamNextGenApplyMaster(int level)
+{
+    if (!dreamNextGenMaster.open()) {
+        eDebug("[DreamAudio Master] ALSA hw:0 Master unavailable");
+        return;
+    }
+    if (level < 0) level = 0;
+    if (level > 100) level = 100;
+    if (dreamNextGenMaster.min_raw != 0 || dreamNextGenMaster.max_raw != 255) {
+        /* Cannot assume dreamaudiod's raw gain curve on another mixer. */
+        dreamNextGenMaster.apply(level);
+        return;
+    }
+    long raw = 0;
+    if (level >= 100)
+        raw = 255;
+    else if (level > 0)
+        raw = static_cast<long>(255.0 + 100.0 * log10(static_cast<double>(level) / 100.0) + 0.5);
+    if (raw < 0) raw = 0;
+    if (raw > 255) raw = 255;
+    if (dreamNextGenMaster.set_all(dreamNextGenMaster.master, raw) < 0)
+        eDebug("[DreamAudio Master] Could not write hw:0 Master=%ld", raw);
+}
+#endif /* DREAMNEXTGEN_NATIVE_MASTER_VOLUME_V1 */
+
 }  // namespace
 #endif // !HAVE_ALSA
 
@@ -480,6 +519,10 @@ int eDVBVolumecontrol::checkVolume(int vol)
 
 void eDVBVolumecontrol::setVolume(int left, int right)
 {
+#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
+	dreamNextGenApplyMaster(muted ? 0 : checkVolume(left));
+#endif /* DREAMNEXTGEN_NATIVE_MASTER_VOLUME_V1 */
+
 #ifdef DREAMNEXTGEN
     DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
 #endif
@@ -552,6 +595,10 @@ bool eDVBVolumecontrol::isMuted()
 
 void eDVBVolumecontrol::volumeMute()
 {
+#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
+	dreamNextGenApplyMaster(0);
+#endif /* DREAMNEXTGEN_NATIVE_MASTER_VOLUME_V1 */
+
 #ifdef DREAMNEXTGEN
     DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
 #endif
@@ -586,6 +633,10 @@ void eDVBVolumecontrol::volumeMute()
 
 void eDVBVolumecontrol::volumeUnMute()
 {
+#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
+	dreamNextGenApplyMaster(leftVol);
+#endif /* DREAMNEXTGEN_NATIVE_MASTER_VOLUME_V1 */
+
 #ifdef DREAMNEXTGEN
     DreamTwoExt3NativeVolumeScope dreamtwoExt3VolumeScope(this);
 #endif
@@ -633,12 +684,21 @@ void eDVBVolumecontrol::volumeToggleMute()
 #ifndef HAVE_ALSA
 void eDVBVolumecontrol::ipaNativeTick()
 {
+#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
+    const bool ipaWasActive = ipaNativeSession.active;
+#endif
+
     /* Only player start/stop discovery runs here.  When inactive, scan /proc
      * about once every 1.2s (never on remote keys); while active validate
      * the cached PID once per 0.8s. No external program, flag or JSON file.
      */
     const bool present = ipaNativePlayerActive();
     ipaNativeSession.sync(muted ? 0 : leftVol, present);
+#if defined(DREAMNEXTGEN) && !defined(HAVE_ALSA)
+    if (ipaWasActive && !ipaNativeSession.active)
+        dreamNextGenApplyMaster(muted ? 0 : leftVol);
+#endif
+
     if (m_ipaNativeTimer)
         m_ipaNativeTimer->start(present ? 800 : 1200, true);
 }
