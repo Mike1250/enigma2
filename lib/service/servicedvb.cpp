@@ -3086,6 +3086,7 @@ RESULT eDVBServicePlay::startTimeshift()
 	}
 
 	m_timeshift_enabled = 1;
+	m_pids_active.clear();
 
 	updateTimeshiftPids();
 	m_record->start();
@@ -3139,6 +3140,7 @@ RESULT eDVBServicePlay::stopTimeshift(bool swToLive)
 	}
 
 	m_timeshift_enabled = 0;
+	m_pids_active.clear();
 
 	// NOW switch to live (SoftDecoder can safely allocate resources)
 	if (swToLive)
@@ -3348,9 +3350,9 @@ void eDVBServicePlay::updateTimeshiftPids()
 		return;
 
 	eDVBServicePMTHandler::program program;
-	eDVBServicePMTHandler &h = m_timeshift_active ? m_service_handler_timeshift : m_service_handler;
+	// The recorder remains on the live service when playback switches to the timeshift file.
 
-	if (h.getProgramInfo(program))
+	if (m_service_handler.getProgramInfo(program))
 		return;
 	else
 	{
@@ -3361,6 +3363,9 @@ void eDVBServicePlay::updateTimeshiftPids()
 		pids_to_record.insert(0); // PAT
 		if (program.pmtPid != -1)
 			pids_to_record.insert(program.pmtPid); // PMT
+
+		if (program.pcrPid > 0 && program.pcrPid < 0x1fff)
+			pids_to_record.insert(program.pcrPid); // PCR can be distinct from video
 
 		if (program.textPid != -1)
 			pids_to_record.insert(program.textPid); // Videotext
@@ -3405,7 +3410,7 @@ void eDVBServicePlay::updateTimeshiftPids()
 		std::set_difference(
 				m_pids_active.begin(), m_pids_active.end(),
 				pids_to_record.begin(), pids_to_record.end(),
-				std::inserter(new_pids, new_pids.begin())
+				std::inserter(obsolete_pids, obsolete_pids.begin())
 				);
 
 		for (std::set<int>::iterator i(new_pids.begin()); i != new_pids.end(); ++i)
@@ -3413,6 +3418,11 @@ void eDVBServicePlay::updateTimeshiftPids()
 
 		for (std::set<int>::iterator i(obsolete_pids.begin()); i != obsolete_pids.end(); ++i)
 			m_record->removePID(*i);
+
+		// Record the PID state so future PMT updates remove stale filters.
+		m_pids_active = pids_to_record;
+		eDebug("[eDVBServicePlay] timeshift LIVE PID sync active=%zu add=%zu remove=%zu PCR=0x%x audio=%zu",
+		       m_pids_active.size(), new_pids.size(), obsolete_pids.size(), program.pcrPid, program.audioStreams.size());
 
 		if (timing_pid != -1)
 			m_record->setTimingPID(timing_pid, timing_pid_type, timing_stream_type);
