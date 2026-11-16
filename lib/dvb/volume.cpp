@@ -1,6 +1,10 @@
+#include <enigma2_config.h>
 #include <lib/base/cfile.h>
 #include <lib/base/eerror.h>
 #include <lib/dvb/volume.h>
+#ifdef DREAMNEXTGEN
+#include <lib/dvb/dreamaudio_volume.h>
+#endif /* DREAMAUDIO_MASTER_V2 */
 #include <stdio.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -140,6 +144,12 @@ void eDVBVolumecontrol::setVolume(int left, int right)
 		/* left, right is 0..100 */
 	leftVol = checkVolume(left);
 	rightVol = checkVolume(right);
+#ifdef DREAMNEXTGEN
+    /* DREAMAUDIO_MASTER_V2: native daemon reads ALSA hw:0 Master, not DVB AUDIO_SET_MIXER. */
+    dreamaudioApplyMaster(muted ? 0 : static_cast<unsigned int>(leftVol));
+    return;
+#endif
+
 
 #ifdef HAVE_ALSA
 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA leftVol=%d", leftVol);
@@ -210,6 +220,11 @@ void eDVBVolumecontrol::volumeMute()
 	//HACK?
 	CFile::writeInt("/proc/stb/audio/j1_mute", 1);
 #endif
+
+#ifdef DREAMNEXTGEN
+    /* DREAMAUDIO_MASTER_V2 */
+    dreamaudioApplyMaster(0);
+#endif
 }
 
 void eDVBVolumecontrol::volumeUnMute()
@@ -232,6 +247,11 @@ void eDVBVolumecontrol::volumeUnMute()
 
 	//HACK?
 	CFile::writeInt("/proc/stb/audio/j1_mute", 0);
+#endif
+
+#ifdef DREAMNEXTGEN
+    /* DREAMAUDIO_MASTER_V2 */
+    dreamaudioApplyMaster(static_cast<unsigned int>(leftVol));
 #endif
 }
 

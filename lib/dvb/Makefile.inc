@@ -94,4 +94,5 @@ dvbinclude_HEADERS = \
 # DreamTwo Amlogic kernel PCR/PTS synchronization (native DreamAudio path).
 if DREAMNEXTGEN
 dvb_libenigma_dvb_a_SOURCES += dvb/avsync_core.cpp
+dvb_libenigma_dvb_a_SOURCES += dvb/dreamaudio_volume.cpp
 endif
