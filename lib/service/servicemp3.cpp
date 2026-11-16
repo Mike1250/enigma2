@@ -2344,6 +2344,91 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	m_gst_playbin = gst_element_factory_make("playbin", "playbin");
 	if ( m_gst_playbin )
 	{
+#ifdef DREAMNEXTGEN
+		/* OPENBH_DREAMTWO_OPENATV_LOCAL_SINKS_V1
+		 * OpenATV assigns native audio/video sinks directly to playbin.
+		 * This DreamTwo image provides dreamaudiosink/dreamvideosink instead
+		 * of dvbaudiosink/dvbvideosink.  Keep the pipeline and other platforms
+		 * untouched.  Force the normal ALSA PCM sink with the temporary
+		 * /tmp/openbh_gst_use_alsa marker for unsupported native audio caps.
+		 * /tmp/openbh_gst_auto_sinks disables this port for A/B testing.
+		 */
+		if (!m_sourceinfo.is_streaming &&
+			!g_file_test("/tmp/openbh_gst_auto_sinks", G_FILE_TEST_EXISTS))
+		{
+			const bool force_alsa =
+				g_file_test("/tmp/openbh_gst_use_alsa", G_FILE_TEST_EXISTS);
+			GstElement *local_audio_sink = NULL;
+			const char *audio_factory = NULL;
+
+			if (!force_alsa)
+			{
+				local_audio_sink = gst_element_factory_make("dreamaudiosink", NULL);
+				if (local_audio_sink)
+					audio_factory = "dreamaudiosink";
+			}
+			if (!local_audio_sink)
+			{
+				local_audio_sink = gst_element_factory_make("alsasink", NULL);
+				if (local_audio_sink)
+					audio_factory = "alsasink";
+			}
+			if (local_audio_sink)
+			{
+				GObjectClass *klass = G_OBJECT_GET_CLASS(local_audio_sink);
+				/* Same e2-sync/e2-async behavior as OpenATV's MP3 service.
+				 * Some Dream sink versions omit these properties. */
+				if (g_object_class_find_property(klass, "e2-sync"))
+					g_object_set(G_OBJECT(local_audio_sink), "e2-sync",
+						m_sourceinfo.is_audio ? TRUE : FALSE, NULL);
+				if (g_object_class_find_property(klass, "e2-async"))
+					g_object_set(G_OBJECT(local_audio_sink), "e2-async",
+						m_sourceinfo.is_audio ? TRUE : FALSE, NULL);
+				/* Keep the decoded PCM at its NORMAL full scale (1.0).
+				 * This is not an artificial boost above 0 dB. */
+				if (g_object_class_find_property(klass, "volume"))
+					g_object_set(G_OBJECT(local_audio_sink), "volume", (gdouble)1.0, NULL);
+				/* An earlier DreamTwo sink build explicitly used the
+				 * dreamhdmi PCM alias.  Keep it selectable, not forced:
+				 * some images already have a correctly configured default. */
+				if (g_object_class_find_property(klass, "device"))
+				{
+					if (g_file_test("/tmp/openbh_gst_use_dreamhdmi", G_FILE_TEST_EXISTS))
+						g_object_set(G_OBJECT(local_audio_sink), "device", "dreamhdmi", NULL);
+					else if (force_alsa &&
+						g_file_test("/tmp/openbh_gst_use_alsa_hw0", G_FILE_TEST_EXISTS))
+						g_object_set(G_OBJECT(local_audio_sink), "device", "hw:0,0", NULL);
+				}
+				gst_object_ref_sink(local_audio_sink);
+				g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", local_audio_sink, NULL);
+				g_object_set(G_OBJECT(m_gst_playbin), "volume", (gdouble)1.0, NULL);
+				gst_object_unref(local_audio_sink);
+				eDebug("[DreamTwo local GStreamer] OpenATV-style audio-sink: %s", audio_factory);
+			}
+			else
+				eWarning("[DreamTwo local GStreamer] dreamaudiosink/alsasink unavailable");
+
+			if (!m_sourceinfo.is_audio)
+			{
+				GstElement *local_video_sink = gst_element_factory_make("dreamvideosink", NULL);
+				if (local_video_sink)
+				{
+					GObjectClass *klass = G_OBJECT_GET_CLASS(local_video_sink);
+					if (g_object_class_find_property(klass, "e2-sync"))
+						g_object_set(G_OBJECT(local_video_sink), "e2-sync", FALSE, NULL);
+					if (g_object_class_find_property(klass, "e2-async"))
+						g_object_set(G_OBJECT(local_video_sink), "e2-async", FALSE, NULL);
+					gst_object_ref_sink(local_video_sink);
+					g_object_set(G_OBJECT(m_gst_playbin), "video-sink", local_video_sink, NULL);
+					gst_object_unref(local_video_sink);
+					eDebug("[DreamTwo local GStreamer] OpenATV-style video-sink: dreamvideosink");
+				}
+				else
+					eWarning("[DreamTwo local GStreamer] dreamvideosink not installed");
+			}
+		}
+#endif
+
 		/*
 		 * avoid video conversion, let the dvbmediasink handle that using native video flag
 		 * volume control is done by hardware, do not use soft volume flag
