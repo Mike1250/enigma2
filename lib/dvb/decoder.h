@@ -3,6 +3,9 @@
 
 #include <lib/base/object.h>
 #include <lib/dvb/demux.h>
+#ifdef DREAMNEXTGEN
+#include <lib/base/ebase.h>
+#endif
 
 class eSocketNotifier;
 
@@ -36,6 +39,11 @@ private:
 	static int m_close_invalidates_attributes;
 	int m_is_slow_motion, m_is_fast_forward, m_is_freezed;
 	ePtr<eSocketNotifier> m_sn;
+#ifdef DREAMNEXTGEN
+    ePtr<eTimer> m_amlogic_poll_timer;
+    unsigned int m_amlogic_poll_attempts = 0;
+    void amlogic_poll_video();
+#endif
 	void video_event(int what);
 	sigc::signal<void(struct iTSMPEGDecoder::videoEvent)> m_event;
 	int m_width, m_height, m_framerate, m_aspect, m_progressive, m_gamma;

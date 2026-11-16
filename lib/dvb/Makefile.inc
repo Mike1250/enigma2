@@ -90,3 +90,8 @@ dvbinclude_HEADERS = \
 	dvb/atsc.h \
 	dvb/fcc.h \
 	dvb/fccdecoder.h
+
+# DreamTwo Amlogic kernel PCR/PTS synchronization (native DreamAudio path).
+if DREAMNEXTGEN
+dvb_libenigma_dvb_a_SOURCES += dvb/avsync_core.cpp
+endif

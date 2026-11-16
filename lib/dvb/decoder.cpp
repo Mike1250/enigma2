@@ -1,8 +1,12 @@
+#include <enigma2_config.h>
 #include <lib/base/cfile.h>
 #include <lib/base/ebase.h>
 #include <lib/base/eerror.h>
 #include <lib/base/wrappers.h>
 #include <lib/dvb/decoder.h>
+#ifdef DREAMNEXTGEN
+#include <lib/dvb/avsync_core.h>
+#endif
 #ifdef HAVE_EGL
 #include <lib/gdi/egl/gegldc.h>
 #endif
@@ -81,7 +85,12 @@ eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 	:m_demux(demux), m_dev(dev)
 {
 	char filename[128] = {};
-	sprintf(filename, "/dev/dvb/adapter%d/audio%d", demux ? demux->adapter : 0, dev);
+	#ifdef DREAMNEXTGEN
+    /* This DVB audio node sends commands/TS packets to userspace dreamaudiod. */
+    sprintf(filename, "/dev/dvb/adapter%d/dreamaudio%d", demux ? demux->adapter : 0, dev);
+#else
+    sprintf(filename, "/dev/dvb/adapter%d/audio%d", demux ? demux->adapter : 0, dev);
+#endif
 	m_fd = openDecoderDeviceWithRetry(filename);
 	if (m_fd < 0)
 		eWarning("[eDVBAudio] %s: %m", filename);
@@ -97,10 +106,12 @@ eDVBAudio::eDVBAudio(eDVBDemux *demux, int dev)
 		m_fd_demux = -1;
 	}
 
+#ifndef DREAMNEXTGEN
 	if (m_fd >= 0)
 	{
 		::ioctl(m_fd, AUDIO_SELECT_SOURCE, demux ? AUDIO_SOURCE_DEMUX : AUDIO_SOURCE_HDMI);
 	}
+#endif
 }
 
 int eDVBAudio::startPid(int pid, int type)
@@ -177,7 +188,11 @@ int eDVBAudio::startPid(int pid, int type)
 			bypass = 0x40;
 			break;
 		case aDDP:
-			bypass = 0x22;
+#ifdef DREAMNEXTGEN
+            bypass = 7;
+#else
+            bypass = 0x22;
+#endif
 			break;
 		}
 
@@ -324,10 +339,12 @@ eDVBVideo::eDVBVideo(eDVBDemux *demux, int dev, bool fcc_enable)
 		m_fd_demux = -1;
 	}
 
+#ifndef DREAMNEXTGEN
 	if (m_fd >= 0)
 	{
 		::ioctl(m_fd, VIDEO_SELECT_SOURCE, demux ? VIDEO_SOURCE_DEMUX : VIDEO_SOURCE_HDMI);
 	}
+#endif
 
 	if (m_close_invalidates_attributes < 0)
 	{
@@ -348,6 +365,15 @@ eDVBVideo::eDVBVideo(eDVBDemux *demux, int dev, bool fcc_enable)
 		readApiSize(m_fd, m_width, m_height, m_aspect);
 		m_close_invalidates_attributes = (m_width == -1) ? 1 : 0;
 	}
+#ifdef DREAMNEXTGEN
+    /* Amlogic may not emit VIDEO_EVENT_SIZE_CHANGED or framerate events. */
+    if (m_fd >= 0)
+    {
+        m_amlogic_poll_timer = eTimer::create(eApp);
+        CONNECT(m_amlogic_poll_timer->timeout, eDVBVideo::amlogic_poll_video);
+        m_amlogic_poll_timer->start(500, true);
+    }
+#endif
 }
 
 // not finally values i think.. !!
@@ -355,11 +381,20 @@ eDVBVideo::eDVBVideo(eDVBDemux *demux, int dev, bool fcc_enable)
 #define VIDEO_STREAMTYPE_MPEG4_H264 1
 #define VIDEO_STREAMTYPE_VC1 3
 #define VIDEO_STREAMTYPE_MPEG4_Part2 4
+#ifdef DREAMNEXTGEN
+/* Video stream formats from the working OpenATV DreamTwo implementation. */
+#define VIDEO_STREAMTYPE_VC1_SM 17
+#define VIDEO_STREAMTYPE_MPEG1 0
+#define VIDEO_STREAMTYPE_H265_HEVC 22
+#define VIDEO_STREAMTYPE_AVS 7
+#define VIDEO_STREAMTYPE_AVS2 15
+#else
 #define VIDEO_STREAMTYPE_VC1_SM 5
 #define VIDEO_STREAMTYPE_MPEG1 6
 #define VIDEO_STREAMTYPE_H265_HEVC 7
 #define VIDEO_STREAMTYPE_AVS 16
 #define VIDEO_STREAMTYPE_AVS2 40
+#endif
 
 int eDVBVideo::startPid(int pid, int type)
 {
@@ -563,7 +598,11 @@ int eDVBVideo::getPTS(pts_t &now)
 
 eDVBVideo::~eDVBVideo()
 {
-	if (m_fd >= 0)
+#ifdef DREAMNEXTGEN
+    if (m_amlogic_poll_timer)
+        m_amlogic_poll_timer->stop();
+#endif
+    if (m_fd >= 0)
 		::close(m_fd);
 	if (m_fd_demux >= 0)
 		::close(m_fd_demux);
@@ -640,6 +679,50 @@ void eDVBVideo::video_event(int)
 	}
 }
 
+#ifdef DREAMNEXTGEN
+/* OPENBH_AMLOGIC_DECODER_V1: OpenATV-style sysfs metadata fallback. */
+void eDVBVideo::amlogic_poll_video()
+{
+    int width = -1, height = -1, rate = -1, progressive = -1;
+    CFile::parseInt(&width, "/sys/class/video/frame_width");
+    CFile::parseInt(&height, "/sys/class/video/frame_height");
+    CFile::parseInt(&rate, "/proc/stb/vmpeg/0/frame_rate");
+    CFile::parseInt(&progressive, "/proc/stb/vmpeg/0/progressive");
+
+    if (width > 0 && height > 0 && (width != m_width || height != m_height || m_amlogic_poll_attempts == 0))
+    {
+        m_width = width;
+        m_height = height;
+        struct iTSMPEGDecoder::videoEvent event = {};
+        event.type = iTSMPEGDecoder::videoEvent::eventSizeChanged;
+        event.width = width;
+        event.height = height;
+        event.aspect = m_aspect < 0 ? 2 : m_aspect;
+        m_event(event);
+    }
+    if (rate > 0 && rate != m_framerate)
+    {
+        m_framerate = rate;
+        struct iTSMPEGDecoder::videoEvent event = {};
+        event.type = iTSMPEGDecoder::videoEvent::eventFrameRateChanged;
+        event.framerate = rate;
+        m_event(event);
+    }
+    if ((progressive == 0 || progressive == 1) && progressive != m_progressive)
+    {
+        m_progressive = progressive;
+        struct iTSMPEGDecoder::videoEvent event = {};
+        event.type = iTSMPEGDecoder::videoEvent::eventProgressiveChanged;
+        event.progressive = progressive;
+        m_event(event);
+    }
+    /* Bound the poll time. Long-running metadata monitoring is not needed. */
+    ++m_amlogic_poll_attempts;
+    if (m_amlogic_poll_timer && m_amlogic_poll_attempts < 45)
+        m_amlogic_poll_timer->start(m_amlogic_poll_attempts < 10 ? 500 : 2000, true);
+}
+#endif
+
 RESULT eDVBVideo::connectEvent(const sigc::slot<void(struct iTSMPEGDecoder::videoEvent)> &event, ePtr<eConnection> &conn)
 {
 	conn = new eConnection(this, m_event.connect(event));
@@ -656,7 +739,19 @@ int eDVBVideo::readApiSize(int fd, int &xres, int &yres, int &aspect)
 		aspect = size.aspect_ratio == 0 ? 2 : 3;  // convert dvb api to etsi
 		return 0;
 	}
-	return -1;
+#ifdef DREAMNEXTGEN
+    int w = -1, h = -1;
+    if (CFile::parseInt(&w, "/sys/class/video/frame_width") == 0 &&
+        CFile::parseInt(&h, "/sys/class/video/frame_height") == 0 &&
+        w > 0 && h > 0)
+    {
+        xres = w;
+        yres = h;
+        aspect = 2;
+        return 0;
+    }
+#endif
+    return -1;
 }
 
 int eDVBVideo::getWidth()
@@ -942,6 +1037,50 @@ int eTSMPEGDecoder::setState()
 		}
 		m_text = 0;
 	}
+#ifdef DREAMNEXTGEN
+    /* From OpenATV: program PCRMASTER before starting video/PCR demux feeds.
+     * Do not interrupt an unchanged video clock on audio-only changes. */
+    if (m_decoder == 0 && (changed & (changeState | changeVideo | changePCR)))
+    {
+        eAVSyncCore *sync = eAVSyncCore::getInstance();
+        static int last_vpid = -1, last_pcrpid = -1, last_demux = -1;
+        int vpid = (m_vpid > 0 && m_vpid < 0x1FFF) ? m_vpid : 0x1FFF;
+        int apid = (m_apid > 0 && m_apid < 0x1FFF) ? m_apid : 0x1FFF;
+        int pcrpid = (m_pcrpid > 0 && m_pcrpid < 0x1FFF) ? m_pcrpid : 0x1FFF;
+        int demuxid = -1;
+        if (m_demux)
+        {
+            uint8_t id = 0;
+            m_demux->getCADemuxID(id);
+            demuxid = id;
+        }
+        bool stopping = (m_state != statePlay && m_state != statePause);
+        bool same_video = !stopping && vpid != 0x1FFF &&
+            last_vpid == vpid && last_pcrpid == pcrpid && last_demux == demuxid;
+        if (same_video)
+        {
+            /* Keep PCRMASTER running while changing audio tracks. */
+        }
+        else if (stopping)
+        {
+            sync->stopPCRSync();
+            last_vpid = last_pcrpid = last_demux = -1;
+        }
+        else if (vpid != 0x1FFF || apid != 0x1FFF || pcrpid != 0x1FFF)
+        {
+            sync->stopPCRSync();
+            sync->enableKernelSync();
+            sync->setPCROffset(0x1a5e);  /* OpenATV default: ~75 ms */
+            sync->setAutoPCROffset(0);
+            if (demuxid >= 0)
+                sync->setDemuxInfo(demuxid, 0, vpid, apid, pcrpid);
+            last_vpid = vpid;
+            last_pcrpid = pcrpid;
+            last_demux = demuxid;
+        }
+    }
+#endif
+
 	if (m_changed & changePCR)
 	{
 		if ((m_pcrpid >= 0) && (m_pcrpid < 0x1FFF))
@@ -1092,7 +1231,11 @@ eTSMPEGDecoder::eTSMPEGDecoder(eDVBDemux *demux, int decoder)
 	m_state = stateStop;
 
 	char filename[128] = {};
-	sprintf(filename, "/dev/dvb/adapter%d/audio%d", m_demux ? m_demux->adapter : 0, m_decoder);
+	#ifdef DREAMNEXTGEN
+    sprintf(filename, "/dev/dvb/adapter%d/dreamaudio%d", m_demux ? m_demux->adapter : 0, m_decoder);
+#else
+    sprintf(filename, "/dev/dvb/adapter%d/audio%d", m_demux ? m_demux->adapter : 0, m_decoder);
+#endif
 	m_has_audio = !access(filename, W_OK);
 
 	if (m_demux && m_decoder == 0)	// Tuxtxt caching actions only on primary decoder
