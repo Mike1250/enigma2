@@ -335,9 +335,12 @@ void eDVBPESReader::data(int)
 {
 	while (1)
 	{
-		uint8_t buffer[16384] = {};
+		// A PES payload may be up to 65535 bytes plus its six-byte header.
+		// 16 KiB reads can return EOVERFLOW on DVB drivers that require
+		// a complete PES packet to fit in the read buffer.
+		uint8_t buffer[65536 + 6];
 		int r;
-		r = ::read(m_fd, buffer, 16384);
+		r = ::read(m_fd, buffer, sizeof(buffer));
 		if (!r)
 			return;
 		if(r < 0)
@@ -352,18 +355,18 @@ void eDVBPESReader::data(int)
 			m_read(buffer, r);
 		else
 			eWarning("[eDVBPESReader] PES reader not active");
-		if (r != 16384)
+		if (r != (int)sizeof(buffer))
 			break;
 	}
 }
 
 eDVBPESReader::eDVBPESReader(eDVBDemux *demux, eMainloop *context, RESULT &res): m_demux(demux), m_active(0)
 {
-	eDebug("[eDVBPESReader] Created. Opening demux");
+	eWarning("[eDVBPESReader] Created. Opening demux");
 	m_fd = m_demux->openDemux();
 	if (m_fd >= 0)
 	{
-		setBufferSize(64*1024);
+		setBufferSize(256*1024); // Allow bursts of large DVB subtitle PES packets.
 		::fcntl(m_fd, F_SETFL, O_NONBLOCK);
 		m_notifier = eSocketNotifier::create(context, m_fd, eSocketNotifier::Read, false);
 		CONNECT(m_notifier->activated, eDVBPESReader::data);
@@ -393,17 +396,30 @@ eDVBPESReader::~eDVBPESReader()
 
 RESULT eDVBPESReader::start(int pid)
 {
+	return startPES(pid, false);
+}
+
+RESULT eDVBPESReader::startSubtitle(int pid)
+{
+	return startPES(pid, true);
+}
+
+RESULT eDVBPESReader::startPES(int pid, bool subtitle)
+{
 	RESULT res;
 	if (m_fd < 0)
 		return -ENODEV;
 
-	eDebug("[eDVBPESReader] DMX_SET_PES_FILTER pid=%04x", pid);
+	eDebug("[eDVBPESReader] DMX_SET_PES_FILTER pid=%04x mode=%s",
+	       pid, subtitle ? "SUBTITLE" : "OTHER");
 	m_notifier->start();
 
 	dmx_pes_filter_params flt = {};
 	memset(&flt, 0, sizeof(flt));
 
-	flt.pes_type = DMX_PES_OTHER;
+	// Generic PES readers (including audio/teletext) must never claim
+	// the dedicated subtitle channel. Only eDVBSubtitleParser opts in.
+	flt.pes_type = subtitle ? DMX_PES_SUBTITLE : DMX_PES_OTHER;
 	flt.pid     = pid;
 	flt.input   = DMX_IN_FRONTEND;
 	flt.output  = DMX_OUT_TAP;
@@ -413,8 +429,12 @@ RESULT eDVBPESReader::start(int pid)
 	res = ::ioctl(m_fd, DMX_SET_PES_FILTER, &flt);
 
 	if (res)
-		eWarning("[eDVBPESReader] DMX_SET_PES_FILTER pid=%04x:  %m", pid);
-	if (!res)
+	{
+		eWarning("[eDVBPESReader] DMX_SET_PES_FILTER pid=%04x mode=%s: %m",
+		         pid, subtitle ? "SUBTITLE" : "OTHER");
+		m_notifier->stop();
+	}
+	else
 		m_active = 1;
 	return res;
 }

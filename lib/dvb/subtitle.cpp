@@ -11,20 +11,105 @@
 #include <lib/base/eerror.h>
 #include <lib/gdi/gpixmap.h>
 #include <lib/base/nconfig.h>
+#include <algorithm>
+#include <unistd.h>
 
-void bitstream_init(bitstream *bit, const void *buffer, int size)
+// DREAMTWO_SUBPROBE_V1: bounded, opt-in diagnostic capture. No decoding changes.
+// Activate with: touch /tmp/e2subtitle_capture_live
+// Captures exact input PES (after ePESParser assembly) and indexed pixmaps
+// (before the OSD renderer). Never enabled in normal operation.
+static bool dreamtwo_subprobe_enabled()
+{
+	return access("/tmp/e2subtitle_capture_live", F_OK) == 0;
+}
+
+static void dreamtwo_subprobe_pes(const uint8_t *data, int len)
+{
+	static unsigned int count = 0;
+	if (!dreamtwo_subprobe_enabled() || count >= 32 || len <= 0 || len > 65541)
+		return;
+	char path[120];
+	snprintf(path, sizeof(path), "/tmp/e2sub_live_%03u.pes", count);
+	FILE *f = fopen(path, "wb");
+	if (!f)
+		return;
+	size_t wrote = fwrite(data, 1, (size_t)len, f);
+	fclose(f);
+	if (wrote == (size_t)len)
+	{
+		eDebug("[DREAMTWO_SUBPROBE_V1] PES #%u len=%d file=%s", count, len, path);
+		count++;
+	}
+}
+
+static void dreamtwo_subprobe_region(int region_id, int width, int height,
+    const gPixmap *pixmap, const gRGB *palette, int ncolors)
+{
+	static unsigned int count = 0;
+	if (!dreamtwo_subprobe_enabled() || count >= 32 || !pixmap ||
+	    width < 1 || width > 1920 || height < 1 || height > 1080 ||
+	    !pixmap->surface || !pixmap->surface->data ||
+	    pixmap->surface->stride < width || !palette || ncolors < 1)
+		return;
+
+	char picpath[120], palpath[120];
+	snprintf(picpath, sizeof(picpath), "/tmp/e2sub_pix_%03u_r%d.pgm", count, region_id);
+	snprintf(palpath, sizeof(palpath), "/tmp/e2sub_pix_%03u_r%d.pal", count, region_id);
+	FILE *pic = fopen(picpath, "wb");
+	if (!pic)
+		return;
+	fprintf(pic, "P5\n%d %d\n255\n", width, height);
+	const uint8_t *pixels = (const uint8_t *)pixmap->surface->data;
+	bool complete = true;
+	for (int y = 0; y < height; ++y)
+	{
+		if (fwrite(pixels + y * pixmap->surface->stride, 1, width, pic) != (size_t)width)
+		{
+			complete = false;
+			break;
+		}
+	}
+	fclose(pic);
+	if (!complete)
+		return;
+	FILE *pal = fopen(palpath, "w");
+	if (pal)
+	{
+		fprintf(pal, "region_id=%d width=%d height=%d stride=%d colors=%d\n",
+			region_id, width, height, pixmap->surface->stride, ncolors);
+		for (int i = 0; i < ncolors; ++i)
+			fprintf(pal, "%d %u %u %u %u\n", i,
+				(unsigned)palette[i].r, (unsigned)palette[i].g,
+				(unsigned)palette[i].b, (unsigned)palette[i].a);
+		fclose(pal);
+	}
+	eDebug("[DREAMTWO_SUBPROBE_V1] PIX #%u region=%d size=%dx%d stride=%d file=%s",
+		count, region_id, width, height, pixmap->surface->stride, picpath);
+	count++;
+}
+
+// The pixel-code bit reader must never cross an object field boundary.
+// A DVB pixel-code string can be terminated by an incomplete/corrupt run;
+// signal that to its caller instead of reading the following segment.
+void bitstream_init(bitstream *bit, const void *buffer, int size, int bytes)
 {
 	bit->data = (uint8_t*) buffer;
+	bit->end = bit->data + bytes;
 	bit->size = size;
 	bit->avail = 8;
 	bit->consumed = 0;
+	bit->failed = false;
 }
 
 int bitstream_get(bitstream *bit)
 {
-	int val;
+	if (bit->failed || bit->data >= bit->end || bit->size > bit->avail)
+	{
+		bit->failed = true;
+		return 0;
+	}
 	bit->avail -= bit->size;
-	val = ((*bit->data) >> bit->avail) & ((1<<bit->size) - 1);
+	int val = ((*bit->data) >> bit->avail) & ((1<<bit->size) - 1);
 	if (!bit->avail)
 	{
 		bit->data++;
@@ -51,14 +136,27 @@ static int extract_pts(pts_t &pts, uint8_t *pkt)
 
 void eDVBSubtitleParser::subtitle_process_line(subtitle_region *region, subtitle_region_object *object, int line, uint8_t *data, int len)
 {
-	bool subcentered = eConfigManager::getConfigBoolValue("config.subtitles.dvb_subtitles_centered");
-	int x = subcentered ? (region->width - len) /2 : object->object_horizontal_position;
-	int y = object->object_vertical_position + line;
-	if (x + len > region->width)
-		len = region->width - x;
-	if (len < 0 || y >= region->height)
+	if (!region || !object || !region->buffer || !region->buffer->surface || !data || len <= 0)
 		return;
-
+	// EXACT_V2: Keep each object row at its authored x position. Center the whole
+	// region at display time instead of independently centering every pixel row.
+	int x = object->object_horizontal_position;
+	int y = object->object_vertical_position + line;
+	if (y < 0 || y >= region->height || x >= region->width)
+		return;
+	if (x < 0)
+	{
+		int skip = -x;
+		if (skip >= len)
+			return;
+		data += skip;
+		len -= skip;
+		x = 0;
+	}
+	if (len > region->width - x)
+		len = region->width - x;
+	if (len <= 0)
+		return;
 	memcpy((uint8_t*)region->buffer->surface->data + region->buffer->surface->stride * y + x, data, len);
 }
 
@@ -66,9 +164,12 @@ static int map_2_to_4_bit_table[4];
 static int map_2_to_8_bit_table[4];
 static int map_4_to_8_bit_table[16];
 
-int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, subtitle_region_object *object, int *linenr, int *linep, uint8_t *data)
+int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, subtitle_region_object *object, int *linenr, int *linep, uint8_t *data, int available)
 {
+	if (!data || available < 1)
+		return -1;
 	int data_type = *data++;
+	--available;
 	static uint8_t line[1920];
 
 	bitstream bit;
@@ -76,8 +177,8 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 	switch (data_type)
 	{
 	case 0x10: // 2bit pixel data
-		bitstream_init(&bit, data, 2);
-		while (1)
+		bitstream_init(&bit, data, 2, available);
+		while (!bit.failed)
 		{
 			int len=0, col=0;
 			int code = bitstream_get(&bit);
@@ -128,18 +229,18 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 				map_2_to_4_bit_table[col] :
 				region->depth == subtitle_region::bpp8 ?
 				map_2_to_8_bit_table[col] : col;
-			while (len && ((*linep) < m_display_size.width()))
+			while (len && ((*linep) < 1920))
 			{
 				line[(*linep)++] = c;
 				len--;
 			}
 		}
-		while (bit.avail != 8)
+		while (bit.avail != 8 && !bit.failed)
 			bitstream_get(&bit);
-		return bit.consumed + 1;
+		return bit.failed ? -1 : bit.consumed + 1;
 	case 0x11: // 4bit pixel data
-		bitstream_init(&bit, data, 4);
-		while (1)
+		bitstream_init(&bit, data, 4, available);
+		while (!bit.failed)
 		{
 			int len=0, col=0;
 			int code = bitstream_get(&bit);
@@ -182,18 +283,18 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 			}
 			uint8_t c = region->depth == subtitle_region::bpp8 ?
 				map_4_to_8_bit_table[col] : col;
-			while (len && ((*linep) < m_display_size.width()))
+			while (len && ((*linep) < 1920))
 			{
 				line[(*linep)++] = c;
 				len--;
 			}
 		}
-		while (bit.avail != 8)
+		while (bit.avail != 8 && !bit.failed)
 			bitstream_get(&bit);
-		return bit.consumed + 1;
+		return bit.failed ? -1 : bit.consumed + 1;
 	case 0x12: // 8bit pixel data
-		bitstream_init(&bit, data, 8);
-		while(1)
+		bitstream_init(&bit, data, 8, available);
+		while(!bit.failed)
 		{
 			int len=0, col=0;
 			int code = bitstream_get(&bit);
@@ -215,34 +316,34 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 				} else
 					break;
 			}
-			while (len && ((*linep) < m_display_size.width()))
+			while (len && ((*linep) < 1920))
 			{
 				line[(*linep)++] = col;
 				len--;
 			}
 		}
-		return bit.consumed + 1;
+		return bit.failed ? -1 : bit.consumed + 1;
 	case 0x20:
-		bitstream_init(&bit, data, 4);
+		bitstream_init(&bit, data, 4, available);
 		for ( int i=0; i < 4; ++i )
 		{
 			map_2_to_4_bit_table[i] = bitstream_get(&bit);
 		}
-		return bit.consumed + 1;
+		return bit.failed ? -1 : bit.consumed + 1;
 	case 0x21:
-		bitstream_init(&bit, data, 8);
+		bitstream_init(&bit, data, 8, available);
 		for ( int i=0; i < 4; ++i )
 		{
 			map_2_to_8_bit_table[i] = bitstream_get(&bit);
 		}
-		return bit.consumed + 1;
+		return bit.failed ? -1 : bit.consumed + 1;
 	case 0x22:
-		bitstream_init(&bit, data, 8);
+		bitstream_init(&bit, data, 8, available);
 		for ( int i=0; i < 16; ++i )
 		{
 			map_4_to_8_bit_table[i] = bitstream_get(&bit);
 		}
-		return bit.consumed + 1;
+		return bit.failed ? -1 : bit.consumed + 1;
 	case 0xF0:
 		subtitle_process_line(region, object, *linenr, line, *linep);
 		(*linenr)+=2; // interlaced
@@ -251,13 +352,47 @@ int eDVBSubtitleParser::subtitle_process_pixel_data(subtitle_region *region, sub
 	default:
 		return -1;
 	}
-	return 0;
 }
 
-int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBufferProcess)
+// Decode exactly one object field.  All pixel-code strings, maps and
+// end-of-line controls must fit in this field (ETSI EN 300 743).
+// When bottom_field_data_block_length is zero, the top field is also used
+// for the bottom field, per the DVB subtitle object-data syntax.
+bool eDVBSubtitleParser::subtitle_process_field(subtitle_region *region,
+	subtitle_region_object *object, uint8_t *data, int length, int first_line)
+{
+	int line = first_line;
+	int linep = 0;
+	for (int pos = 0; pos < length; )
+	{
+		// A zero data_type is not a DVB pixel-data command.  It is only
+		// tolerated as terminal alignment padding, never within a string.
+		if (!data[pos])
+		{
+			bool padding = true;
+			for (int i = pos; i < length; ++i)
+				if (data[i]) { padding = false; break; }
+			if (padding)
+				return true;
+		}
+		int used = subtitle_process_pixel_data(region, object, &line, &linep,
+			data + pos, length - pos);
+		if (used <= 0 || used > length - pos)
+			return false;
+		pos += used;
+	}
+	return true;
+}
+
+int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, int available, bool isBufferProcess)
 {
 	int segment_type, page_id, segment_length, processed_length;
-	if (*segment++ !=  DVB_SUB_SYNC_BYTE)
+	if (!segment || available < 6 || segment[0] != DVB_SUB_SYNC_BYTE)
+		return -1;
+	segment_length = (segment[4] << 8) | segment[5];
+	if (segment_length + 6 > available)
+		return -1;
+	if (*segment++ != DVB_SUB_SYNC_BYTE)
 	{
 		eDebug("[eDVBSubtitleParser] out of sync.");
 		return -1;
@@ -271,6 +406,34 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 		return segment_length + 6;
 	if (page_id != m_composition_page_id && page_id != m_ancillary_page_id && !isBufferProcess)
 		return segment_length + 6;
+
+	// Validate variable-length structures before dereferencing any fields or
+	// allocating subtitle regions.  A corrupt segment must not affect its peers.
+	switch (segment_type)
+	{
+	case DVB_SUB_SEGMENT_PAGE_COMPOSITION:
+		if (segment_length < 2 || (segment_length - 2) % 6)
+			return -1;
+		break;
+	case DVB_SUB_SEGMENT_REGION_COMPOSITION:
+		if (segment_length < 10)
+			return -1;
+		break;
+	case DVB_SUB_SEGMENT_CLUT_DEFINITION:
+		if (segment_length < 2)
+			return -1;
+		break;
+	case DVB_SUB_SEGMENT_OBJECT_DATA:
+		if (segment_length < 3)
+			return -1;
+		break;
+	case DVB_SUB_SEGMENT_DISPLAY_DEFINITION:
+		if (segment_length < 5 || ((segment[0] & 0x08) && segment_length < 13))
+			return -1;
+		break;
+	default:
+		break;
+	}
 
 	subtitle_page *page, **ppage;
 
@@ -301,11 +464,14 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 			page = new subtitle_page;
 			page->page_regions = 0;
 			page->regions = 0;
+			page->pcs_size = -1; // EXACT_V2: no cached composition yet.
+			page->page_version_number = -1;
 			page->page_id = page_id;
 			page->cluts = 0;
 			page->next = 0;
 			*ppage = page;
-		} else
+		}
+		else
 		{
 			if (page->pcs_size != segment_length)
 				page->page_version_number = -1;
@@ -318,19 +484,18 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 
 		page->state = page_state;
 
-		// Clear page_region list before processing any type of PCS
+		// EXACT_V2: every new PCS replaces the page's region-reference list,
+		// including normal (state 0) updates. Keeping old references causes
+		// duplicates and stale captions after repeated display sets.
 		while (page->page_regions)
 		{
-			subtitle_page_region *p = page->page_regions->next;
+			subtitle_page_region *next = page->page_regions->next;
 			delete page->page_regions;
-			page->page_regions = p;
+			page->page_regions = next;
 		}
-		page->page_regions=0;
-
-		// when acquisition point or mode change: remove all displayed regions.
+		// Acquisition/mode-change PCS also resets cached region definitions.
 		if ((page_state == 1) || (page_state == 2))
 		{
-
 			while (page->regions)
 			{
 				subtitle_region *p = page->regions->next;
@@ -349,12 +514,16 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 		page->page_time_out = page_time_out;
 
 		page->page_version_number = page_version_number;
+		page->pcs_size = segment_length; // Track changes between show/clear PCS.
 
 		subtitle_page_region **r = &page->page_regions;
 
 		// go to last entry
 		while (*r)
 			r = &(*r)->next;
+
+		if (processed_length == segment_length && !page->page_regions)
+			subtitle_redraw(page->page_id);
 
 		while (processed_length < segment_length)
 		{
@@ -378,6 +547,8 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 			processed_length += 2;
 		}
 
+		if (processed_length != segment_length)
+			eDebug("[eDVBSubtitleParser] %d != %d", processed_length, segment_length);
 		break;
 	}
 	case DVB_SUB_SEGMENT_REGION_COMPOSITION:
@@ -411,7 +582,7 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 		{
 			*pregion = region = new subtitle_region;
 			region->next = 0;
-			region->buffer=0;
+			region->objects = 0;
 			region->committed = false;
 		}
 		else if (region->version_number != version_number)
@@ -423,6 +594,12 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 				delete objects;
 				objects = n;
 			}
+			region->objects = 0; // EXACT_V2: do not retain a freed list head.
+			if (region->buffer)
+			{
+				region->buffer=0;
+			}
+			region->committed = false;
 		}
 		else
 			break;
@@ -437,6 +614,18 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 		region->height  = *segment++ << 8;
 		region->height |= *segment++;
 		processed_length += 2;
+		// Reject impossible dimensions before allocating and filling the surface.
+		if (region->width <= 0 || region->height <= 0 ||
+			region->width > 4096 || region->height > 2160 ||
+			(size_t)region->width * region->height > 4096u * 2160u)
+			return -1;
+
+		region->buffer = new gPixmap(eSize(region->width, region->height), 8, 1);
+		if (!region->buffer || !region->buffer->surface ||
+			!region->buffer->surface->data ||
+			region->buffer->surface->stride < region->width)
+			return -1;
+		memset(region->buffer->surface->data, 0, region->height * region->buffer->surface->stride);
 
 		int depth;
 		depth = (*segment++ >> 2) & 7;
@@ -460,23 +649,17 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 			region_fill_flag = 1;
 		}
 
-//	create and initialise buffer only when buffer does not yet exist.
-
-		if (region->buffer==0) {
-			region->buffer = new gPixmap(eSize(region->width, region->height), 8, 1);
-			memset(region->buffer->surface->data, 0, region->height * region->buffer->surface->stride);
-
-			if (region_fill_flag)
-			{
-				if (depth == 1)
-					memset(region->buffer->surface->data, region_2bit_pixel_code, region->height * region->width);
-				else if (depth == 2)
-					memset(region->buffer->surface->data, region_4bit_pixel_code, region->height * region->width);
-				else if (depth == 3)
-					memset(region->buffer->surface->data, region_8bit_pixel_code, region->height * region->width);
-				else
-					eDebug("[eDVBSubtitleParser] !!!! invalid depth");
-			}
+		if (region_fill_flag)
+		{
+			// EXACT_V2: the 8-bit surface has a byte stride, potentially > width.
+			int fill = depth == 1 ? region_2bit_pixel_code :
+				depth == 2 ? region_4bit_pixel_code :
+				depth == 3 ? region_8bit_pixel_code : 0;
+			if (depth < 1 || depth > 3)
+				eDebug("[eDVBSubtitleParser] !!!! invalid depth");
+			for (int row = 0; row < region->height; ++row)
+				memset((uint8_t*)region->buffer->surface->data +
+					row * region->buffer->surface->stride, fill, region->width);
 		}
 
 		region->objects = 0;
@@ -484,6 +667,12 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 
 		while (processed_length < segment_length)
 		{
+			if (segment_length - processed_length < 6)
+				return -1;
+			int object_type = segment[2] >> 6;
+			if ((object_type == 1 || object_type == 2) &&
+				segment_length - processed_length < 8)
+				return -1;
 			subtitle_region_object *object;
 
 			object = new subtitle_region_object;
@@ -558,6 +747,11 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 
 		while (processed_length < segment_length)
 		{
+			if (segment_length - processed_length < 2)
+				return -1;
+			int entry_bytes = (segment[1] & 1) ? 6 : 4;
+			if (segment_length - processed_length < entry_bytes)
+				return -1;
 			int CLUT_entry_id, entry_CLUT_flag, full_range;
 			int v_Y, v_Cr, v_Cb, v_T;
 
@@ -622,96 +816,61 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 	}
 	case DVB_SUB_SEGMENT_OBJECT_DATA:
 	{
-		int object_id;
-		int object_coding_method;
-
-		object_id  = *segment++ << 8;
-		object_id |= *segment++;
-		processed_length += 2;
-
-		object_coding_method  = (*segment >> 2) & 3;
-		segment++; // non_modifying_color_flag
-		processed_length++;
+		// This segment can reference the same object from multiple regions.
+		// Parse the field lengths once, then restart decoding at the same
+		// field data for each matching reference (never keep a shared cursor).
+		if (segment_length < 7)
+			return -1;
+		int object_id = (segment[0] << 8) | segment[1];
+		int coding_method = (segment[2] >> 2) & 3;
+		if (!page)
+			break;
+		if (coding_method != 0)
+		{
+			// Character-code objects (method 1) aren't bitmap objects.
+			// Preserve earlier behaviour: ignore rather than misdecode them.
+			break;
+		}
+		int top_len = (segment[3] << 8) | segment[4];
+		int bottom_len = (segment[5] << 8) | segment[6];
+		if (top_len + bottom_len > segment_length - 7)
+		{
+			eWarning("[DVB_SUB_SAFE] invalid object %04x fields top=%d bottom=%d segment=%d",
+				object_id, top_len, bottom_len, segment_length);
+			return -1;
+		}
+		uint8_t *top = segment + 7;
+		uint8_t *bottom = top + top_len;
 
 		subtitle_region *region = page->regions;
 		while (region)
 		{
-			subtitle_region_object *object = region->objects;
-			while (object)
+			for (subtitle_region_object *object = region->objects; object; object = object->next)
 			{
-				if (object->object_id == object_id)
+				if (object->object_id != object_id || !region->buffer)
+					continue;
+
+				map_2_to_4_bit_table[0] = 0;
+				map_2_to_4_bit_table[1] = 8;
+				map_2_to_4_bit_table[2] = 7;
+				map_2_to_4_bit_table[3] = 15;
+				map_2_to_8_bit_table[0] = 0;
+				map_2_to_8_bit_table[1] = 0x88;
+				map_2_to_8_bit_table[2] = 0x77;
+				map_2_to_8_bit_table[3] = 0xff;
+				for (int i = 0; i < 16; ++i)
+					map_4_to_8_bit_table[i] = i * 0x11;
+
+				bool top_ok = subtitle_process_field(region, object, top, top_len, 0);
+				bool bottom_ok = top_ok && subtitle_process_field(region, object,
+					bottom_len ? bottom : top,
+					bottom_len ? bottom_len : top_len, 1);
+				if (!top_ok || !bottom_ok)
 				{
-					if (object_coding_method == 0)
-					{
-						int top_field_data_blocklength, bottom_field_data_blocklength;
-						int i=1, line, linep;
-
-						top_field_data_blocklength  = *segment++ << 8;
-						top_field_data_blocklength |= *segment++;
-
-						bottom_field_data_blocklength  = *segment++ << 8;
-						bottom_field_data_blocklength |= *segment++;
-						processed_length += 4;
-
-						// its working on cyfra channels.. but hmm in EN300743 the default table is 0, 7, 8, 15
-						map_2_to_4_bit_table[0] = 0;
-						map_2_to_4_bit_table[1] = 8;
-						map_2_to_4_bit_table[2] = 7;
-						map_2_to_4_bit_table[3] = 15;
-
-						// this map is realy untested...
-						map_2_to_8_bit_table[0] = 0;
-						map_2_to_8_bit_table[1] = 0x88;
-						map_2_to_8_bit_table[2] = 0x77;
-						map_2_to_8_bit_table[3] = 0xff;
-
-						map_4_to_8_bit_table[0] = 0;
-						for (; i < 16; ++i)
-							map_4_to_8_bit_table[i] = i * 0x11;
-
-						i = 0;
-						line = 0;
-						linep = 0;
-						while (i < top_field_data_blocklength)
-						{
-							int len;
-							len = subtitle_process_pixel_data(region, object, &line, &linep, segment);
-							if (len < 0)
-								return -1;
-							segment += len;
-							processed_length += len;
-							i += len;
-						}
-
-						line = 1;
-						linep = 0;
-
-						if (bottom_field_data_blocklength)
-						{
-							i = 0;
-							while (i < bottom_field_data_blocklength)
-							{
-								int len;
-								len = subtitle_process_pixel_data(region, object, &line, &linep, segment);
-								if (len < 0)
-									return -1;
-								segment += len;
-									processed_length += len;
-								i += len;
-							}
-						}
-						else if (top_field_data_blocklength)
-							eDebug("[eDVBSubtitleParser] !!!! unimplemented: no bottom field! (%d : %d)", top_field_data_blocklength, bottom_field_data_blocklength);
-
-						if ((top_field_data_blocklength + bottom_field_data_blocklength) & 1)
-						{
-							segment++; processed_length++;
-						}
-					}
-					else if (object_coding_method == 1)
-						eDebug("[eDVBSubtitleParser] ---- object_coding_method 1 unsupported!");
+					eWarning("[DVB_SUB_SAFE] object %04x invalid pixel data, region=%d top=%d bottom=%d",
+						object_id, region->region_id, top_len, bottom_len);
+					return -1;
 				}
-				object = object->next;
 			}
 			region = region->next;
 		}
@@ -730,10 +889,10 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 			{
 				if (segment_length > 12)
 				{
-					int display_window_horizontal_position_min = (segment[4] << 8) | segment[5];
-					int display_window_horizontal_position_max = (segment[6] << 8) | segment[7];
-					int display_window_vertical_position_min = (segment[8] << 8) | segment[9];
-					int display_window_vertical_position_max = (segment[10] << 8) | segment[11];
+					int display_window_horizontal_position_min = (segment[5] << 8) | segment[6];
+					int display_window_horizontal_position_max = (segment[7] << 8) | segment[8];
+					int display_window_vertical_position_min = (segment[9] << 8) | segment[10];
+					int display_window_vertical_position_max = (segment[11] << 8) | segment[12];
 					eDebug("[eDVBSubtitleParser] NYI hpos min %d, hpos max %d, vpos min %d, vpos max %d",
 						display_window_horizontal_position_min,
 						display_window_horizontal_position_max,
@@ -753,11 +912,13 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 	{
 		subtitle_redraw_all();
 		m_seen_eod = true;
+		break;
 	}
 	case DVB_SUB_SEGMENT_STUFFING:
 		break;
 	default:
 		eDebug("[eDVBSubtitleParser] unhandled segment type %02x", segment_type);
+		break;
 	}
 
 	return segment_length + 6;
@@ -765,70 +926,52 @@ int eDVBSubtitleParser::subtitle_process_segment(uint8_t *segment, bool isBuffer
 
 void eDVBSubtitleParser::subtitle_process_pes(uint8_t *pkt, int len)
 {
-	if (!extract_pts(m_show_time, pkt))
-	{
-		pkt += 6; len -= 6;
-		// skip PES header
-		pkt++; len--;
-		pkt++; len--;
-
-		int hdr_len = *pkt++; len--;
-
-		pkt+=hdr_len; len-=hdr_len;
-
-		if (*pkt != 0x20)
-			return;
-
-		pkt++; len--; // data identifier
-		pkt++; len--; // stream id;
-
-		if (len <= 0)
-			return;
-
-		m_seen_eod = false;
-
-		while (len && *pkt == DVB_SUB_SYNC_BYTE)
-		{
-			int l = subtitle_process_segment(pkt);
-			if (l < 0)
-				break;
-			pkt += l;
-			len -= l;
-		}
-
-		if (len && *pkt != 0xFF)
-			eDebug("[eDVBSubtitleParser] strange data at the end");
-	}
-}
-
-void eDVBSubtitleParser::processBuffer(uint8_t *data, size_t len, pts_t pts)
-{
-	m_show_time = pts;
-
-	if (*data != 0x20) {
-		eWarning("[eDVBSubtitleParser] Tried to handle a PES packet private data that isn't a subtitle packet (does not start with 0x20)");
+	// EXACT_V2: Capture the actual live PES bytes when opted in.
+	dreamtwo_subprobe_pes(pkt, len);
+	// [AML_SUBTITLE_PORT_V1] length-checked PES segment walk with EOD fallback.
+	if (!pkt || len < 14 || pkt[0] != 0 || pkt[1] != 0 || pkt[2] != 1)
 		return;
-	}
-
-	data++; len--; // data identifier
-	data++; len--; // stream id;
-
-
+	int header_len = pkt[8];
+	int offset = 9 + header_len;
+	if (header_len < 5 || offset + 2 > len || pkt[offset] != 0x20)
+		return;
+	if (extract_pts(m_show_time, pkt))
+		return;
+	pkt += offset + 2;
+	len -= offset + 2;
 	m_seen_eod = false;
-	while (len && *data == DVB_SUB_SYNC_BYTE)
+	bool saw_segment = false;
+	while (len >= 6 && pkt[0] == DVB_SUB_SYNC_BYTE)
 	{
-		int l = subtitle_process_segment(data, true);
-		if (l < 0)
+		int specified_length = 6 + (pkt[4] << 8) + pkt[5];
+		if (specified_length > len)
+		{
+			eWarning("[AML_SUBTITLE_PORT_V1] truncated subtitle segment type=%02x need=%d have=%d",
+				pkt[1], specified_length, len);
 			break;
-		data += l;
-		len -= l;
+		}
+		saw_segment = true;
+		int consumed = subtitle_process_segment(pkt, len);
+		if (consumed < 0)
+		{
+			eWarning("[AML_SUBTITLE_PORT_V1] failed subtitle segment type=%02x; skipping %d bytes",
+				pkt[1], specified_length);
+			consumed = specified_length;
+		}
+		if (consumed != specified_length)
+		{
+			eWarning("[AML_SUBTITLE_PORT_V1] segment size discrepancy type=%02x expected=%d actual=%d",
+				pkt[1], specified_length, consumed);
+			consumed = specified_length;
+		}
+		pkt += consumed;
+		len -= consumed;
 	}
-
-	if (len && *data != DVB_SUB_SEGMENT_STUFFING)
-		eDebug("[eDVBSubtitleParser] strange data at the end");
-
+	if (len > 0 && pkt[0] != 0xFF)
+		eWarning("[AML_SUBTITLE_PORT_V1] unprocessed subtitle bytes=%d next=%02x", len, pkt[0]);
+	if (saw_segment && !m_seen_eod)
+		subtitle_redraw_all();
 }
-
 
 void eDVBSubtitleParser::subtitle_redraw_all()
 {
@@ -839,6 +982,37 @@ void eDVBSubtitleParser::subtitle_redraw_all()
 		subtitle_redraw(page->page_id);
 		page = page->next;
 	}
+}
+
+
+void eDVBSubtitleParser::processBuffer(uint8_t *data, size_t len, pts_t pts)
+{
+	m_show_time = pts;
+
+	if (!data || len < 2)
+		return;
+	if (*data != 0x20) {
+		eWarning("[eDVBSubtitleParser] Tried to handle a PES packet private data that isn't a subtitle packet (does not start with 0x20)");
+		return;
+	}
+
+	data++; len--; // data identifier
+	data++; len--; // stream id;
+
+
+	m_seen_eod = false;
+	while (len >= 6 && *data == DVB_SUB_SYNC_BYTE)
+	{
+		int l = subtitle_process_segment(data, len > 65541u ? 65541 : (int)len, true);
+		if (l < 0)
+			break;
+		data += l;
+		len -= l;
+	}
+
+	if (len && *data != DVB_SUB_SEGMENT_STUFFING)
+		eDebug("[eDVBSubtitleParser] strange data at the end");
+
 }
 
 void eDVBSubtitleParser::subtitle_reset()
@@ -914,8 +1088,13 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 		}
 		if (reg)
 		{
+			// EXACT_V2: a region must remain redisplayable in later display sets;
+			// reg->committed merely records a prior publication.
 			int x0 = region->region_horizontal_address;
 			int y0 = region->region_vertical_address;
+			if (eConfigManager::getConfigBoolValue("config.subtitles.dvb_subtitles_centered") &&
+				reg->width <= m_display_size.width())
+				x0 = (m_display_size.width() - reg->width) / 2;
 
 			if ((x0 < 0) || (y0 < 0))
 				continue;
@@ -929,12 +1108,24 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 				clut = clut->next;
 			}
 
-			int clut_size = reg->buffer->surface->clut.colors = reg->depth == subtitle_region::bpp2 ?
+			// EXACT_V2: Publish a separate software-backed pixmap so following
+			// object updates cannot change a page already queued for the OSD.
+			if (!reg->buffer || !reg->buffer->surface || !reg->buffer->surface->data ||
+				reg->width <= 0 || reg->height <= 0 ||
+				reg->buffer->surface->stride < reg->width)
+				continue;
+			ePtr<gPixmap> display_pixmap = new gPixmap(eSize(reg->width, reg->height), 8, 0);
+			if (!display_pixmap || !display_pixmap->surface || !display_pixmap->surface->data ||
+				display_pixmap->surface->stride < reg->width)
+				continue;
+			for (int row = 0; row < reg->height; ++row)
+				memcpy((uint8_t*)display_pixmap->surface->data + row * display_pixmap->surface->stride,
+					(const uint8_t*)reg->buffer->surface->data + row * reg->buffer->surface->stride,
+					(size_t)reg->width);
+			int clut_size = display_pixmap->surface->clut.colors = reg->depth == subtitle_region::bpp2 ?
 				4 : reg->depth == subtitle_region::bpp4 ? 16 : 256;
-
-			reg->buffer->surface->clut.data = new gRGB[clut_size];
-
-			gRGB *palette = reg->buffer->surface->clut.data;
+			display_pixmap->surface->clut.data = new gRGB[clut_size];
+			gRGB *palette = display_pixmap->surface->clut.data;
 
 			subtitle_clut_entry *entries=0;
 			switch(reg->depth)
@@ -1001,7 +1192,7 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 								}
 								break;
 							}
-							[[fallthrough]];
+			[[fallthrough]];
 						case 16: // b1 == 0 && b5 == 1
 							if (i & 128) // R = 33% x b8
 								palette[i].r = 0x55;
@@ -1022,7 +1213,7 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 							palette[i].r =
 							palette[i].g =
 							palette[i].b = 0x80; // 50%
-							[[fallthrough]];
+			[[fallthrough]];
 						case 17: // b1 == 1 && b5 == 1
 							if (i & 128) // R += 16.7% x b8
 								palette[i].r += 0x2A;
@@ -1042,73 +1233,66 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 					break;
 			}
 
-			int bcktrans = eConfigManager::getConfigIntValue("config.subtitles.dvb_subtitles_backtrans");
-			int color = eConfigManager::getConfigIntValue("config.subtitles.dvb_subtitles_color");
-
-			for (int i=0; i<clut_size; ++i)
+			int backgroundTransparency = eConfigManager::getConfigIntValue("config.subtitles.dvb_subtitles_backtrans");
+			int subtitleColor = eConfigManager::getConfigIntValue("config.subtitles.dvb_subtitles_color");
+			bool isYellow = subtitleColor == 1;
+			bool isGreen = subtitleColor == 2;
+			bool isCyan = subtitleColor == 4;
+			if (entries)
 			{
-				if (entries && entries[i].valid)
+				for (int i = 0; i < clut_size; ++i)
 				{
-					int y = entries[i].Y,
-						cr = entries[i].Cr,
-						cb = entries[i].Cb;
-					if (y > 0)
+					if (entries[i].valid)
 					{
-						y -= 16;
-						cr -= 128;
-						cb -= 128;
-						if (color == 1) // yellow
+						int y = entries[i].Y,
+							cr = entries[i].Cr,
+							cb = entries[i].Cb;
+						if (y > 0)
 						{
-							palette[i].r = MAX(MIN(((298 * y            + 460 * cr) / 256), 255), 0);
-							palette[i].g = MAX(MIN(((298 * y -  55 * cb - 137 * cr) / 256), 255), 0);
-							palette[i].b = 0;
-						}
-						else if (color == 2) // green
-						{
-							palette[i].r = 0;
-							palette[i].g = MAX(MIN(((298 * y) / 256), 255), 0);
-							palette[i].b = 0;
-						}
-						else if (color == 3) // magenta
-						{
-							palette[i].r = MAX(MIN(((298 * y + 460 * cr) / 256), 255), 0);
-							palette[i].g = 0;
-							palette[i].b = MAX(MIN(((298 * y + 543 * cb) / 256), 255), 0);
-						}
-						else if (color == 4) // cyan
-						{
-							palette[i].r = 0;
-							palette[i].g = MAX(MIN(((298 * y + 543 * cb) / 256), 255), 0);
-							palette[i].b = MAX(MIN(((298 * y + 543 * cb) / 256), 255), 0);
-						}
-						else // original
-						{
-							palette[i].r = MAX(MIN(((298 * y            + 460 * cr) / 256), 255), 0);
-							palette[i].g = MAX(MIN(((298 * y -  55 * cb - 137 * cr) / 256), 255), 0);
-							palette[i].b = MAX(MIN(((298 * y + 543 * cb) / 256), 255), 0);
-						}
-						if (bcktrans >= 0)
-						{
-							if (palette[i].r || palette[i].g || palette[i].b)
+							y -= 16;
+							cr -= 128;
+							cb -= 128;
+							palette[i].r = (isGreen || isCyan) ? 0 : std::max(std::min(((298 * y + 460 * cr) / 256), 255), 0);
+							palette[i].b = (isYellow || isGreen) ? 0 : std::max(std::min(((298 * y + 543 * cb) / 256), 255), 0);
+
+							if (isGreen)
+							{
+								palette[i].g = std::max(std::min(((298 * y) / 256), 255), 0);
+							}
+							else if (subtitleColor == 3) // magenta
+							{
+								palette[i].g = 0;
+							}
+							else if (isCyan)
+							{
+								palette[i].g = std::max(std::min(((298 * y + 543 * cb) / 256), 255), 0);
+							}
+							else // yellow , original
+							{
+								palette[i].g = std::max(std::min(((298 * y - 55 * cb - 137 * cr) / 256), 255), 0);
+							}
+
+							if (backgroundTransparency == -1 || palette[i].r || palette[i].g || palette[i].b)
 								palette[i].a = (entries[i].T) & 0xFF;
 							else
-								palette[i].a = bcktrans;
+								palette[i].a = backgroundTransparency;
 						}
 						else
-							palette[i].a = (entries[i].T) & 0xFF;
-					}
-					else
-					{
-						palette[i].r = 0;
-						palette[i].g = 0;
-						palette[i].b = 0;
-						palette[i].a = 0xFF;
+						{
+							palette[i].r = 0;
+							palette[i].g = 0;
+							palette[i].b = 0;
+							palette[i].a = 0xFF;
+						}
 					}
 				}
 			}
 
+			// EXACT_V2: probe what is actually passed to the OSD, not a stale buffer.
+			dreamtwo_subprobe_region(reg->region_id, reg->width, reg->height,
+				display_pixmap.operator->(), palette, clut_size);
 			eDVBSubtitleRegion Region;
-			Region.m_pixmap = reg->buffer;
+			Region.m_pixmap = display_pixmap;
 			Region.m_position.setX(x0);
 			Region.m_position.setY(y0);
 			Page.m_regions.push_back(Region);
@@ -1123,11 +1307,12 @@ void eDVBSubtitleParser::subtitle_redraw(int page_id)
 DEFINE_REF(eDVBSubtitleParser);
 
 eDVBSubtitleParser::eDVBSubtitleParser()
-	:m_pages(0), m_display_size(720,576)
-{ }
+	:m_pages(0), m_seen_eod(false), m_display_size(720,576)
+{
+}
 
 eDVBSubtitleParser::eDVBSubtitleParser(iDVBDemux *demux)
-	:m_pages(0), m_display_size(720,576)
+	:m_pages(0), m_seen_eod(false), m_display_size(720,576)
 {
 	setStreamID(0xBD);
 
@@ -1147,7 +1332,11 @@ int eDVBSubtitleParser::stop()
 	if (m_pes_reader)
 	{
 		eDebug("[eDVBSubtitleParser] disable dvb subtitles");
-		return m_pes_reader->stop();
+		RESULT result = m_pes_reader->stop();
+		subtitle_reset();
+		resetParser();
+		m_seen_eod = false;
+		return result;
 	}
 	return -1;
 }
@@ -1157,10 +1346,17 @@ int eDVBSubtitleParser::start(int pid, int composition_page_id, int ancillary_pa
 	if (m_pes_reader && pid >= 0 && pid < 0x1fff)
 	{
 		eDebug("[eDVBSubtitleParser] start on pid 0x%04x with composition_page_id %d and ancillary_page_id %d",
-			pid, composition_page_id, ancillary_page_id);
+		pid, composition_page_id, ancillary_page_id);
+		// EXACT_V2: stop previous PID before clearing stale pages/PES data.
+		m_pes_reader->stop();
+		subtitle_reset();
+		resetParser();
+		m_seen_eod = false;
+		m_display_size = eSize(720, 576);
+		eDebug("[AML_SUBTITLE_V2_EXACT] Fresh subtitle state pid=%04x", pid);
 		m_composition_page_id = composition_page_id;
 		m_ancillary_page_id = ancillary_page_id;
-		return m_pes_reader->start(pid);
+		return m_pes_reader->startSubtitle(pid);
 	}
 	return -1;
 }

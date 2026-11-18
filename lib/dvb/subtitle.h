@@ -94,9 +94,11 @@ struct subtitle_page
 struct bitstream
 {
 	uint8_t *data;
+	uint8_t *end;
 	int size;
 	int avail;
 	int consumed;
+	bool failed;
 };
 
 struct eDVBSubtitleRegion
@@ -140,8 +142,9 @@ public:
 	void connectNewPage(const sigc::slot<void(const eDVBSubtitlePage&)> &slot, ePtr<eConnection> &connection);
 private:
 	void subtitle_process_line(subtitle_region *region, subtitle_region_object *object, int line, uint8_t *data, int len);
-	int subtitle_process_pixel_data(subtitle_region *region, subtitle_region_object *object, int *linenr, int *linep, uint8_t *data);
-	int subtitle_process_segment(uint8_t *segment, bool isBufferProcess=false);
+	int subtitle_process_pixel_data(subtitle_region *region, subtitle_region_object *object, int *linenr, int *linep, uint8_t *data, int available);
+	bool subtitle_process_field(subtitle_region *region, subtitle_region_object *object, uint8_t *data, int length, int first_line);
+	int subtitle_process_segment(uint8_t *segment, int available, bool isBufferProcess=false);
 	void subtitle_process_pes(uint8_t *buffer, int len);
 	void subtitle_redraw_all();
 	void subtitle_reset();

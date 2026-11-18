@@ -42,6 +42,10 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <unistd.h>
 #include <chrono>
 #include <time.h>
 #include <thread>
@@ -68,6 +72,44 @@ using namespace std;
 #include <iomanip>
 
 bool m_is_streamx = false;
+
+/* Restored pre-clean live DVB subtitle clock. */
+static long long openbhSubtitlePtsDifference(pts_t future, pts_t current)
+{
+    const unsigned long long mask = (1ULL << 33) - 1;
+    long long delta = (long long)(((unsigned long long)future -
+                                   (unsigned long long)current) & mask);
+    if (delta >= (1LL << 32))
+        delta -= (1LL << 33);
+    return delta;
+}
+static bool openbhSubtitlePresentedVideoPTS(pts_t demux, pts_t &presented,
+                                            long long &behind90k)
+{
+    if (demux <= 0)
+        return false;
+    FILE *f = fopen("/sys/class/tsync/pts_video", "r");
+    if (!f)
+        return false;
+    char text[48] = {};
+    const bool ok = fgets(text, sizeof(text), f) != NULL;
+    fclose(f);
+    if (!ok)
+        return false;
+    char *end = NULL;
+    unsigned long long raw = strtoull(text, &end, 0);
+    if (end == text || !raw || raw > 0xffffffffULL)
+        return false;
+    const unsigned int distance32 = (unsigned int)demux - (unsigned int)raw;
+    const long long behind = (long long)(int)distance32;
+    if (behind < 0 || behind > 5LL * 90000)
+        return false;
+    behind90k = behind;
+    presented = (pts_t)(((unsigned long long)demux -
+                        (unsigned long long)behind) & ((1ULL << 33) - 1));
+    return true;
+}
+
 
 class eStaticServiceDVBInformation: public iStaticServiceInformation
 {
@@ -4271,6 +4313,35 @@ void eDVBServicePlay::checkSubtitleTiming()
 		m_decoder->getPTS(0, pos);
 	}
 
+
+	/* V12: use the displayed-video clock on live DVB only. */
+	const bool live_dvb_subtitles = !m_is_pvr &&
+		!m_timeshift_enabled && !m_timeshift_active &&
+		!m_dvb_subtitle_pages.empty() && pos > 0;
+	pts_t dvb_video_pos = pos;
+	bool use_live_clock = false;
+	long long clock_lag90k = 0;
+	if (live_dvb_subtitles)
+	{
+		pts_t presented = 0;
+		if (openbhSubtitlePresentedVideoPTS(pos, presented, clock_lag90k))
+		{
+			dvb_video_pos = presented;
+			use_live_clock = true;
+		}
+		else if (!eConfigManager::getConfigIntValue(
+			"config.subtitles.subtitle_bad_timing_delay", 0))
+		{
+			/* Empirical fallback for this receiver: delay live DVB 1500 ms. */
+			dvb_video_pos = (pts_t)(((unsigned long long)pos - 135000ULL) &
+				((1ULL << 33) - 1));
+			use_live_clock = true;
+		}
+		if (access("/tmp/e2subtitle_clock_debug", F_OK) == 0)
+			eDebug("[E2_SUB_SYNC_V12] demux=%lld clock=%lld delta_ms=%lld",
+				(long long)pos, (long long)dvb_video_pos, clock_lag90k / 90);
+	}
+
 	while (1)
 	{
 		enum { TELETEXT, DVB } type;
@@ -4294,7 +4365,17 @@ void eDVBServicePlay::checkSubtitleTiming()
 
 		// If subtitle is overdue or within 20ms the video timing then display it.
 		// If not, pause subtitle processing until the subtitle should be shown
-		int diff = show_time - pos;
+		/* V12: compare live DVB subtitle PTS to displayed-video PTS. */
+		const bool corrected = type == DVB && use_live_clock;
+		const pts_t clock = corrected ? dvb_video_pos : pos;
+		long long delta = corrected ?
+			openbhSubtitlePtsDifference(show_time, clock) :
+			(long long)(show_time - clock);
+		if (delta < -10LL * 90000)
+			delta = -10LL * 90000;
+		if (delta > 60LL * 90000)
+			delta = 60LL * 90000;
+		int diff = (int)delta;
 		if (diff < 20*90)
 		{
 			//eDebug("[eDVBServicePlay] Showing subtitle with pts:%lld Video pts:%lld diff:%.03fs. Page stack size %d", show_time, pos, diff / 90000.0f, m_dvb_subtitle_pages.size());
@@ -4312,7 +4393,13 @@ void eDVBServicePlay::checkSubtitleTiming()
 		else
 		{
 			//eDebug("[eDVBServicePlay] Delay early subtitle by %.03fs. Page stack size %d", diff / 90000.0f, m_dvb_subtitle_pages.size());
-			m_subtitle_sync_timer->start(diff / 90, 1);
+			/* Recheck live DVB video PTS regularly during buffer delays. */
+			int wait_ms = diff / 90;
+			if (corrected && wait_ms > 100)
+				wait_ms = 100;
+			if (wait_ms < 1)
+				wait_ms = 1;
+			m_subtitle_sync_timer->start(wait_ms, 1);
 			break;
 		}
 	}
