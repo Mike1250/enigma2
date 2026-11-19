@@ -3197,8 +3197,12 @@ RESULT eServiceMP3::pause()
 		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
 	if (openbh_local_movie && m_currentTrickRatio == 1.0)
 	{
-		eDebug("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] local movie pause: GST_STATE_PAUSED");
+		const gint64 pause_begin_us = g_get_monotonic_time();
+		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] local movie PAUSE requested");
 		GstStateChangeReturn result = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
+		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] pause set_state result=%s elapsed_ms=%lld",
+			gst_element_state_change_return_get_name(result),
+			(long long)((g_get_monotonic_time() - pause_begin_us) / 1000));
 		if (result == GST_STATE_CHANGE_FAILURE)
 		{
 			eWarning("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] failed to pause local movie");
@@ -3233,17 +3237,54 @@ RESULT eServiceMP3::unpause()
 		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
 	if (openbh_local_movie && m_currentTrickRatio == 1.0)
 	{
-		eDebug("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] local movie unpause: GST_STATE_PLAYING");
-		GstStateChangeReturn result = gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+		/* [OPENBH_LOCAL_MOVIE_RESUME_V2] Restore decoding with the same
+		 * FLUSH + KEY_UNIT seek mechanism used by right-arrow seeking.
+		 * A state-only PAUSED -> PLAYING transition is not sufficient on
+		 * some Amlogic native video sinks after a buffered pause.
+		 * The seek targets the CURRENT paused position, not a skip ahead. */
+		pts_t resume_pts = 0;
+		const bool have_resume_pts = getRawPlayPosition(resume_pts) >= 0;
+		const gint64 begin_us = g_get_monotonic_time();
+		GstState before = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
+		const GstStateChangeReturn prior =
+			gst_element_get_state(m_gst_playbin, &before, &pending, 0);
+		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] resume requested: state=%s pending=%s status=%s pts=%lld valid=%d",
+			gst_element_state_get_name(before), gst_element_state_get_name(pending),
+			gst_element_state_change_return_get_name(prior),
+			(long long)resume_pts, (int)have_resume_pts);
+
+		/* Match the existing trickSeek recovery sequence: PLAYING first,
+		 * then a flushing key-unit seek. Never wait for a blocking state
+		 * transition from the Enigma2 UI/event thread. */
+		const GstStateChangeReturn result =
+			gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
 		if (result == GST_STATE_CHANGE_FAILURE)
 		{
-			eWarning("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] failed to unpause local movie");
+			eWarning("[OPENBH_LOCAL_MOVIE_RESUME_V2] GST_STATE_PLAYING failed");
 			return -1;
 		}
+
+		bool flushed = false;
+		if (have_resume_pts)
+		{
+			const gint64 resume_ns = (gint64)resume_pts * 11111LL;
+			flushed = gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME,
+				(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+				GST_SEEK_TYPE_SET, resume_ns,
+				GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+			if (flushed && getHDAudioAuxState(m_gst_playbin))
+				seekHDAudioAuxPersistent(m_gst_playbin, resume_ns);
+		}
+		if (!flushed)
+			eWarning("[OPENBH_LOCAL_MOVIE_RESUME_V2] resume flush not applied (position/seek unavailable)");
+
 		setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
 		m_prev_decoder_time = -1;
 		m_decoder_time_valid_state = 0;
-		return 0;
+		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] resume result=%s flush=%d elapsed_ms=%lld",
+			gst_element_state_change_return_get_name(result), (int)flushed,
+			(long long)((g_get_monotonic_time() - begin_us) / 1000));
+		return flushed ? 0 : -1;
 	}
 
 
