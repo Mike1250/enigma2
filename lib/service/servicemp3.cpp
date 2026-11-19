@@ -3186,6 +3186,31 @@ RESULT eServiceMP3::pause()
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
+	/* [OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] Ordinary local video only: pause/resume is
+	 * a GStreamer state transition, NOT a flushing seek. The old
+	 * trickSeek() resume fallback can restart preroll on a keyframe
+	 * and leave the Amlogic decoder stuck after a normal pause.
+	 * Keep legacy behavior for network streams, audio-only, and
+	 * fast/slow/reverse playback. */
+	const bool openbh_local_movie = !m_sourceinfo.is_audio &&
+		!m_ref.path.empty() &&
+		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
+	if (openbh_local_movie && m_currentTrickRatio == 1.0)
+	{
+		eDebug("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] local movie pause: GST_STATE_PAUSED");
+		GstStateChangeReturn result = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
+		if (result == GST_STATE_CHANGE_FAILURE)
+		{
+			eWarning("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] failed to pause local movie");
+			return -1;
+		}
+		setHDAudioAuxState(m_gst_playbin, GST_STATE_PAUSED);
+		m_prev_decoder_time = -1;
+		m_decoder_time_valid_state = 0;
+		return 0;
+	}
+
+
 	eDebug("[eServiceMP3] pause");
 	trickSeek(0.0);
 
@@ -3196,6 +3221,31 @@ RESULT eServiceMP3::unpause()
 {
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
+
+	/* [OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] Ordinary local video only: pause/resume is
+	 * a GStreamer state transition, NOT a flushing seek. The old
+	 * trickSeek() resume fallback can restart preroll on a keyframe
+	 * and leave the Amlogic decoder stuck after a normal pause.
+	 * Keep legacy behavior for network streams, audio-only, and
+	 * fast/slow/reverse playback. */
+	const bool openbh_local_movie = !m_sourceinfo.is_audio &&
+		!m_ref.path.empty() &&
+		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
+	if (openbh_local_movie && m_currentTrickRatio == 1.0)
+	{
+		eDebug("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] local movie unpause: GST_STATE_PLAYING");
+		GstStateChangeReturn result = gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+		if (result == GST_STATE_CHANGE_FAILURE)
+		{
+			eWarning("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] failed to unpause local movie");
+			return -1;
+		}
+		setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
+		m_prev_decoder_time = -1;
+		m_decoder_time_valid_state = 0;
+		return 0;
+	}
+
 
 	/* no need to unpase if we are not paused already */
 	if (m_currentTrickRatio == 1.0 && !m_paused)
