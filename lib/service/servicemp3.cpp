@@ -3202,9 +3202,15 @@ RESULT eServiceMP3::pause()
 		 * Capture the actual playback position BEFORE pausing. A flushing
 		 * seek while paused may clear queues, but may also move to a keyframe;
 		 * keep it OFF by default and enable only when comparing. */
+		/* OPENBH_LOCAL_FAST_PAUSE_V4: use the pipeline timeline in ns.
+		 * getRawPlayPosition() may prefer audio decoder time, which can be in
+		 * a different/stale PTS domain; FLUSH|KEY_UNIT can snap back a GOP. */
+		m_openbh_fast_pause_target_ns = -1;
 		const bool fast_pause_test = g_file_test("/tmp/openbh_fast_pause_flush", G_FILE_TEST_EXISTS);
-		pts_t fast_pause_pts = 0;
-		const bool fast_pause_have_pts = fast_pause_test && (getRawPlayPosition(fast_pause_pts) >= 0);
+		gint64 fast_pause_ns = -1;
+		const bool fast_pause_have_pts = fast_pause_test &&
+			gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &fast_pause_ns) &&
+			fast_pause_ns >= 0;
 		const gint64 pause_begin_us = g_get_monotonic_time();
 		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] local movie PAUSE requested");
 		GstStateChangeReturn result = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
@@ -3221,15 +3227,16 @@ RESULT eServiceMP3::pause()
 			bool fast_pause_flushed = false;
 			if (fast_pause_have_pts)
 			{
-				const gint64 fast_pause_ns = (gint64)fast_pause_pts * 11111LL;
 				fast_pause_flushed = gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME,
-					(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+					(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
 					GST_SEEK_TYPE_SET, fast_pause_ns,
 					GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+				if (fast_pause_flushed)
+					m_openbh_fast_pause_target_ns = fast_pause_ns;
 			}
-			eDebug("[OPENBH_LOCAL_FAST_PAUSE_V3] flush=%d valid_pts=%d pts=%lld elapsed_ms=%lld",
+			eDebug("[OPENBH_LOCAL_FAST_PAUSE_V4] pause flush=%d valid_pos=%d target_ms=%lld elapsed_ms=%lld",
 				(int)fast_pause_flushed, (int)fast_pause_have_pts,
-				(long long)fast_pause_pts,
+				(long long)(fast_pause_have_pts ? fast_pause_ns / GST_MSECOND : -1),
 				(long long)((g_get_monotonic_time() - pause_begin_us) / 1000));
 		}
 		setHDAudioAuxState(m_gst_playbin, GST_STATE_PAUSED);
@@ -3266,8 +3273,15 @@ RESULT eServiceMP3::unpause()
 		 * A state-only PAUSED -> PLAYING transition is not sufficient on
 		 * some Amlogic native video sinks after a buffered pause.
 		 * The seek targets the CURRENT paused position, not a skip ahead. */
+		/* OPENBH_LOCAL_FAST_PAUSE_V4: do not re-query a keyframe-snapped
+		 * position after an accurate fast-pause flush. Remember the requested
+		 * pause position until playback resumes or the user seeks elsewhere. */
+		const bool accurate_resume = m_openbh_fast_pause_target_ns >= 0;
+		const gint64 accurate_ns = m_openbh_fast_pause_target_ns;
 		pts_t resume_pts = 0;
-		const bool have_resume_pts = getRawPlayPosition(resume_pts) >= 0;
+		const bool have_resume_pts = accurate_resume || (getRawPlayPosition(resume_pts) >= 0);
+		if (accurate_resume)
+			resume_pts = (pts_t)(accurate_ns / 11111LL);
 		const gint64 begin_us = g_get_monotonic_time();
 		GstState before = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
 		const GstStateChangeReturn prior =
@@ -3291,9 +3305,11 @@ RESULT eServiceMP3::unpause()
 		bool flushed = false;
 		if (have_resume_pts)
 		{
-			const gint64 resume_ns = (gint64)resume_pts * 11111LL;
+			const gint64 resume_ns = accurate_resume ? accurate_ns : (gint64)resume_pts * 11111LL;
+			const GstSeekFlags seek_flags = (GstSeekFlags)(GST_SEEK_FLAG_FLUSH |
+				(accurate_resume ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT));
 			flushed = gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME,
-				(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+				seek_flags,
 				GST_SEEK_TYPE_SET, resume_ns,
 				GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
 			if (flushed && getHDAudioAuxState(m_gst_playbin))
@@ -3303,6 +3319,10 @@ RESULT eServiceMP3::unpause()
 			eWarning("[OPENBH_LOCAL_MOVIE_RESUME_V2] resume flush not applied (position/seek unavailable)");
 
 		setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
+		eDebug("[OPENBH_LOCAL_FAST_PAUSE_V4] resume accurate=%d flush=%d target_ms=%lld",
+			(int)accurate_resume, (int)flushed,
+			(long long)(accurate_resume ? accurate_ns / GST_MSECOND : -1));
+		m_openbh_fast_pause_target_ns = -1;
 		m_prev_decoder_time = -1;
 		m_decoder_time_valid_state = 0;
 		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] resume result=%s flush=%d elapsed_ms=%lld",
@@ -3349,7 +3369,9 @@ RESULT eServiceMP3::getLength(pts_t &pts)
 
 RESULT eServiceMP3::seekToImpl(pts_t to, bool accurate)
 {
-		/* convert pts to nanoseconds */
+		/* Explicit seek supersedes the previous saved fast-pause point. */
+	m_openbh_fast_pause_target_ns = -1;
+	/* convert pts to nanoseconds */
 	m_last_seek_pos = to * 11111LL;
 	if (!gst_element_seek (m_gst_playbin, m_currentTrickRatio, GST_FORMAT_TIME,
 		(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | (accurate ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT)),
@@ -3416,6 +3438,8 @@ RESULT eServiceMP3::trickSeek(gdouble ratio)
 {
 	if (!m_gst_playbin)
 		return -1;
+	/* Trick play supersedes the previous saved fast-pause point. */
+	m_openbh_fast_pause_target_ns = -1;
 	GstState state, pending;
 	if (ratio > -0.01 && ratio < 0.01)
 	{

@@ -366,6 +366,9 @@ private:
 	bool m_use_chapter_entries;
 	/* last used seek position gst-1 only */
 	gint64 m_last_seek_pos;
+	/* OPENBH_LOCAL_FAST_PAUSE_V4: absolute GStreamer position preserved
+	 * across the opt-in accurate PAUSE/RESUME. -1 means inactive. */
+	gint64 m_openbh_fast_pause_target_ns = -1;
 
 	/* An "&e2startoffset=<pts>" URL parameter (see the constructor) - the
 	 * position to resume from once the pipeline is actually able to seek.
