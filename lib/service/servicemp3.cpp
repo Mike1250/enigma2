@@ -3206,7 +3206,8 @@ RESULT eServiceMP3::pause()
 		 * getRawPlayPosition() may prefer audio decoder time, which can be in
 		 * a different/stale PTS domain; FLUSH|KEY_UNIT can snap back a GOP. */
 		m_openbh_fast_pause_target_ns = -1;
-		const bool fast_pause_test = g_file_test("/tmp/openbh_fast_pause_flush", G_FILE_TEST_EXISTS);
+		/* OPENBH_LOCAL_PLAYBACK_V5: automatic for local video; opt out only on trouble. */
+		const bool fast_pause_test = !g_file_test("/tmp/openbh_disable_fast_pause", G_FILE_TEST_EXISTS);
 		gint64 fast_pause_ns = -1;
 		const bool fast_pause_have_pts = fast_pause_test &&
 			gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &fast_pause_ns) &&
@@ -3382,6 +3383,20 @@ RESULT eServiceMP3::seekToImpl(pts_t to, bool accurate)
 		return -1;
 	}
 
+	/* OPENBH_LOCAL_PLAYBACK_V5: show the target immediately while the
+	 * local-file seek completes asynchronously. The initial hardware sink
+	 * decoder-time baseline must NOT be recomputed at the resume point. */
+	const bool local_video_seek = !m_sourceinfo.is_audio && !m_ref.path.empty() &&
+		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
+	if (local_video_seek && m_currentTrickRatio == 1.0)
+	{
+		m_openbh_ui_seek_target_ns = m_last_seek_pos;
+		m_openbh_ui_seek_deadline_us = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+		m_position_correction_enabled = false;
+		m_position_baseline_provisional = -1;
+		eDebug("[OPENBH_LOCAL_PLAYBACK_V5] seek display target_ms=%lld",
+			(long long)(m_last_seek_pos / GST_MSECOND));
+	}
 	/* A seek just happened: from here on the sink/pipeline itself reports
 	 * position correctly (this is what makes a manual seek "fix" the
 	 * display today), so getPlayPosition()'s one-time startup correction is
@@ -3711,6 +3726,41 @@ RESULT eServiceMP3::getRawPlayPosition(pts_t &pts)
  * applied only here, at the point the position is actually reported. */
 RESULT eServiceMP3::getPlayPosition(pts_t &pts)
 {
+	/* OPENBH_LOCAL_PLAYBACK_V5: local MP4/MKV use playbin time, which
+	 * is the seek timeline. The sink's raw decoder time may be stale or
+	 * nonzero-based during startup and after an early resume seek. */
+	const bool local_video = !m_sourceinfo.is_audio && !m_ref.path.empty() &&
+		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
+	if (local_video && m_gst_playbin && m_state == stRunning)
+	{
+		gint64 pos_ns = -1;
+		const bool queried = gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &pos_ns) && pos_ns >= 0;
+		if (m_openbh_ui_seek_target_ns >= 0)
+		{
+			const gint64 target = m_openbh_ui_seek_target_ns;
+			const gint64 distance = queried ? (pos_ns >= target ? pos_ns - target : target - pos_ns) : G_MAXINT64;
+			if (queried && distance <= 2 * GST_SECOND)
+			{
+				m_openbh_ui_seek_target_ns = -1;
+				m_openbh_ui_seek_deadline_us = 0;
+			}
+			else if (g_get_monotonic_time() < m_openbh_ui_seek_deadline_us)
+			{
+				pts = (pts_t)(target / 11111LL);
+				return 0;
+			}
+			else
+			{
+				m_openbh_ui_seek_target_ns = -1;
+				m_openbh_ui_seek_deadline_us = 0;
+			}
+		}
+		if (queried)
+		{
+			pts = (pts_t)(pos_ns / 11111LL);
+			return 0;
+		}
+	}
 	pts_t raw;
 	RESULT res = getRawPlayPosition(raw);
 	if (res < 0)

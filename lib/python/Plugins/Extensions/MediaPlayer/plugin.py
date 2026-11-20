@@ -1,5 +1,5 @@
 from os import listdir, path as ospath, remove as osremove
-from time import strftime
+from time import strftime, monotonic
 import random
 
 from enigma import iPlayableService, eTimer, eServiceCenter, iServiceInformation, ePicLoad
@@ -551,6 +551,24 @@ class MediaPlayer(Screen, InfoBarBase, InfoBarScreenSaver, InfoBarSeek, InfoBarA
 				self.summaries.setText(" ", 4)
 
 	def ok(self):
+		# OPENBH_LOCAL_PLAYBACK_V5: when watching a local video, OK toggles
+		# only the movie infobar; do not re-open it from a duplicate action.
+		if (not self.shown and self.ext not in AUDIO_EXTENSIONS
+				and not self.isAudioCD and not self.playlist.isStopped()):
+			now = monotonic()
+			if now - getattr(self, "_openbh_last_video_ok", -100.0) < 0.35:
+				print("[OPENBH_LOCAL_PLAYBACK_V5] duplicate movie OK ignored")
+				return
+			self._openbh_last_video_ok = now
+			self.hideMediaPlayerInfoBar.stop()
+			if self.mediaPlayerInfoBar.shown:
+				self.mediaPlayerInfoBar.hide()
+				print("[OPENBH_LOCAL_PLAYBACK_V5] movie infobar HIDE")
+			else:
+				self.mediaPlayerInfoBar.show()
+				self.hideMediaPlayerInfoBar.start(5000, True)
+				print("[OPENBH_LOCAL_PLAYBACK_V5] movie infobar SHOW")
+			return
 		if self.currList == "filelist":
 			if self["filelist"].canDescent():
 				self["filelist"].descent()

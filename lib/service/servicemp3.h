@@ -369,6 +369,10 @@ private:
 	/* OPENBH_LOCAL_FAST_PAUSE_V4: absolute GStreamer position preserved
 	 * across the opt-in accurate PAUSE/RESUME. -1 means inactive. */
 	gint64 m_openbh_fast_pause_target_ns = -1;
+	/* OPENBH_LOCAL_PLAYBACK_V5: UI can show the requested time while
+	 * an asynchronous local-file seek is still catching up. */
+	gint64 m_openbh_ui_seek_target_ns = -1;
+	gint64 m_openbh_ui_seek_deadline_us = 0;
 
 	/* An "&e2startoffset=<pts>" URL parameter (see the constructor) - the
 	 * position to resume from once the pipeline is actually able to seek.
