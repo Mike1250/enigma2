@@ -3243,20 +3243,19 @@ RESULT eServiceMP3::setFastForward(int ratio)
 RESULT eServiceMP3::pause()
 {
 
+    /* OPENBH_OPENATV_LOCAL_MOVIE_V9: no blocking position-query/FLUSH seek on remote-key path.
+     * The V8 seek within pause could deadlock or stall GStreamer on DreamTwo.
+     * Keep PAUSED state change, and log its return value. */
     if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-        if (!m_gst_playbin || m_state != stRunning) return -1;
-        gint64 ns = -1;
-        const bool have_pos = gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &ns) && ns >= 0;
-        const GstStateChangeReturn ret = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
-        if (ret == GST_STATE_CHANGE_FAILURE) return -1;
-        if (have_pos) {
-            gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME,
-                (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
-                GST_SEEK_TYPE_SET, ns, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
-            m_last_seek_pos = ns;
-        }
+        if (!m_gst_playbin || m_state != stRunning)
+            return -1;
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] PAUSE enter");
+        const GstStateChangeReturn rc = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] PAUSE set_state result=%d", (int)rc);
+        if (rc == GST_STATE_CHANGE_FAILURE)
+            return -1;
         m_paused = true;
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] local PAUSE pos_ns=%lld", (long long)ns);
+        m_currentTrickRatio = 1.0;
         return 0;
     }
 
@@ -7261,7 +7260,10 @@ void eServiceMP3::pullSubtitle(GstBuffer *buffer)
                 m_dvb_subtitle_parser->processBuffer(map.data, map.size, start / GST_MSECOND);
             } else if (kind < stVOB) {
                 const uint32_t start_ms = (uint32_t)(start / GST_MSECOND);
-                const uint32_t duration_ms = GST_CLOCK_TIME_IS_VALID(dur) ?
+                /* Some MKV text buffers report a valid *zero* duration.
+                 * A zero-length page is discarded by the renderer. */
+                const uint32_t duration_ms =
+                    (GST_CLOCK_TIME_IS_VALID(dur) && dur >= GST_MSECOND) ?
                     (uint32_t)(dur / GST_MSECOND) : 2500U;
                 std::string line((const char*)map.data, map.size);
                 if (!line.empty() && line[line.length()-1] == '\n')
@@ -7269,6 +7271,9 @@ void eServiceMP3::pullSubtitle(GstBuffer *buffer)
                 const uint32_t end_ms = start_ms + duration_ms;
                 m_subtitle_pages.insert(subtitle_pages_map_pair_t(end_ms,
                     subtitle_page_t(start_ms, end_ms, line)));
+                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] text queued start=%u duration=%u end=%u pages=%zu widget=%d",
+                    start_ms, duration_ms, end_ms, (size_t)m_subtitle_pages.size(),
+                    m_subtitle_widget ? 1 : 0);
                 m_subtitle_sync_timer->start(20, true);
             }
             static unsigned v8_sub_debug = 0;
@@ -7386,6 +7391,66 @@ void eServiceMP3::pushDVBSubtitles()
 
 void eServiceMP3::pushSubtitles()
 {
+    /* OPENBH_OPENATV_LOCAL_MOVIE_V9: subtitles for local files use GstBuffer PTS / GStreamer time.
+     * Avoid OpenBH's native decoder clock stability gate for this case.
+     * Each page is consumed once (no repeated setPage calls). */
+    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
+        if (m_currentSubtitleStream < 0 ||
+            m_currentSubtitleStream >= (int)m_subtitleStreams.size())
+            return;
+        pts_t now_pts = 0;
+        if (!openatv_v8_position(m_gst_playbin, now_pts)) {
+            static unsigned v9_clock_fail_count = 0;
+            if (v9_clock_fail_count++ < 8)
+                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] subtitle clock unavailable, queue=%zu",
+                    (size_t)m_subtitle_pages.size());
+            m_subtitle_sync_timer->start(100, true);
+            return;
+        }
+        const int64_t now_ms = now_pts / 90;
+        int32_t retry_ms = 1000;
+        for (subtitle_pages_map_t::iterator it = m_subtitle_pages.begin();
+             it != m_subtitle_pages.end();) {
+            const int64_t start_ms = it->second.start_ms;
+            const int64_t end_ms = it->second.end_ms;
+            if (end_ms <= now_ms || end_ms <= start_ms) {
+                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] subtitle expired now=%lld start=%lld end=%lld",
+                    (long long)now_ms, (long long)start_ms, (long long)end_ms);
+                m_subtitle_pages.erase(it++);
+                continue;
+            }
+            if (now_ms + 20 < start_ms) {
+                int64_t delta = start_ms - now_ms;
+                if (delta < retry_ms) retry_ms = (int32_t)delta;
+                break;
+            }
+            if (m_paused) {
+                retry_ms = 100;
+                break;
+            }
+            if (m_subtitle_widget) {
+                ePangoSubtitlePage page;
+                gRGB color(0xD0, 0xD0, 0xD0);
+                page.m_elements.push_back(ePangoSubtitlePageElement(
+                    color, it->second.text.c_str()));
+                page.m_show_pts = start_ms * 90;
+                page.m_timeout = (int)(end_ms - now_ms);
+                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] RENDER subtitle now=%lld start=%lld end=%lld timeout=%d",
+                    (long long)now_ms, (long long)start_ms, (long long)end_ms,
+                    page.m_timeout);
+                m_subtitle_widget->setPage(page);
+            } else {
+                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] subtitle renderer missing now=%lld start=%lld",
+                    (long long)now_ms, (long long)start_ms);
+            }
+            m_subtitle_pages.erase(it++);
+        }
+        if (retry_ms < 20) retry_ms = 20;
+        if (retry_ms > 1000) retry_ms = 1000;
+        m_subtitle_sync_timer->start(retry_ms, true);
+        return;
+    }
+
 	pts_t running_pts = 0;
 	int32_t next_timer = 0, decoder_ms, start_ms, end_ms, diff_start_ms, diff_end_ms;
 	subtitle_pages_map_t::iterator current;
