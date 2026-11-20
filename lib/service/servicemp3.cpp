@@ -29,6 +29,9 @@
 #include <string>
 #include <cstdint>
 #include <cstdlib>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -2917,6 +2920,7 @@ struct StopWorkerArgs
 	GstElement *playbin;
 	StopWatchdog *watchdog;
 	bool hadVideo;
+	bool wasLocalMovie;
 };
 
 /* gst_element_set_state(..., GST_STATE_NULL) is the call that can still block
@@ -2935,12 +2939,23 @@ gpointer stopWorker(gpointer data)
 	GstElement *playbin = args->playbin;
 	StopWatchdog *watchdog = args->watchdog;
 	bool hadVideo = args->hadVideo;
+	const bool wasLocalMovie = args->wasLocalMovie;
 	delete args;
 
 	GstStateChangeReturn ret = gst_element_set_state(playbin, GST_STATE_NULL);
 	if (ret != GST_STATE_CHANGE_SUCCESS)
 		eDebug("[eServiceMP3] stop GST_STATE_NULL failure");
 	gst_object_unref(playbin);
+#ifdef __GLIBC__
+    /* OPENBH_LOCAL_PLAYBACK_V6D: return free malloc arenas, not page cache. */
+    if (wasLocalMovie)
+    {
+        const int trimmed = malloc_trim(0);
+        eDebug("[OPENBH_LOCAL_PLAYBACK_V6D] local stop malloc_trim=%d", trimmed);
+    }
+#else
+    (void)wasLocalMovie;
+#endif
 
 	int remaining = g_atomic_int_add(&s_mp3_stop_workers, -1) - 1;
 	eDebug("[eServiceMP3] stop worker released hardware; %d teardown(s) remain", remaining);
@@ -3122,7 +3137,9 @@ RESULT eServiceMP3::stop()
 	gst_object_ref(m_gst_playbin);
 	g_atomic_int_inc(&s_mp3_stop_workers);
 	StopWatchdog *watchdog = new StopWatchdog{0, 2};
-	GThread *worker = g_thread_new("mp3stop", stopWorker, new StopWorkerArgs{m_gst_playbin, watchdog, videoSink != NULL && m_pip_decoder < 0 /* a PiP must never blank the primary decoder */});
+	GThread *worker = g_thread_new("mp3stop", stopWorker, new StopWorkerArgs{m_gst_playbin, watchdog, videoSink != NULL && m_pip_decoder < 0 /* a PiP must never blank the primary decoder */,
+        !m_sourceinfo.is_audio && !m_ref.path.empty() &&
+        (m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0)});
 	g_thread_unref(worker);
 	GThread *watchdogThread = g_thread_new("mp3stopwd", stopWatchdog, watchdog);
 	g_thread_unref(watchdogThread);
@@ -3374,8 +3391,16 @@ RESULT eServiceMP3::seekToImpl(pts_t to, bool accurate)
 	m_openbh_fast_pause_target_ns = -1;
 	/* convert pts to nanoseconds */
 	m_last_seek_pos = to * 11111LL;
+	/* OPENBH_LOCAL_PLAYBACK_V6D: seek saved positions precisely on local
+	 * videos. Streaming and trick-play retain their existing key-unit policy. */
+	const bool local_exact_seek = !m_sourceinfo.is_audio && !m_is_live &&
+		!m_ref.path.empty() &&
+		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0) &&
+		m_currentTrickRatio == 1.0;
+	const GstSeekFlags openbh_v6_seek_flags = (GstSeekFlags)(GST_SEEK_FLAG_FLUSH |
+		((accurate || local_exact_seek) ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT));
 	if (!gst_element_seek (m_gst_playbin, m_currentTrickRatio, GST_FORMAT_TIME,
-		(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | (accurate ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT)),
+		openbh_v6_seek_flags,
 		GST_SEEK_TYPE_SET, m_last_seek_pos,
 		GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE))
 	{
@@ -5685,6 +5710,27 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 					 * evResumed and whatever evStart/evGstreamerStart this
 					 * session held back for it - see fireDeferredStartEvents(). */
 					tryApplyPendingStartOffset();
+					/* OPENBH_LOCAL_PLAYBACK_V6D: initial local playback position diagnostic.
+					 * Never reset a saved seek position. */
+					if (!m_initial_start && !m_is_live && !m_sourceinfo.is_audio &&
+					    !m_ref.path.empty() &&
+					    (m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0))
+					{
+					    gint64 startup_position_ns = -1;
+					    const bool position_ok = gst_element_query_position(m_gst_playbin,
+					        GST_FORMAT_TIME, &startup_position_ns) && startup_position_ns >= 0;
+					    eDebug("[OPENBH_LOCAL_PLAYBACK_V6D] startup first_playing_ms=%lld saved_seek_ms=%lld",
+					        (long long)(position_ok ? startup_position_ns / GST_MSECOND : -1),
+					        (long long)(m_last_seek_pos / GST_MSECOND));
+					    if (position_ok && startup_position_ns >= 3 * GST_SECOND &&
+					        m_last_seek_pos == 0 && m_openbh_ui_seek_target_ns < 0 &&
+					        m_pending_start_position < 0)
+					    {
+					        const RESULT reset_result = seekToImpl(0, true);
+					        eDebug("[OPENBH_LOCAL_PLAYBACK_V6D] startup rewind-to-zero result=%d",
+					            (int)reset_result);
+					    }
+					}
 
 					if (!m_initial_start)
 					{
