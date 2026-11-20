@@ -3128,6 +3128,8 @@ RESULT eServiceMP3::stop()
 {
 
     if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
+        if (m_gst_playbin)
+            g_object_set_data(G_OBJECT(m_gst_playbin), "openbh-v10-retired", GINT_TO_POINTER(1));
         ++m_subtitle_generation;
         m_subtitle_sync_timer->stop();
         m_dvb_subtitle_sync_timer->stop();
@@ -3240,6 +3242,101 @@ RESULT eServiceMP3::setFastForward(int ratio)
 }
 
 		// iPausableService
+
+/* OPENBH_OPENATV_LOCAL_MOVIE_V10: no Enigma2 service object references in these
+ * GStreamer workers. gst_element_call_async() retains its GstElement while
+ * the request is queued; GDestroyNotify releases request memory. The serial
+ * prevents a queued superseded request from being applied after a newer one.
+ * Stop marks the old pipeline retired so queued operations are skipped.
+ * A call that is already in gst_element_set_state() cannot be forcibly
+ * cancelled; use log diagnostics if the hardware sink itself stays blocked.
+ */
+namespace {
+struct OpenBHV10StateRequest {
+    GstState state;
+    guint serial;
+};
+
+struct OpenBHV10TextRequest {
+    gint track;
+    guint serial;
+};
+
+static void openbhV10AsyncState(GstElement *pipeline, gpointer opaque)
+{
+    OpenBHV10StateRequest *request = static_cast<OpenBHV10StateRequest *>(opaque);
+    if (!pipeline) return;
+    const bool latest = request->serial == GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-state-serial"));
+    if (latest && !g_object_get_data(G_OBJECT(pipeline), "openbh-v10-retired")) {
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker state BEGIN target=%d serial=%u",
+            (int)request->state, request->serial);
+        const GstStateChangeReturn result = gst_element_set_state(pipeline, request->state);
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker state END target=%d result=%d",
+            (int)request->state, (int)result);
+    } else {
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker state SKIP stale/retired serial=%u",
+            request->serial);
+    }
+    if (request->serial == GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-state-serial")))
+        g_object_set_data(G_OBJECT(pipeline), "openbh-v10-state-pending", NULL);
+}
+
+static void openbhV10QueueState(GstElement *pipeline, GstState state)
+{
+    guint serial = GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-state-serial")) + 1;
+    if (!serial) serial = 1;
+    g_object_set_data(G_OBJECT(pipeline), "openbh-v10-state-serial", GUINT_TO_POINTER(serial));
+    g_object_set_data(G_OBJECT(pipeline), "openbh-v10-state-pending", GINT_TO_POINTER(1));
+    OpenBHV10StateRequest *request = g_new(OpenBHV10StateRequest, 1);
+    request->state = state;
+    request->serial = serial;
+    gst_element_call_async(pipeline, openbhV10AsyncState, request, (GDestroyNotify)g_free);
+}
+
+static void openbhV10AsyncText(GstElement *pipeline, gpointer opaque)
+{
+    OpenBHV10TextRequest *request = static_cast<OpenBHV10TextRequest *>(opaque);
+    if (!pipeline) return;
+    const bool latest = request->serial == GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-text-serial"));
+    if (latest && !g_object_get_data(G_OBJECT(pipeline), "openbh-v10-retired")) {
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker subtitle BEGIN track=%d serial=%u",
+            request->track, request->serial);
+        g_object_set(G_OBJECT(pipeline), "current-text", request->track, NULL);
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker subtitle END track=%d", request->track);
+    } else {
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker subtitle SKIP stale/retired serial=%u",
+            request->serial);
+    }
+    if (request->serial == GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-text-serial")))
+        g_object_set_data(G_OBJECT(pipeline), "openbh-v10-text-pending", NULL);
+}
+
+static void openbhV10QueueText(GstElement *pipeline, gint track)
+{
+    guint serial = GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-text-serial")) + 1;
+    if (!serial) serial = 1;
+    g_object_set_data(G_OBJECT(pipeline), "openbh-v10-text-serial", GUINT_TO_POINTER(serial));
+    g_object_set_data(G_OBJECT(pipeline), "openbh-v10-text-pending", GINT_TO_POINTER(1));
+    OpenBHV10TextRequest *request = g_new(OpenBHV10TextRequest, 1);
+    request->track = track;
+    request->serial = serial;
+    gst_element_call_async(pipeline, openbhV10AsyncText, request, (GDestroyNotify)g_free);
+}
+
+static bool openbhV10Busy(GstElement *pipeline)
+{
+    return pipeline &&
+        (g_object_get_data(G_OBJECT(pipeline), "openbh-v10-state-pending") ||
+         g_object_get_data(G_OBJECT(pipeline), "openbh-v10-text-pending"));
+}
+} // anonymous namespace, OpenBH V10
+
 RESULT eServiceMP3::pause()
 {
 
@@ -3247,15 +3344,11 @@ RESULT eServiceMP3::pause()
      * The V8 seek within pause could deadlock or stall GStreamer on DreamTwo.
      * Keep PAUSED state change, and log its return value. */
     if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-        if (!m_gst_playbin || m_state != stRunning)
-            return -1;
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] PAUSE enter");
-        const GstStateChangeReturn rc = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] PAUSE set_state result=%d", (int)rc);
-        if (rc == GST_STATE_CHANGE_FAILURE)
-            return -1;
+        if (!m_gst_playbin || m_state != stRunning) return -1;
         m_paused = true;
         m_currentTrickRatio = 1.0;
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] PAUSE queued (UI thread returns immediately)");
+        openbhV10QueueState(m_gst_playbin, GST_STATE_PAUSED);
         return 0;
     }
 
@@ -3334,13 +3427,12 @@ RESULT eServiceMP3::unpause()
 
     if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
         if (!m_gst_playbin || m_state != stRunning) return -1;
-        if (gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
-            return -1;
         m_paused = false;
         m_currentTrickRatio = 1.0;
         m_prev_decoder_time = -1;
         m_decoder_time_valid_state = 0;
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] local RESUME (no keyframe re-seek)");
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] RESUME queued (UI thread returns immediately)");
+        openbhV10QueueState(m_gst_playbin, GST_STATE_PLAYING);
         return 0;
     }
 
@@ -3843,8 +3935,27 @@ RESULT eServiceMP3::getPlayPosition(pts_t &pts)
     if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
         if (!m_gst_playbin || m_state != stRunning)
             return -1;
-        if (openatv_v8_position(m_gst_playbin, pts))
+        /* During a native sink state/text transition, position queries can
+         * wait on locks held by the streaming thread. Keep last good UI
+         * value rather than blocking the Enigma2 GUI. */
+        gint64 *v10_cached_pts = (gint64 *)g_object_get_data(
+            G_OBJECT(m_gst_playbin), "openbh-v10-last-play-pts");
+        if (openbhV10Busy(m_gst_playbin)) {
+            if (v10_cached_pts) {
+                pts = (pts_t)*v10_cached_pts;
+                return 0;
+            }
+            return -1;
+        }
+        if (openatv_v8_position(m_gst_playbin, pts)) {
+            if (!v10_cached_pts) {
+                v10_cached_pts = g_new(gint64, 1);
+                g_object_set_data_full(G_OBJECT(m_gst_playbin),
+                    "openbh-v10-last-play-pts", v10_cached_pts, (GDestroyNotify)g_free);
+            }
+            *v10_cached_pts = (gint64)pts;
             return 0;
+        }
         /* Keep last known position temporarily if the asynchronous seek is
          * still completing, instead of claiming playback is at zero. */
         if (m_last_seek_pos > 0) {
@@ -5174,6 +5285,18 @@ bool pipelineSettledInPlaying(GstElement *pipeline)
 /* See applySubtitleStreamSwitch()'s own header comment in the .h. */
 void eServiceMP3::applySubtitleStreamSwitch()
 {
+    /* OPENBH_OPENATV_LOCAL_MOVIE_V10: avoid synchronous input-selector
+     * reconfiguration and subsequent FLUSH seek from Enigma2's UI thread.
+     * A new track may display only when its next cue arrives. */
+    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
+        if (!m_gst_playbin) return;
+        m_subtitle_switch_needs_flush = false;
+        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] subtitle selected track=%d queued",
+            m_currentSubtitleStream);
+        openbhV10QueueText(m_gst_playbin, m_currentSubtitleStream);
+        return;
+    }
+
 	g_object_set(G_OBJECT(m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
 	if (m_subtitle_switch_needs_flush)
 	{
@@ -7398,6 +7521,10 @@ void eServiceMP3::pushSubtitles()
         if (m_currentSubtitleStream < 0 ||
             m_currentSubtitleStream >= (int)m_subtitleStreams.size())
             return;
+        if (m_paused || openbhV10Busy(m_gst_playbin)) {
+            m_subtitle_sync_timer->start(150, true);
+            return;
+        }
         pts_t now_pts = 0;
         if (!openatv_v8_position(m_gst_playbin, now_pts)) {
             static unsigned v9_clock_fail_count = 0;
@@ -7590,7 +7717,10 @@ RESULT eServiceMP3::enableSubtitles(iSubtitleUser *user, struct SubtitleTrack &t
 	const bool wasAlreadyShowingSubtitles = (m_currentSubtitleStream >= 0);
 
 	if (m_subtitle_widget) m_subtitle_widget->clearPage();
-	g_object_set (G_OBJECT (m_gst_playbin), "current-text", -1, NULL);
+	/* V10: local movie goes directly to the newly selected text stream.
+     * Avoid a synchronous -1 selector transition before the async switch. */
+    if (!openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio))
+        g_object_set(G_OBJECT(m_gst_playbin), "current-text", -1, NULL);
 	m_subtitle_sync_timer->stop();
 	m_dvb_subtitle_sync_timer->stop();
 	m_dvb_subtitle_pages.clear();
@@ -7651,7 +7781,10 @@ RESULT eServiceMP3::disableSubtitles()
 	m_currentSubtitleStream = -1;
 	m_cachedSubtitleStream = m_currentSubtitleStream;
 	setCacheEntry(false, -1);
-	g_object_set (G_OBJECT (m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
+	if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio))
+        openbhV10QueueText(m_gst_playbin, -1);
+    else
+        g_object_set(G_OBJECT(m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
 	m_subtitle_sync_timer->stop();
 	m_dvb_subtitle_sync_timer->stop();
 	m_subtitle_pages.clear();
