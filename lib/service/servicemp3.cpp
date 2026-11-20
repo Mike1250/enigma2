@@ -3197,6 +3197,14 @@ RESULT eServiceMP3::pause()
 		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
 	if (openbh_local_movie && m_currentTrickRatio == 1.0)
 	{
+		/* OPENBH_LOCAL_FAST_PAUSE_V3: opt-in test for the extra 1-2 seconds of
+		 * decoded/queued video that may keep displaying after PAUSED is requested.
+		 * Capture the actual playback position BEFORE pausing. A flushing
+		 * seek while paused may clear queues, but may also move to a keyframe;
+		 * keep it OFF by default and enable only when comparing. */
+		const bool fast_pause_test = g_file_test("/tmp/openbh_fast_pause_flush", G_FILE_TEST_EXISTS);
+		pts_t fast_pause_pts = 0;
+		const bool fast_pause_have_pts = fast_pause_test && (getRawPlayPosition(fast_pause_pts) >= 0);
 		const gint64 pause_begin_us = g_get_monotonic_time();
 		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] local movie PAUSE requested");
 		GstStateChangeReturn result = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
@@ -3207,6 +3215,22 @@ RESULT eServiceMP3::pause()
 		{
 			eWarning("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] failed to pause local movie");
 			return -1;
+		}
+		if (fast_pause_test)
+		{
+			bool fast_pause_flushed = false;
+			if (fast_pause_have_pts)
+			{
+				const gint64 fast_pause_ns = (gint64)fast_pause_pts * 11111LL;
+				fast_pause_flushed = gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME,
+					(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+					GST_SEEK_TYPE_SET, fast_pause_ns,
+					GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+			}
+			eDebug("[OPENBH_LOCAL_FAST_PAUSE_V3] flush=%d valid_pts=%d pts=%lld elapsed_ms=%lld",
+				(int)fast_pause_flushed, (int)fast_pause_have_pts,
+				(long long)fast_pause_pts,
+				(long long)((g_get_monotonic_time() - pause_begin_us) / 1000));
 		}
 		setHDAudioAuxState(m_gst_playbin, GST_STATE_PAUSED);
 		m_prev_decoder_time = -1;

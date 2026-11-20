@@ -999,11 +999,15 @@ class MediaPlayer(Screen, InfoBarBase, InfoBarScreenSaver, InfoBarSeek, InfoBarA
 			self.playlist.rewindFile()
 
 	def pauseEntry(self):
-		self.pauseService()
+		# OPENBH_MEDIAPLAYER_TOGGLE_V3: KEY_PLAYPAUSE must toggle, not pause twice.
 		if self.seekstate == self.SEEK_STATE_PAUSE:
-			self.show()
-		else:
+			print("[OPENBH_MEDIAPLAYER_TOGGLE_V3] RESUME")
+			self.unPauseService()
 			self.hideAndInfoBar()
+		else:
+			print("[OPENBH_MEDIAPLAYER_TOGGLE_V3] PAUSE")
+			self.pauseService()
+			self.show()
 
 	def stopEntry(self):
 		self.playlist.stopFile()
