@@ -612,20 +612,23 @@ DEFINE_REF(eServiceFactoryMP3)
 static void create_gstreamer_sinks() {
 	dvb_subsink = dvb_audiosink = dvb_videosink = NULL;
 	dvb_subsink_ok = dvb_audiosink_ok = dvb_videosink_ok = false;
-	dvb_audiosink = gst_element_factory_make("dvbaudiosink", NULL);
-	if (!dvb_audiosink) {
-		/* DreamTwo's known working local-playback sink takes priority over ALSA. */
-		dvb_audiosink = gst_element_factory_make("dreamaudiosink", "openbh_movie_native_audio");
-		if (dvb_audiosink)
-			eDebug("[OPENBH_2A0B702] fallback local audio = dreamaudiosink");
+	/* OPENBH_2A0B702_RUNTIMEFIX_V3: prior OpenBH device test: dreamaudiosink AAC decoded but silent.
+	 * ALSA hw:0,0 was audible with playbin; restore that priority. */
+	dvb_audiosink = gst_element_factory_make("alsasink", "openbh_movie_pcm");
+	if (dvb_audiosink) {
+		gstSetStringIfAvailable(dvb_audiosink, "device", "hw:0,0");
+		gstSetBoolIfAvailable(dvb_audiosink, "sync", TRUE);
+		eDebug("[OPENBH_2A0B702_RUNTIMEFIX_V3] selected ALSA hw:0,0 for MoviePlayer audio");
 	}
 	if (!dvb_audiosink) {
-		dvb_audiosink = gst_element_factory_make("alsasink", "openbh_movie_pcm");
-		if (dvb_audiosink) {
-			gstSetStringIfAvailable(dvb_audiosink, "device", "hw:0,0");
-			gstSetBoolIfAvailable(dvb_audiosink, "sync", TRUE);
-			eDebug("[OPENBH_2A0B702] fallback local PCM audio = alsasink hw:0,0");
-		}
+		dvb_audiosink = gst_element_factory_make("dreamaudiosink", "openbh_movie_native_audio");
+		if (dvb_audiosink)
+			eWarning("[OPENBH_2A0B702_RUNTIMEFIX_V3] ALSA missing; falling back to dreamaudiosink");
+	}
+	if (!dvb_audiosink) {
+		dvb_audiosink = gst_element_factory_make("dvbaudiosink", NULL);
+		if (dvb_audiosink)
+			eWarning("[OPENBH_2A0B702_RUNTIMEFIX_V3] ALSA/Dream unavailable; falling back to dvbaudiosink");
 	}
 	if (dvb_audiosink) {
 		gst_object_ref_sink(dvb_audiosink);
@@ -1076,11 +1079,20 @@ void eServiceMP3InfoContainer::setBuffer(GstBuffer* buffer) {
 	bufferSize = map.size;
 }
 
-/* OPENBH_2A0B702_COMPAT: OpenATV's synchronous stop() completes before return. */
+/* OPENBH_2A0B702_RUNTIMEFIX_V3: do not claim release until the pipeline has really reached NULL.
+ * Unlike the old always-true stub, this can expose a failed handover. */
 bool eServiceMP3::waitForHardwareRelease(unsigned int timeout_ms)
 {
- (void)timeout_ms;
- return true;
+	if (!m_gst_playbin)
+		return true;
+	GstState state = GST_STATE_VOID_PENDING, pending = GST_STATE_VOID_PENDING;
+	const GstClockTime budget = static_cast<GstClockTime>(timeout_ms) * GST_MSECOND;
+	GstStateChangeReturn ret = gst_element_get_state(m_gst_playbin, &state, &pending, budget);
+	if (state != GST_STATE_NULL)
+		eWarning("[OPENBH_2A0B702_RUNTIMEFIX_V3] hardware not released: state=%s pending=%s ret=%s",
+			 gst_element_state_get_name(state), gst_element_state_get_name(pending),
+			 gst_element_state_change_return_get_name(ret));
+	return state == GST_STATE_NULL;
 }
 
 // eServiceMP3
@@ -1843,7 +1855,7 @@ RESULT eServiceMP3::stop() {
 	GstStateChangeReturn ret;
 	GstState state, pending;
 	/* make sure that last state change was successfull */
-	ret = gst_element_get_state(m_gst_playbin, &state, &pending, 5 * GST_SECOND);
+	ret = gst_element_get_state(m_gst_playbin, &state, &pending, 0);
 	eDebug("[eServiceMP3] stop state:%s pending:%s ret:%s", gst_element_state_get_name(state),
 		   gst_element_state_get_name(pending), gst_element_state_change_return_get_name(ret));
 	ret = gst_element_set_state(m_gst_playbin, GST_STATE_NULL);
@@ -1854,7 +1866,7 @@ RESULT eServiceMP3::stop() {
 	m_subtitles_paused = false;
 	m_nownext_timer->stop();
 	/* make sure that media is stopped before proceeding further */
-	ret = gst_element_get_state(m_gst_playbin, &state, &pending, 5 * GST_SECOND);
+	ret = gst_element_get_state(m_gst_playbin, &state, &pending, 0);
 	eDebug("[eServiceMP3] **** TO NULL state:%s pending:%s ret:%s ****", gst_element_state_get_name(state),
 		   gst_element_state_get_name(pending), gst_element_state_change_return_get_name(ret));
 	removeCCProbe();
@@ -2513,8 +2525,14 @@ gint eServiceMP3::match_sinktype(const GValue* velement, const gchar* type) {
 RESULT eServiceMP3::getPlayPosition(pts_t& pts) {
 	gint64 pos = 0;
 
-	if (!m_gst_playbin || m_state != stRunning)
+	if (!m_gst_playbin)
 		return -1;
+	/* OPENBH_2A0B702_RUNTIMEFIX_V3: report zero during preroll instead of an unavailable
+	 * counter. Do not infer a time from a decoder that isn't ready. */
+	if (m_state != stRunning) {
+		pts = 0;
+		return 0;
+	}
 	// allow only one ioctl call per second
 	// in case of seek procedure , the position
 	// is updated by the seektoImpl function.
@@ -2549,7 +2567,7 @@ RESULT eServiceMP3::getPlayPosition(pts_t& pts) {
 	// if not this procedure needs to be altered.
 	// if ((dvb_audiosink || dvb_videosink) && !m_paused && !m_seeking_or_paused && !m_sourceinfo.is_hls)
 	bool got_decoder_time = false;
-	if ((dvb_audiosink || dvb_videosink) && !m_paused && !m_seeking_or_paused) {
+	if (m_sourceinfo.is_streaming && (dvb_audiosink || dvb_videosink) && !m_paused && !m_seeking_or_paused) { /* OPENBH_2A0B702_RUNTIMEFIX_V3 */
 		// eDebug("[eServiceMP3] getPlayPosition Check dvb_audiosink or dvb_videosink");
 		if (m_sourceinfo.is_audio && dvb_audiosink) {
 			if (g_signal_lookup("get-decoder-time", G_OBJECT_TYPE(dvb_audiosink)))
@@ -2590,8 +2608,13 @@ RESULT eServiceMP3::getPlayPosition(pts_t& pts) {
 				pts = m_last_seek_pos;
 				m_last_seek_count = 0;
 				return 0;
-			} else
+			} else {
+				if (!m_sourceinfo.is_streaming) { /* OPENBH_2A0B702_RUNTIMEFIX_V3 */
+					pts = 0;
+					return 0;
+				}
 				return -1;
+			}
 		}
 	}
 
@@ -3604,7 +3627,7 @@ void eServiceMP3::gstBusCall(GstMessage* msg) {
 						m_event(this, evStart);
 					if (!m_is_live)
 						gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
-					ret = gst_element_get_state(m_gst_playbin, &state, &pending, 5LL * GST_SECOND);
+					ret = gst_element_get_state(m_gst_playbin, &state, &pending, 0);
 					eDebug("[eServiceMP3] PLAYBIN WITH BLOCK READY TO PAUSED state:%s pending:%s ret:%s",
 						   gst_element_state_get_name(state), gst_element_state_get_name(pending),
 						   gst_element_state_change_return_get_name(ret));
@@ -3657,14 +3680,14 @@ void eServiceMP3::gstBusCall(GstMessage* msg) {
 					if (!m_sourceinfo.is_streaming && !m_cuesheet_loaded) /* cuesheet CVR */
 						loadCuesheet();
 					/* avoid position taking on audiosink when audiosink is not running */
-					ret = gst_element_get_state(dvb_audiosink, &state, &pending, 3 * GST_SECOND);
+					ret = gst_element_get_state(dvb_audiosink, &state, &pending, 0);
 					if (state == GST_STATE_NULL)
 						m_audiosink_not_running = true;
 					if (!m_is_live)
 						gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
 					/* tempo debug */
 					/* wait on async state change complete for max 5 seconds */
-					ret = gst_element_get_state(m_gst_playbin, &state, &pending, 3 * GST_SECOND);
+					ret = gst_element_get_state(m_gst_playbin, &state, &pending, 0);
 					eDebug("[eServiceMP3] PLAYBIN WITH BLOCK PLAYSTART state:%s pending:%s ret:%s",
 						   gst_element_state_get_name(state), gst_element_state_get_name(pending),
 						   gst_element_state_change_return_get_name(ret));
@@ -4134,7 +4157,7 @@ void eServiceMP3::gstBusCall(GstMessage* msg) {
 						if (m_bufferInfo.bufferPercent == 100) {
 							GstState state, pending;
 							/* avoid setting to play while still in async state change mode */
-							gst_element_get_state(m_gst_playbin, &state, &pending, 5 * GST_SECOND);
+							gst_element_get_state(m_gst_playbin, &state, &pending, 0);
 							if (state != GST_STATE_PLAYING && !m_first_paused) {
 								eDebug("[eServiceMP3] *** PREFILL BUFFER action start playing *** pending state was %s",
 									   pending == GST_STATE_VOID_PENDING ? "NO_PENDING" : "A_PENDING_STATE");
