@@ -1180,13 +1180,14 @@ eServiceMP3::eServiceMP3(eServiceReference ref)
 	std::string sref = ref.toString();
 	if (!sref.empty()) {
 		sref = replace_all(sref, ",", "_");
-		std::vector<ePtr<eDVBService>>& iptv_services = eDVBDB::getInstance()->iptv_services;
-		for (std::vector<ePtr<eDVBService>>::iterator it = iptv_services.begin(); it != iptv_services.end(); ++it) {
-			// eDebug("[eServiceMP3] iptv_services m_reference_str : %s", (*it)->m_reference_str.c_str());
-			if (sref.find((*it)->m_reference_str) != std::string::npos) {
+		/* OPENBH_2A0B702_COMPILEFIX_V2: restore native OpenBH IPTV cache reader. */
+		std::vector<eIPTVDBItem> &iptv_services = eDVBDB::getInstance()->iptv_services;
+		for (std::vector<eIPTVDBItem>::const_iterator it = iptv_services.begin();
+		     it != iptv_services.end(); ++it) {
+			if (sref.find(it->s_ref) != std::string::npos) {
 				if (eConfigManager::getConfigBoolValue("config.autolanguage.audio_usecache", true))
-					m_initialAudioStream = (*it)->getCacheEntry(eDVBService::cMPEGAPID);
-				m_currentSubtitleStream = (*it)->getCacheEntry(eDVBService::cSUBTITLE);
+					m_initialAudioStream = it->ampeg_pid;
+				m_currentSubtitleStream = it->subtitle_pid;
 				m_cachedSubtitleStream = m_currentSubtitleStream;
 				break;
 			}
@@ -1730,35 +1731,22 @@ DEFINE_REF(GstMessageContainer);
  * @param[in] pid The PID of the audio or subtitle stream.
  */
 void eServiceMP3::setCacheEntry(bool isAudio, int pid) {
-	// eDebug("[eServiceMP3] setCacheEntry %d %d / %s", isAudio, pid, m_ref.toString().c_str());
-	std::string ref = replace_all(m_ref.toString(), ",", "_");
-	bool hasFoundItem = false;
-	std::vector<ePtr<eDVBService>>& iptv_services = eDVBDB::getInstance()->iptv_services;
-	for (std::vector<ePtr<eDVBService>>::iterator it = iptv_services.begin(); it != iptv_services.end(); ++it) {
-		if (ref.find((*it)->m_reference_str) != std::string::npos) {
-			hasFoundItem = true;
-			(*it)->setCacheEntry(isAudio ? eDVBService::cMPEGAPID : eDVBService::cSUBTITLE, pid);
-			break;
+	/* OPENBH_2A0B702_COMPILEFIX_V2: native OpenBH eIPTVDBItem cache writer. */
+	std::string ref = m_sourceinfo.is_streaming ? m_ref.toReferenceString() : m_ref.toString();
+	std::vector<eIPTVDBItem> &iptv_services = eDVBDB::getInstance()->iptv_services;
+	for (std::vector<eIPTVDBItem>::iterator it = iptv_services.begin(); it != iptv_services.end(); ++it) {
+		if (ref.find(it->s_ref) != std::string::npos) {
+			if (isAudio)
+				it->ampeg_pid = pid;
+			else
+				it->subtitle_pid = pid;
+			return;
 		}
 	}
-	if (!hasFoundItem) {
-		ePtr<eDVBService> s = new eDVBService;
-		s->m_reference_str = ref;
-		s->setCacheEntry(isAudio ? eDVBService::cMPEGAPID : eDVBService::cSUBTITLE, pid);
-		iptv_services.push_back(s);
-	}
+	eIPTVDBItem item(ref, isAudio ? pid : -1, -1, -1, -1, -1, -1, -1, isAudio ? -1 : pid, -1);
+	iptv_services.push_back(item);
 }
 
-/**
- * @brief Connects an event to the service.
- *
- * This function connects a signal slot to the service's event system, allowing
- * external components to listen for specific events related to the service.
- *
- * @param[in] event The signal slot to connect.
- * @param[out] connection An output pointer that will hold the connection reference.
- * @return RESULT Returns 0 on success, or an error code if the connection fails.
- */
 RESULT eServiceMP3::connectEvent(const sigc::slot<void(iPlayableService*, int)>& event, ePtr<eConnection>& connection) {
 	connection = new eConnection((iPlayableService*)this, m_event.connect(event));
 	return 0;
@@ -3759,7 +3747,8 @@ void eServiceMP3::gstBusCall(GstMessage* msg) {
 				if (input)
 					gst_object_unref(input);
 				if (retry)
-					m_event((iPlayableService*)this, evStreamError);
+					/* OPENBH_2A0B702_COMPILEFIX_V2: evStreamError not in OpenBH iPlayableService. */
+					eWarning("[eServiceMP3] HTTP source read/seek error (OpenBH has no evStreamError event)");
 			}
 			if (err->domain == GST_STREAM_ERROR) {
 				if (err->code == GST_STREAM_ERROR_CODEC_NOT_FOUND) {
@@ -5466,7 +5455,7 @@ RESULT eServiceMP3::getCachedSubtitle(struct SubtitleTrack& track) {
 		track.page_number = int(type);
 		track.magazine_number = 0;
 		track.language_code = m_subtitleStreams[m_cachedSubtitleStream].language_code;
-		track.title = m_subtitleStreams[m_cachedSubtitleStream].title;
+		/* OPENBH_2A0B702_COMPILEFIX_V2: SubtitleTrack has no title (m_subtitleStreams[m_cachedSubtitleStream].title). */
 		return 0;
 	}
 
@@ -5499,7 +5488,7 @@ RESULT eServiceMP3::getSubtitleList(std::vector<struct SubtitleTrack>& subtitlel
 		track.page_number = int(stream.type);
 		track.magazine_number = 0;
 		track.language_code = stream.language_code;
-		track.title = stream.title;
+		/* OPENBH_2A0B702_COMPILEFIX_V2: SubtitleTrack has no title (stream.title). */
 
 		subtitlelist.push_back(track);
 	}
