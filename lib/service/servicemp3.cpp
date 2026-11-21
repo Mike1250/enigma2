@@ -1079,20 +1079,27 @@ void eServiceMP3InfoContainer::setBuffer(GstBuffer* buffer) {
 	bufferSize = map.size;
 }
 
-/* OPENBH_2A0B702_RUNTIMEFIX_V3: do not claim release until the pipeline has really reached NULL.
- * Unlike the old always-true stub, this can expose a failed handover. */
+/* OPENBH_2A0B702_STATICWAIT_V4: the method is static in the OpenBH API.
+ * It cannot read an instance's m_gst_playbin. Instead, track stop() calls
+ * still executing, as OpenBH's original stop-worker wait did. This does not
+ * prove that an asynchronously stopping sink has reached GST_STATE_NULL. */
+namespace {
+static volatile gint s_openbh_mp3_stop_calls_in_flight = 0;
+}
+
 bool eServiceMP3::waitForHardwareRelease(unsigned int timeout_ms)
 {
-	if (!m_gst_playbin)
-		return true;
-	GstState state = GST_STATE_VOID_PENDING, pending = GST_STATE_VOID_PENDING;
-	const GstClockTime budget = static_cast<GstClockTime>(timeout_ms) * GST_MSECOND;
-	GstStateChangeReturn ret = gst_element_get_state(m_gst_playbin, &state, &pending, budget);
-	if (state != GST_STATE_NULL)
-		eWarning("[OPENBH_2A0B702_RUNTIMEFIX_V3] hardware not released: state=%s pending=%s ret=%s",
-			 gst_element_state_get_name(state), gst_element_state_get_name(pending),
-			 gst_element_state_change_return_get_name(ret));
-	return state == GST_STATE_NULL;
+	unsigned int waited_ms = 0;
+	while (g_atomic_int_get(&s_openbh_mp3_stop_calls_in_flight) > 0 && waited_ms < timeout_ms) {
+		unsigned int delay_ms = (timeout_ms - waited_ms < 5U) ? timeout_ms - waited_ms : 5U;
+		g_usleep(static_cast<gulong>(delay_ms) * 1000U);
+		waited_ms += delay_ms;
+	}
+	const int remaining = g_atomic_int_get(&s_openbh_mp3_stop_calls_in_flight);
+	if (remaining > 0)
+		eWarning("[OPENBH_2A0B702_STATICWAIT_V4] %d stop() call(s) still in progress after %u ms",
+			remaining, waited_ms);
+	return remaining == 0;
 }
 
 // eServiceMP3
@@ -1848,6 +1855,8 @@ RESULT eServiceMP3::stop() {
 
 	eDebug("[eServiceMP3] stop %s", m_ref.path.c_str());
 	m_state = stStopped;
+	/* OPENBH_2A0B702_STATICWAIT_V4: bracket the actual stop() call. */
+	g_atomic_int_inc(&s_openbh_mp3_stop_calls_in_flight);
 #ifdef DREAMNEXTGEN
 	windStop();
 #endif
@@ -1870,6 +1879,8 @@ RESULT eServiceMP3::stop() {
 	eDebug("[eServiceMP3] **** TO NULL state:%s pending:%s ret:%s ****", gst_element_state_get_name(state),
 		   gst_element_state_get_name(pending), gst_element_state_change_return_get_name(ret));
 	removeCCProbe();
+	/* OPENBH_2A0B702_STATICWAIT_V4: stop() no longer running. */
+	g_atomic_int_add(&s_openbh_mp3_stop_calls_in_flight, -1);
 
 	return 0;
 }
