@@ -29,9 +29,6 @@
 #include <string>
 #include <cstdint>
 #include <cstdlib>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -1894,58 +1891,26 @@ void eServiceMP3InfoContainer::setBuffer(GstBuffer *buffer)
 int eServiceMP3::ac3_delay = 0,
     eServiceMP3::pcm_delay = 0;
 
-/* Reduce an "&e2clearkeys=" value to clean "kid=key[,kid=key...]" pairs.
- * The value is whatever followed the parameter in the service path, and
- * Enigma2 can leave stray text on the end of it (e.g. "<kid>=<key>:Virgin",
- * the first word of the channel name), which cencdec rejects as an invalid
- * entry - with a single key that leaves it with no key at all and every sample
- * is dropped (no picture/sound). Keep only a 32-hex KID (dashes tolerated) and
- * the first 32 hex digits of the key, drop everything else, and lowercase the
- * hex since cencdec looks keys up by lowercase KID. */
-static inline bool ckIsHex(char ch)
+
+// OPENATV_FULLPORT_1: OpenATV subtitle selector active-pad commit.
+// This callback runs in a GStreamer thread.  It neither accesses the
+// eServiceMP3 object nor waits on a streaming thread from the E2 UI.
+static void openatv_port_force_selector_commit(GstElement *, gpointer user_data)
 {
-	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+    GstPad *pad = GST_PAD(user_data);
+    gst_pad_send_event(pad, gst_event_new_custom(
+        GST_EVENT_CUSTOM_DOWNSTREAM_OOB,
+        gst_structure_new_empty("eServiceMP3-force-selector-commit")));
 }
 
-static std::string sanitiseClearkeys(const std::string &in)
+// OPENATV_FULLPORT_1: states are requested on the GStreamer pool, never using
+// a blocking gst_element_get_state() wait on Enigma2's UI thread. The playbin
+// owns the queued call and the callback never dereferences eServiceMP3.
+static void openatv_port_set_pipeline_state(GstElement *element, gpointer user_data)
 {
-	std::string out;
-	size_t i = 0;
-	while (i <= in.size())
-	{
-		size_t e = in.find(',', i);
-		if (e == std::string::npos)
-			e = in.size();
-		size_t j = i;
-		while (j < e && (in[j] == ' ' || in[j] == '\t'))
-			++j;
-		std::string kid, key;
-		while (j < e && (ckIsHex(in[j]) || in[j] == '-'))
-		{
-			if (in[j] != '-')
-				kid += (char)((in[j] >= 'A' && in[j] <= 'F') ? in[j] + 32 : in[j]);
-			++j;
-		}
-		if (kid.size() == 32 && j < e && in[j] == '=')
-		{
-			++j;
-			while (j < e && key.size() < 32 && ckIsHex(in[j]))
-			{
-				key += (char)((in[j] >= 'A' && in[j] <= 'F') ? in[j] + 32 : in[j]);
-				++j;
-			}
-			if (key.size() == 32)
-			{
-				if (!out.empty())
-					out += ',';
-				out += kid + "=" + key;
-			}
-		}
-		if (e >= in.size())
-			break;
-		i = e + 1;
-	}
-	return out;
+    GstState target = (GstState)GPOINTER_TO_INT(user_data);
+    GstStateChangeReturn result = gst_element_set_state(element, target);
+    eDebug("[OPENATV_FULLPORT_1] worker set_state target=%d result=%d", (int)target, (int)result);
 }
 
 eServiceMP3::eServiceMP3(eServiceReference ref):
@@ -2068,17 +2033,6 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 		m_clearkeys = m_ref.path.substr(kstart, kend == std::string::npos ? std::string::npos : kend - kstart);
 		m_ref.path.erase(pos, kend == std::string::npos ? std::string::npos : kend - pos);
 		eDebug("[eServiceMP3] construct: e2clearkeys supplied (%zu bytes)", m_clearkeys.size());
-		{
-			const std::string cleaned = sanitiseClearkeys(m_clearkeys);
-			if (cleaned.empty())
-				eDebug("[eServiceMP3] e2clearkeys: no valid <32 hex kid>=<32 hex key> pair found, passing as given");
-			else
-			{
-				if (cleaned != m_clearkeys)
-					eDebug("[eServiceMP3] e2clearkeys cleaned (stray characters removed / hex lowercased): %zu -> %zu bytes", m_clearkeys.size(), cleaned.size());
-				m_clearkeys = cleaned;
-			}
-		}
 	}
 	pos = m_ref.path.find('#');
 	size_t pos_q = m_ref.path.find('?');
@@ -2347,91 +2301,6 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	m_gst_playbin = gst_element_factory_make("playbin", "playbin");
 	if ( m_gst_playbin )
 	{
-#ifdef DREAMNEXTGEN
-		/* OPENBH_DREAMTWO_OPENATV_LOCAL_SINKS_V1
-		 * OpenATV assigns native audio/video sinks directly to playbin.
-		 * This DreamTwo image provides dreamaudiosink/dreamvideosink instead
-		 * of dvbaudiosink/dvbvideosink.  Keep the pipeline and other platforms
-		 * untouched.  Force the normal ALSA PCM sink with the temporary
-		 * /tmp/openbh_gst_use_alsa marker for unsupported native audio caps.
-		 * /tmp/openbh_gst_auto_sinks disables this port for A/B testing.
-		 */
-		if (!m_sourceinfo.is_streaming &&
-			!g_file_test("/tmp/openbh_gst_auto_sinks", G_FILE_TEST_EXISTS))
-		{
-			const bool force_alsa =
-				g_file_test("/tmp/openbh_gst_use_alsa", G_FILE_TEST_EXISTS);
-			GstElement *local_audio_sink = NULL;
-			const char *audio_factory = NULL;
-
-			if (!force_alsa)
-			{
-				local_audio_sink = gst_element_factory_make("dreamaudiosink", NULL);
-				if (local_audio_sink)
-					audio_factory = "dreamaudiosink";
-			}
-			if (!local_audio_sink)
-			{
-				local_audio_sink = gst_element_factory_make("alsasink", NULL);
-				if (local_audio_sink)
-					audio_factory = "alsasink";
-			}
-			if (local_audio_sink)
-			{
-				GObjectClass *klass = G_OBJECT_GET_CLASS(local_audio_sink);
-				/* Same e2-sync/e2-async behavior as OpenATV's MP3 service.
-				 * Some Dream sink versions omit these properties. */
-				if (g_object_class_find_property(klass, "e2-sync"))
-					g_object_set(G_OBJECT(local_audio_sink), "e2-sync",
-						m_sourceinfo.is_audio ? TRUE : FALSE, NULL);
-				if (g_object_class_find_property(klass, "e2-async"))
-					g_object_set(G_OBJECT(local_audio_sink), "e2-async",
-						m_sourceinfo.is_audio ? TRUE : FALSE, NULL);
-				/* Keep the decoded PCM at its NORMAL full scale (1.0).
-				 * This is not an artificial boost above 0 dB. */
-				if (g_object_class_find_property(klass, "volume"))
-					g_object_set(G_OBJECT(local_audio_sink), "volume", (gdouble)1.0, NULL);
-				/* An earlier DreamTwo sink build explicitly used the
-				 * dreamhdmi PCM alias.  Keep it selectable, not forced:
-				 * some images already have a correctly configured default. */
-				if (g_object_class_find_property(klass, "device"))
-				{
-					if (g_file_test("/tmp/openbh_gst_use_dreamhdmi", G_FILE_TEST_EXISTS))
-						g_object_set(G_OBJECT(local_audio_sink), "device", "dreamhdmi", NULL);
-					else if (force_alsa &&
-						g_file_test("/tmp/openbh_gst_use_alsa_hw0", G_FILE_TEST_EXISTS))
-						g_object_set(G_OBJECT(local_audio_sink), "device", "hw:0,0", NULL);
-				}
-				gst_object_ref_sink(local_audio_sink);
-				g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", local_audio_sink, NULL);
-				g_object_set(G_OBJECT(m_gst_playbin), "volume", (gdouble)1.0, NULL);
-				gst_object_unref(local_audio_sink);
-				eDebug("[DreamTwo local GStreamer] OpenATV-style audio-sink: %s", audio_factory);
-			}
-			else
-				eWarning("[DreamTwo local GStreamer] dreamaudiosink/alsasink unavailable");
-
-			if (!m_sourceinfo.is_audio)
-			{
-				GstElement *local_video_sink = gst_element_factory_make("dreamvideosink", NULL);
-				if (local_video_sink)
-				{
-					GObjectClass *klass = G_OBJECT_GET_CLASS(local_video_sink);
-					if (g_object_class_find_property(klass, "e2-sync"))
-						g_object_set(G_OBJECT(local_video_sink), "e2-sync", FALSE, NULL);
-					if (g_object_class_find_property(klass, "e2-async"))
-						g_object_set(G_OBJECT(local_video_sink), "e2-async", FALSE, NULL);
-					gst_object_ref_sink(local_video_sink);
-					g_object_set(G_OBJECT(m_gst_playbin), "video-sink", local_video_sink, NULL);
-					gst_object_unref(local_video_sink);
-					eDebug("[DreamTwo local GStreamer] OpenATV-style video-sink: dreamvideosink");
-				}
-				else
-					eWarning("[DreamTwo local GStreamer] dreamvideosink not installed");
-			}
-		}
-#endif
-
 		/*
 		 * avoid video conversion, let the dvbmediasink handle that using native video flag
 		 * volume control is done by hardware, do not use soft volume flag
@@ -2463,6 +2332,47 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			g_object_set(G_OBJECT(m_gst_playbin), "buffer-size", m_buffer_size, NULL);
 			if (m_sourceinfo.is_hls || m_sourceinfo.is_dash)
 				g_object_set(G_OBJECT(m_gst_playbin), "connection-speed", (guint64)(4495000LL), NULL);
+		}
+		/*
+		 * DreamTwo/OpenBH MoviePlayer sound-first handoff (OpenATV-inspired):
+		 * choose concrete media sinks before the playbin state transition,
+		 * rather than selecting the highest-ranked system audio sink.
+		 * This receiver's dreamaudiosink decodes AAC but produced silence;
+		 * gst-launch playbin + alsasink device=hw:0,0 produced audible PCM.
+		 * Native Dreambox video sink already works independently. Do not
+		 * change live DVB eAudioDecoder/eAlsaOutput or the Amlogic driver.
+		 */
+		if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
+		{
+			GstElement *movie_alsa = gst_element_factory_make("alsasink", "movie_audio_hw00");
+			if (movie_alsa)
+			{
+				g_object_set(G_OBJECT(movie_alsa), "device", "hw:0,0", "sync", TRUE, NULL);
+				g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", movie_alsa, NULL);
+				/* MOVIE_ALSA_V3_LIFETIME: playbin takes ownership of the
+				 * factory-created sink's floating reference. Do NOT unref it
+				 * here: doing so can destroy the sink while playbin uses it,
+				 * leading to a crash when closing MoviePlayer. */
+				flags |= GST_PLAY_FLAG_SOFT_VOLUME;
+				eDebug("[eServiceMP3] MOVIE_ALSA_V3_LIFETIME: ALSA hw:0,0 handed to playbin");
+			}
+			else
+				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: alsasink missing, falling back to default sink");
+
+			/* OpenATV DREAMNEXTGEN explicitly selects dreamvideosink. Keep
+			 * its default hardware pacing (sync=false), which matches the
+			 * existing local video playback. A/V offset is a separate task. */
+			GstElement *movie_video = gst_element_factory_make("dreamvideosink", "movie_amlogic_video");
+			if (movie_video)
+			{
+				g_object_set(G_OBJECT(movie_video), "sync", FALSE, NULL);
+				g_object_set(G_OBJECT(m_gst_playbin), "video-sink", movie_video, NULL);
+				/* MOVIE_ALSA_V3_LIFETIME: playbin owns the floating sink
+				 * reference after g_object_set(), just as for audio above. */
+				eDebug("[eServiceMP3] MOVIE_ALSA_V3_LIFETIME: native dreamvideosink handed to playbin");
+			}
+			else
+				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: dreamvideosink missing; using default video sink");
 		}
 		g_object_set (G_OBJECT (m_gst_playbin), "flags", flags, NULL);
 		g_object_set (G_OBJECT (m_gst_playbin), "uri", uri, NULL);
@@ -2821,24 +2731,6 @@ void eServiceMP3::applyPipTarget()
 	eDebug("[eServiceMP3] PiP: video-only on decoder %d", m_pip_decoder);
 }
 
-/* OPENBH_OPENATV_LOCAL_MOVIE_V8: local MoviePlayer experiments.
- * Keep local media playback in GStreamer's time domain. For DVB/PVR and
- * network streams preserve OpenBH's original service behavior. */
-static bool openatv_v8_is_local_movie(const eServiceReference &ref,
-                                     bool is_live, bool is_audio)
-{
-    return !is_live && !is_audio && !ref.path.empty() &&
-           (ref.path[0] == '/' || ref.path.compare(0, 7, "file://") == 0);
-}
-static bool openatv_v8_position(GstElement *playbin, pts_t &pts)
-{
-    gint64 ns = -1;
-    if (!playbin || !gst_element_query_position(playbin, GST_FORMAT_TIME, &ns) || ns < 0)
-        return false;
-    pts = (pts_t)(ns / 11111LL);
-    return true;
-}
-
 RESULT eServiceMP3::start()
 {
 	ASSERT(m_state == stIdle);
@@ -2862,19 +2754,7 @@ RESULT eServiceMP3::start()
 
 		eDebug("[eServiceMP3] starting pipeline");
 		GstStateChangeReturn ret;
-		/* OPENBH_OPENATV_LOCAL_MOVIE_V8: preroll local file before first frame. */
-        if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-            g_object_set_data(G_OBJECT(m_gst_playbin), "openatv-v8-start-stage", GINT_TO_POINTER(1));
-            ret = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
-            if (ret == GST_STATE_CHANGE_SUCCESS) {
-                /* No preroll message is guaranteed for a synchronous change. */
-                g_object_set_data(G_OBJECT(m_gst_playbin), "openatv-v8-start-stage", NULL);
-                ret = gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-            }
-            eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] local startup preroll started");
-        } else {
-            ret = gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-        }
+		ret = gst_element_set_state (m_gst_playbin, GST_STATE_PLAYING);
 
 		switch(ret)
 		{
@@ -2950,7 +2830,6 @@ struct StopWorkerArgs
 	GstElement *playbin;
 	StopWatchdog *watchdog;
 	bool hadVideo;
-	bool wasLocalMovie;
 };
 
 /* gst_element_set_state(..., GST_STATE_NULL) is the call that can still block
@@ -2969,23 +2848,12 @@ gpointer stopWorker(gpointer data)
 	GstElement *playbin = args->playbin;
 	StopWatchdog *watchdog = args->watchdog;
 	bool hadVideo = args->hadVideo;
-	const bool wasLocalMovie = args->wasLocalMovie;
 	delete args;
 
 	GstStateChangeReturn ret = gst_element_set_state(playbin, GST_STATE_NULL);
 	if (ret != GST_STATE_CHANGE_SUCCESS)
 		eDebug("[eServiceMP3] stop GST_STATE_NULL failure");
 	gst_object_unref(playbin);
-#ifdef __GLIBC__
-    /* OPENBH_LOCAL_PLAYBACK_V6D: return free malloc arenas, not page cache. */
-    if (wasLocalMovie)
-    {
-        const int trimmed = malloc_trim(0);
-        eDebug("[OPENBH_LOCAL_PLAYBACK_V6D] local stop malloc_trim=%d", trimmed);
-    }
-#else
-    (void)wasLocalMovie;
-#endif
 
 	int remaining = g_atomic_int_add(&s_mp3_stop_workers, -1) - 1;
 	eDebug("[eServiceMP3] stop worker released hardware; %d teardown(s) remain", remaining);
@@ -3126,20 +2994,6 @@ void eServiceMP3::disconnectAsyncSignalHandlers()
 
 RESULT eServiceMP3::stop()
 {
-
-    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-        if (m_gst_playbin)
-            g_object_set_data(G_OBJECT(m_gst_playbin), "openbh-v10-retired", GINT_TO_POINTER(1));
-        ++m_subtitle_generation;
-        m_subtitle_sync_timer->stop();
-        m_dvb_subtitle_sync_timer->stop();
-        m_dvb_subtitle_pages.clear();
-        m_subtitle_pages.clear();
-        if (m_gst_playbin)
-            g_object_set_data(G_OBJECT(m_gst_playbin), "openatv-v8-start-stage", NULL);
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] stop: clear local subtitle queues");
-    }
-
 	m_passthrough_fix_timer->stop();
 	m_dash_recover_timer->stop();
 	/* A switch still waiting on the pipeline to settle - a fresh pipeline
@@ -3181,9 +3035,7 @@ RESULT eServiceMP3::stop()
 	gst_object_ref(m_gst_playbin);
 	g_atomic_int_inc(&s_mp3_stop_workers);
 	StopWatchdog *watchdog = new StopWatchdog{0, 2};
-	GThread *worker = g_thread_new("mp3stop", stopWorker, new StopWorkerArgs{m_gst_playbin, watchdog, videoSink != NULL && m_pip_decoder < 0 /* a PiP must never blank the primary decoder */,
-        !m_sourceinfo.is_audio && !m_ref.path.empty() &&
-        (m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0)});
+	GThread *worker = g_thread_new("mp3stop", stopWorker, new StopWorkerArgs{m_gst_playbin, watchdog, videoSink != NULL && m_pip_decoder < 0 /* a PiP must never blank the primary decoder */});
 	g_thread_unref(worker);
 	GThread *watchdogThread = g_thread_new("mp3stopwd", stopWatchdog, watchdog);
 	g_thread_unref(watchdogThread);
@@ -3242,180 +3094,21 @@ RESULT eServiceMP3::setFastForward(int ratio)
 }
 
 		// iPausableService
-
-/* OPENBH_OPENATV_LOCAL_MOVIE_V10: no Enigma2 service object references in these
- * GStreamer workers. gst_element_call_async() retains its GstElement while
- * the request is queued; GDestroyNotify releases request memory. The serial
- * prevents a queued superseded request from being applied after a newer one.
- * Stop marks the old pipeline retired so queued operations are skipped.
- * A call that is already in gst_element_set_state() cannot be forcibly
- * cancelled; use log diagnostics if the hardware sink itself stays blocked.
- */
-namespace {
-struct OpenBHV10StateRequest {
-    GstState state;
-    guint serial;
-};
-
-struct OpenBHV10TextRequest {
-    gint track;
-    guint serial;
-};
-
-static void openbhV10AsyncState(GstElement *pipeline, gpointer opaque)
-{
-    OpenBHV10StateRequest *request = static_cast<OpenBHV10StateRequest *>(opaque);
-    if (!pipeline) return;
-    const bool latest = request->serial == GPOINTER_TO_UINT(
-        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-state-serial"));
-    if (latest && !g_object_get_data(G_OBJECT(pipeline), "openbh-v10-retired")) {
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker state BEGIN target=%d serial=%u",
-            (int)request->state, request->serial);
-        const GstStateChangeReturn result = gst_element_set_state(pipeline, request->state);
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker state END target=%d result=%d",
-            (int)request->state, (int)result);
-    } else {
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker state SKIP stale/retired serial=%u",
-            request->serial);
-    }
-    if (request->serial == GPOINTER_TO_UINT(
-        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-state-serial")))
-        g_object_set_data(G_OBJECT(pipeline), "openbh-v10-state-pending", NULL);
-}
-
-static void openbhV10QueueState(GstElement *pipeline, GstState state)
-{
-    guint serial = GPOINTER_TO_UINT(
-        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-state-serial")) + 1;
-    if (!serial) serial = 1;
-    g_object_set_data(G_OBJECT(pipeline), "openbh-v10-state-serial", GUINT_TO_POINTER(serial));
-    g_object_set_data(G_OBJECT(pipeline), "openbh-v10-state-pending", GINT_TO_POINTER(1));
-    OpenBHV10StateRequest *request = g_new(OpenBHV10StateRequest, 1);
-    request->state = state;
-    request->serial = serial;
-    gst_element_call_async(pipeline, openbhV10AsyncState, request, (GDestroyNotify)g_free);
-}
-
-static void openbhV10AsyncText(GstElement *pipeline, gpointer opaque)
-{
-    OpenBHV10TextRequest *request = static_cast<OpenBHV10TextRequest *>(opaque);
-    if (!pipeline) return;
-    const bool latest = request->serial == GPOINTER_TO_UINT(
-        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-text-serial"));
-    if (latest && !g_object_get_data(G_OBJECT(pipeline), "openbh-v10-retired")) {
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker subtitle BEGIN track=%d serial=%u",
-            request->track, request->serial);
-        g_object_set(G_OBJECT(pipeline), "current-text", request->track, NULL);
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker subtitle END track=%d", request->track);
-    } else {
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] worker subtitle SKIP stale/retired serial=%u",
-            request->serial);
-    }
-    if (request->serial == GPOINTER_TO_UINT(
-        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-text-serial")))
-        g_object_set_data(G_OBJECT(pipeline), "openbh-v10-text-pending", NULL);
-}
-
-static void openbhV10QueueText(GstElement *pipeline, gint track)
-{
-    guint serial = GPOINTER_TO_UINT(
-        g_object_get_data(G_OBJECT(pipeline), "openbh-v10-text-serial")) + 1;
-    if (!serial) serial = 1;
-    g_object_set_data(G_OBJECT(pipeline), "openbh-v10-text-serial", GUINT_TO_POINTER(serial));
-    g_object_set_data(G_OBJECT(pipeline), "openbh-v10-text-pending", GINT_TO_POINTER(1));
-    OpenBHV10TextRequest *request = g_new(OpenBHV10TextRequest, 1);
-    request->track = track;
-    request->serial = serial;
-    gst_element_call_async(pipeline, openbhV10AsyncText, request, (GDestroyNotify)g_free);
-}
-
-static bool openbhV10Busy(GstElement *pipeline)
-{
-    return pipeline &&
-        (g_object_get_data(G_OBJECT(pipeline), "openbh-v10-state-pending") ||
-         g_object_get_data(G_OBJECT(pipeline), "openbh-v10-text-pending"));
-}
-} // anonymous namespace, OpenBH V10
-
 RESULT eServiceMP3::pause()
 {
-
-    /* OPENBH_OPENATV_LOCAL_MOVIE_V9: no blocking position-query/FLUSH seek on remote-key path.
-     * The V8 seek within pause could deadlock or stall GStreamer on DreamTwo.
-     * Keep PAUSED state change, and log its return value. */
-    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-        if (!m_gst_playbin || m_state != stRunning) return -1;
-        m_paused = true;
-        m_currentTrickRatio = 1.0;
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] PAUSE queued (UI thread returns immediately)");
-        openbhV10QueueState(m_gst_playbin, GST_STATE_PAUSED);
-        return 0;
-    }
-
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
-	/* [OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] Ordinary local video only: pause/resume is
-	 * a GStreamer state transition, NOT a flushing seek. The old
-	 * trickSeek() resume fallback can restart preroll on a keyframe
-	 * and leave the Amlogic decoder stuck after a normal pause.
-	 * Keep legacy behavior for network streams, audio-only, and
-	 * fast/slow/reverse playback. */
-	const bool openbh_local_movie = !m_sourceinfo.is_audio &&
-		!m_ref.path.empty() &&
-		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
-	if (openbh_local_movie && m_currentTrickRatio == 1.0)
-	{
-		/* OPENBH_LOCAL_FAST_PAUSE_V3: opt-in test for the extra 1-2 seconds of
-		 * decoded/queued video that may keep displaying after PAUSED is requested.
-		 * Capture the actual playback position BEFORE pausing. A flushing
-		 * seek while paused may clear queues, but may also move to a keyframe;
-		 * keep it OFF by default and enable only when comparing. */
-		/* OPENBH_LOCAL_FAST_PAUSE_V4: use the pipeline timeline in ns.
-		 * getRawPlayPosition() may prefer audio decoder time, which can be in
-		 * a different/stale PTS domain; FLUSH|KEY_UNIT can snap back a GOP. */
-		m_openbh_fast_pause_target_ns = -1;
-		/* OPENBH_LOCAL_PLAYBACK_V5: automatic for local video; opt out only on trouble. */
-		const bool fast_pause_test = !g_file_test("/tmp/openbh_disable_fast_pause", G_FILE_TEST_EXISTS);
-		gint64 fast_pause_ns = -1;
-		const bool fast_pause_have_pts = fast_pause_test &&
-			gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &fast_pause_ns) &&
-			fast_pause_ns >= 0;
-		const gint64 pause_begin_us = g_get_monotonic_time();
-		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] local movie PAUSE requested");
-		GstStateChangeReturn result = gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
-		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] pause set_state result=%s elapsed_ms=%lld",
-			gst_element_state_change_return_get_name(result),
-			(long long)((g_get_monotonic_time() - pause_begin_us) / 1000));
-		if (result == GST_STATE_CHANGE_FAILURE)
-		{
-			eWarning("[OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] failed to pause local movie");
-			return -1;
-		}
-		if (fast_pause_test)
-		{
-			bool fast_pause_flushed = false;
-			if (fast_pause_have_pts)
-			{
-				fast_pause_flushed = gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME,
-					(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
-					GST_SEEK_TYPE_SET, fast_pause_ns,
-					GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
-				if (fast_pause_flushed)
-					m_openbh_fast_pause_target_ns = fast_pause_ns;
-			}
-			eDebug("[OPENBH_LOCAL_FAST_PAUSE_V4] pause flush=%d valid_pos=%d target_ms=%lld elapsed_ms=%lld",
-				(int)fast_pause_flushed, (int)fast_pause_have_pts,
-				(long long)(fast_pause_have_pts ? fast_pause_ns / GST_MSECOND : -1),
-				(long long)((g_get_monotonic_time() - pause_begin_us) / 1000));
-		}
-		setHDAudioAuxState(m_gst_playbin, GST_STATE_PAUSED);
-		m_prev_decoder_time = -1;
-		m_decoder_time_valid_state = 0;
-		return 0;
-	}
-
-
+    // OPENATV_FULLPORT_1: local files must not execute trickSeek's blocking
+    // gst_element_get_state(1s) and audio-track recovery on the UI thread.
+    if (!m_sourceinfo.is_streaming && !m_is_live && m_sourceinfo.is_video)
+    {
+        m_currentTrickRatio = 0.0;
+        eDebug("[OPENATV_FULLPORT_1] PAUSE queued");
+        gst_element_call_async(m_gst_playbin, openatv_port_set_pipeline_state,
+                               GINT_TO_POINTER(GST_STATE_PAUSED), NULL);
+        return 0;
+    }
 	eDebug("[eServiceMP3] pause");
 	trickSeek(0.0);
 
@@ -3424,96 +3117,20 @@ RESULT eServiceMP3::pause()
 
 RESULT eServiceMP3::unpause()
 {
-
-    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-        if (!m_gst_playbin || m_state != stRunning) return -1;
-        m_paused = false;
-        m_currentTrickRatio = 1.0;
-        m_prev_decoder_time = -1;
-        m_decoder_time_valid_state = 0;
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] RESUME queued (UI thread returns immediately)");
-        openbhV10QueueState(m_gst_playbin, GST_STATE_PLAYING);
-        return 0;
-    }
-
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
-	/* [OPENBH_LOCAL_MOVIE_PAUSE_RESUME_V1] Ordinary local video only: pause/resume is
-	 * a GStreamer state transition, NOT a flushing seek. The old
-	 * trickSeek() resume fallback can restart preroll on a keyframe
-	 * and leave the Amlogic decoder stuck after a normal pause.
-	 * Keep legacy behavior for network streams, audio-only, and
-	 * fast/slow/reverse playback. */
-	const bool openbh_local_movie = !m_sourceinfo.is_audio &&
-		!m_ref.path.empty() &&
-		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
-	if (openbh_local_movie && m_currentTrickRatio == 1.0)
-	{
-		/* [OPENBH_LOCAL_MOVIE_RESUME_V2] Restore decoding with the same
-		 * FLUSH + KEY_UNIT seek mechanism used by right-arrow seeking.
-		 * A state-only PAUSED -> PLAYING transition is not sufficient on
-		 * some Amlogic native video sinks after a buffered pause.
-		 * The seek targets the CURRENT paused position, not a skip ahead. */
-		/* OPENBH_LOCAL_FAST_PAUSE_V4: do not re-query a keyframe-snapped
-		 * position after an accurate fast-pause flush. Remember the requested
-		 * pause position until playback resumes or the user seeks elsewhere. */
-		const bool accurate_resume = m_openbh_fast_pause_target_ns >= 0;
-		const gint64 accurate_ns = m_openbh_fast_pause_target_ns;
-		pts_t resume_pts = 0;
-		const bool have_resume_pts = accurate_resume || (getRawPlayPosition(resume_pts) >= 0);
-		if (accurate_resume)
-			resume_pts = (pts_t)(accurate_ns / 11111LL);
-		const gint64 begin_us = g_get_monotonic_time();
-		GstState before = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
-		const GstStateChangeReturn prior =
-			gst_element_get_state(m_gst_playbin, &before, &pending, 0);
-		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] resume requested: state=%s pending=%s status=%s pts=%lld valid=%d",
-			gst_element_state_get_name(before), gst_element_state_get_name(pending),
-			gst_element_state_change_return_get_name(prior),
-			(long long)resume_pts, (int)have_resume_pts);
-
-		/* Match the existing trickSeek recovery sequence: PLAYING first,
-		 * then a flushing key-unit seek. Never wait for a blocking state
-		 * transition from the Enigma2 UI/event thread. */
-		const GstStateChangeReturn result =
-			gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-		if (result == GST_STATE_CHANGE_FAILURE)
-		{
-			eWarning("[OPENBH_LOCAL_MOVIE_RESUME_V2] GST_STATE_PLAYING failed");
-			return -1;
-		}
-
-		bool flushed = false;
-		if (have_resume_pts)
-		{
-			const gint64 resume_ns = accurate_resume ? accurate_ns : (gint64)resume_pts * 11111LL;
-			const GstSeekFlags seek_flags = (GstSeekFlags)(GST_SEEK_FLAG_FLUSH |
-				(accurate_resume ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT));
-			flushed = gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME,
-				seek_flags,
-				GST_SEEK_TYPE_SET, resume_ns,
-				GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
-			if (flushed && getHDAudioAuxState(m_gst_playbin))
-				seekHDAudioAuxPersistent(m_gst_playbin, resume_ns);
-		}
-		if (!flushed)
-			eWarning("[OPENBH_LOCAL_MOVIE_RESUME_V2] resume flush not applied (position/seek unavailable)");
-
-		setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
-		eDebug("[OPENBH_LOCAL_FAST_PAUSE_V4] resume accurate=%d flush=%d target_ms=%lld",
-			(int)accurate_resume, (int)flushed,
-			(long long)(accurate_resume ? accurate_ns / GST_MSECOND : -1));
-		m_openbh_fast_pause_target_ns = -1;
-		m_prev_decoder_time = -1;
-		m_decoder_time_valid_state = 0;
-		eDebug("[OPENBH_LOCAL_MOVIE_RESUME_V2] resume result=%s flush=%d elapsed_ms=%lld",
-			gst_element_state_change_return_get_name(result), (int)flushed,
-			(long long)((g_get_monotonic_time() - begin_us) / 1000));
-		return flushed ? 0 : -1;
-	}
-
-
+    // OPENATV_FULLPORT_1: direct resume from PAUSED; no keyframe seek.
+    if (!m_sourceinfo.is_streaming && !m_is_live && m_sourceinfo.is_video)
+    {
+        m_currentTrickRatio = 1.0;
+        m_prev_decoder_time = -1;
+        m_decoder_time_valid_state = 0;
+        eDebug("[OPENATV_FULLPORT_1] RESUME queued");
+        gst_element_call_async(m_gst_playbin, openatv_port_set_pipeline_state,
+                               GINT_TO_POINTER(GST_STATE_PLAYING), NULL);
+        return 0;
+    }
 	/* no need to unpase if we are not paused already */
 	if (m_currentTrickRatio == 1.0 && !m_paused)
 	{
@@ -3551,25 +3168,15 @@ RESULT eServiceMP3::getLength(pts_t &pts)
 
 RESULT eServiceMP3::seekToImpl(pts_t to, bool accurate)
 {
-		/* Explicit seek supersedes the previous saved fast-pause point. */
-	m_openbh_fast_pause_target_ns = -1;
-	/* convert pts to nanoseconds */
+		/* convert pts to nanoseconds */
+    // OPENATV_FULLPORT_1: local playback should resume at the requested frame,
+    // rather than at an earlier keyframe. Network/trickplay behavior unchanged.
+    if (!m_is_live && !m_sourceinfo.is_streaming && m_sourceinfo.is_video &&
+        m_currentTrickRatio == 1.0)
+        accurate = true;
 	m_last_seek_pos = to * 11111LL;
-	/* OPENBH_LOCAL_PLAYBACK_V6D: seek saved positions precisely on local
-	 * videos. Streaming and trick-play retain their existing key-unit policy. */
-	const bool local_exact_seek = !m_sourceinfo.is_audio && !m_is_live &&
-		!m_ref.path.empty() &&
-		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0) &&
-		m_currentTrickRatio == 1.0;
-	const GstSeekFlags openbh_v6_seek_flags = (GstSeekFlags)(GST_SEEK_FLAG_FLUSH |
-		((accurate || local_exact_seek) ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT));
-
-    const bool openatv_v8_exact = openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio);
-    const GstSeekFlags openatv_v8_seek_flags = openatv_v8_exact ?
-        (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE) :
-        openbh_v6_seek_flags;
 	if (!gst_element_seek (m_gst_playbin, m_currentTrickRatio, GST_FORMAT_TIME,
-		openatv_v8_seek_flags,
+		(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | (accurate ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT)),
 		GST_SEEK_TYPE_SET, m_last_seek_pos,
 		GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE))
 	{
@@ -3577,20 +3184,6 @@ RESULT eServiceMP3::seekToImpl(pts_t to, bool accurate)
 		return -1;
 	}
 
-	/* OPENBH_LOCAL_PLAYBACK_V5: show the target immediately while the
-	 * local-file seek completes asynchronously. The initial hardware sink
-	 * decoder-time baseline must NOT be recomputed at the resume point. */
-	const bool local_video_seek = !m_sourceinfo.is_audio && !m_ref.path.empty() &&
-		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
-	if (local_video_seek && m_currentTrickRatio == 1.0)
-	{
-		m_openbh_ui_seek_target_ns = m_last_seek_pos;
-		m_openbh_ui_seek_deadline_us = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
-		m_position_correction_enabled = false;
-		m_position_baseline_provisional = -1;
-		eDebug("[OPENBH_LOCAL_PLAYBACK_V5] seek display target_ms=%lld",
-			(long long)(m_last_seek_pos / GST_MSECOND));
-	}
 	/* A seek just happened: from here on the sink/pipeline itself reports
 	 * position correctly (this is what makes a manual seek "fix" the
 	 * display today), so getPlayPosition()'s one-time startup correction is
@@ -3625,17 +3218,6 @@ RESULT eServiceMP3::seekToImpl(pts_t to, bool accurate)
 		m_event((iPlayableService*)this, evUpdatedInfo);
 	}
 
-    if (openatv_v8_exact) {
-        ++m_subtitle_generation;
-        m_subtitle_sync_timer->stop();
-        m_dvb_subtitle_sync_timer->stop();
-        m_subtitle_pages.clear();
-        m_dvb_subtitle_pages.clear();
-        m_prev_decoder_time = -1;
-        m_decoder_time_valid_state = 0;
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] accurate seek pts=%lld", (long long)to);
-    }
-
 	return 0;
 }
 
@@ -3658,8 +3240,6 @@ RESULT eServiceMP3::trickSeek(gdouble ratio)
 {
 	if (!m_gst_playbin)
 		return -1;
-	/* Trick play supersedes the previous saved fast-pause point. */
-	m_openbh_fast_pause_target_ns = -1;
 	GstState state, pending;
 	if (ratio > -0.01 && ratio < 0.01)
 	{
@@ -3932,74 +3512,25 @@ RESULT eServiceMP3::getRawPlayPosition(pts_t &pts)
 RESULT eServiceMP3::getPlayPosition(pts_t &pts)
 {
 
-    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-        if (!m_gst_playbin || m_state != stRunning)
-            return -1;
-        /* During a native sink state/text transition, position queries can
-         * wait on locks held by the streaming thread. Keep last good UI
-         * value rather than blocking the Enigma2 GUI. */
-        gint64 *v10_cached_pts = (gint64 *)g_object_get_data(
-            G_OBJECT(m_gst_playbin), "openbh-v10-last-play-pts");
-        if (openbhV10Busy(m_gst_playbin)) {
-            if (v10_cached_pts) {
-                pts = (pts_t)*v10_cached_pts;
-                return 0;
-            }
-            return -1;
-        }
-        if (openatv_v8_position(m_gst_playbin, pts)) {
-            if (!v10_cached_pts) {
-                v10_cached_pts = g_new(gint64, 1);
-                g_object_set_data_full(G_OBJECT(m_gst_playbin),
-                    "openbh-v10-last-play-pts", v10_cached_pts, (GDestroyNotify)g_free);
-            }
-            *v10_cached_pts = (gint64)pts;
+    // OPENATV_FULLPORT_1: avoid an artificial startup baseline for local files.
+    // PTS is GStreamer's media timeline (the same domain as subtitle buffers).
+    if (m_gst_playbin && m_state == stRunning && !m_is_live &&
+        !m_sourceinfo.is_streaming && m_sourceinfo.is_video)
+    {
+        gint64 video_ns = GST_CLOCK_TIME_NONE;
+        if (gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &video_ns) &&
+            video_ns >= 0 && GST_CLOCK_TIME_IS_VALID((GstClockTime)video_ns))
+        {
+            pts = (pts_t)gst_util_uint64_scale((guint64)video_ns, 90000, GST_SECOND);
             return 0;
         }
-        /* Keep last known position temporarily if the asynchronous seek is
-         * still completing, instead of claiming playback is at zero. */
-        if (m_last_seek_pos > 0) {
-            pts = (pts_t)(m_last_seek_pos / 11111LL);
+        // If a saved-position seek is still pending, don't display a bogus 0.
+        if (m_pending_start_position > 0)
+        {
+            pts = m_pending_start_position;
             return 0;
         }
-        return -1;
     }
-
-	/* OPENBH_LOCAL_PLAYBACK_V5: local MP4/MKV use playbin time, which
-	 * is the seek timeline. The sink's raw decoder time may be stale or
-	 * nonzero-based during startup and after an early resume seek. */
-	const bool local_video = !m_sourceinfo.is_audio && !m_ref.path.empty() &&
-		(m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0);
-	if (local_video && m_gst_playbin && m_state == stRunning)
-	{
-		gint64 pos_ns = -1;
-		const bool queried = gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &pos_ns) && pos_ns >= 0;
-		if (m_openbh_ui_seek_target_ns >= 0)
-		{
-			const gint64 target = m_openbh_ui_seek_target_ns;
-			const gint64 distance = queried ? (pos_ns >= target ? pos_ns - target : target - pos_ns) : G_MAXINT64;
-			if (queried && distance <= 2 * GST_SECOND)
-			{
-				m_openbh_ui_seek_target_ns = -1;
-				m_openbh_ui_seek_deadline_us = 0;
-			}
-			else if (g_get_monotonic_time() < m_openbh_ui_seek_deadline_us)
-			{
-				pts = (pts_t)(target / 11111LL);
-				return 0;
-			}
-			else
-			{
-				m_openbh_ui_seek_target_ns = -1;
-				m_openbh_ui_seek_deadline_us = 0;
-			}
-		}
-		if (queried)
-		{
-			pts = (pts_t)(pos_ns / 11111LL);
-			return 0;
-		}
-	}
 	pts_t raw;
 	RESULT res = getRawPlayPosition(raw);
 	if (res < 0)
@@ -5285,27 +4816,31 @@ bool pipelineSettledInPlaying(GstElement *pipeline)
 /* See applySubtitleStreamSwitch()'s own header comment in the .h. */
 void eServiceMP3::applySubtitleStreamSwitch()
 {
-    /* OPENBH_OPENATV_LOCAL_MOVIE_V10: avoid synchronous input-selector
-     * reconfiguration and subsequent FLUSH seek from Enigma2's UI thread.
-     * A new track may display only when its next cue arrives. */
-    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-        if (!m_gst_playbin) return;
-        m_subtitle_switch_needs_flush = false;
-        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V10] subtitle selected track=%d queued",
-            m_currentSubtitleStream);
-        openbhV10QueueText(m_gst_playbin, m_currentSubtitleStream);
-        return;
-    }
+    // OPENATV_FULLPORT_1: text pad selection is deferred until PLAYING by
+    // enableSubtitles() / gstBusCall(), as in the recovered OpenATV source.
+    if (!m_gst_playbin || m_currentSubtitleStream < 0) return;
+    g_object_set(G_OBJECT(m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
 
-	g_object_set(G_OBJECT(m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
-	if (m_subtitle_switch_needs_flush)
-	{
-		if (!m_is_live && !flushNearCurrentPosition())
-			eDebug("[eServiceMP3] applySubtitleStreamSwitch: flush failed - new subtitle stream may not "
-				"appear until its own next cue");
-	}
-	eDebug("[eServiceMP3] applySubtitleStreamSwitch: switched to subtitle stream %i (generation %d)",
-		m_currentSubtitleStream, m_subtitle_generation.load());
+    // The input selector may only stage its active-pad switch until the next
+    // subtitle cue. Force a harmless downstream custom event in a worker.
+    GstPad *textPad = NULL;
+    if (g_signal_lookup("get-text-pad", G_OBJECT_TYPE(m_gst_playbin)))
+        g_signal_emit_by_name(m_gst_playbin, "get-text-pad", m_currentSubtitleStream, &textPad);
+    if (textPad)
+    {
+        GstElement *selector = gst_pad_get_parent_element(textPad);
+        if (selector)
+        {
+            gst_element_call_async(selector, openatv_port_force_selector_commit,
+                                   textPad, (GDestroyNotify)gst_object_unref);
+            gst_object_unref(selector);
+        }
+        else
+            gst_object_unref(textPad);
+    }
+    m_subtitle_switch_needs_flush = false;
+    eDebug("[OPENATV_FULLPORT_1] subtitle selector track=%d generation=%d",
+           m_currentSubtitleStream, m_subtitle_generation.load());
 }
 
 int eServiceMP3::selectAudioStream(int i, bool skipAudioFix)
@@ -5810,7 +5345,23 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						loadCuesheet();
 					updateEpgCacheNowNext();
 
-					if (m_pip_decoder < 0 && (!videoSink || m_ref.getData(0) == 2)) // show radio pic
+					/* MOVIE_ALSA_V3_VIDEO: this OpenBH branch only discovers
+					 * GstDVBVideoSink. The selected Dreambox Amlogic sink
+					 * (movie_amlogic_video) is NOT that type, so videoSink is
+					 * NULL even during working local movie playback. Do not
+					 * open a second DVB still-picture decoder over the movie. */
+					bool has_movie_amlogic_video = false;
+					if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
+					{
+						GstElement *movie_video_sink = NULL;
+						g_object_get(G_OBJECT(m_gst_playbin), "video-sink", &movie_video_sink, NULL);
+						if (movie_video_sink)
+						{
+							has_movie_amlogic_video = !strcmp(GST_OBJECT_NAME(movie_video_sink), "movie_amlogic_video");
+							gst_object_unref(movie_video_sink); /* g_object_get returns a new ref */
+						}
+					}
+					if (m_pip_decoder < 0 && ((!videoSink && !has_movie_amlogic_video) || m_ref.getData(0) == 2)) // show radio pic
 					{
 						bool showRadioBackground = eConfigManager::getConfigBoolValue("config.misc.showradiopic", true);
 						std::string radio_pic = eConfigManager::getConfigValue(showRadioBackground ? "config.misc.radiopic" : "config.misc.blackradiopic");
@@ -5936,20 +5487,6 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 					 * evResumed and whatever evStart/evGstreamerStart this
 					 * session held back for it - see fireDeferredStartEvents(). */
 					tryApplyPendingStartOffset();
-					/* OPENBH_LOCAL_PLAYBACK_V6D: initial local playback position diagnostic.
-					 * Never reset a saved seek position. */
-					if (!m_initial_start && !m_is_live && !m_sourceinfo.is_audio &&
-					    !m_ref.path.empty() &&
-					    (m_ref.path[0] == '/' || m_ref.path.compare(0, 7, "file://") == 0))
-					{
-					    gint64 startup_position_ns = -1;
-					    const bool position_ok = gst_element_query_position(m_gst_playbin,
-					        GST_FORMAT_TIME, &startup_position_ns) && startup_position_ns >= 0;
-					    eDebug("[OPENBH_LOCAL_PLAYBACK_V6D] startup first_playing_ms=%lld saved_seek_ms=%lld",
-					        (long long)(position_ok ? startup_position_ns / GST_MSECOND : -1),
-					        (long long)(m_last_seek_pos / GST_MSECOND));
-					    /* V8: removed V6d forced startup rewind; OpenATV uses native playback timeline. */
-					}
 
 					if (!m_initial_start)
 					{
@@ -6171,36 +5708,6 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 		{
 			if(GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
 				break;
-            /* OPENBH_OPENATV_LOCAL_MOVIE_V8: OpenATV-inspired preroll and deferred bookmark. */
-            if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-                int stage = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(m_gst_playbin), "openatv-v8-start-stage"));
-                if (stage == 1) {
-                    const pts_t pending = m_pending_start_position;
-                    if (pending > 0) {
-                        /* Native seek is nonblocking and stays in PAUSED until
-                         * its own ASYNC_DONE, so no first-frame at 0. */
-                        if (seekToImpl(pending, true) >= 0) {
-                            m_pending_start_position = -1;
-                            if (m_start_events_deferred)
-                                fireDeferredStartEvents();
-                            g_object_set_data(G_OBJECT(m_gst_playbin), "openatv-v8-start-stage", GINT_TO_POINTER(2));
-                            eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] initial bookmark seek pending=%lld", (long long)pending);
-                            /* Continue normal ASYNC_DONE stream enumeration;
-                             * stopping it here prevents subtitle discovery. */
-                        }
-                        eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] initial bookmark seek rejected, continue normally");
-                    }
-                    g_object_set_data(G_OBJECT(m_gst_playbin), "openatv-v8-start-stage", NULL);
-                    gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-                    eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] preroll complete, PLAYING");
-                } else if (stage == 2) {
-                    g_object_set_data(G_OBJECT(m_gst_playbin), "openatv-v8-start-stage", NULL);
-                    m_event((iPlayableService*)this, evResumed);
-                    gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-                    eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] initial bookmark prerolled, PLAYING");
-                }
-            }
-
 
 			if (m_audio_switch_flush_phase == AudioSwitchFlushWaitSeek)
 			{
@@ -7370,46 +6877,6 @@ void eServiceMP3::gstTextpadHasCAPS_synced(GstPad *pad)
 
 void eServiceMP3::pullSubtitle(GstBuffer *buffer)
 {
-
-    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio) && buffer && m_currentSubtitleStream >= 0 &&
-        m_currentSubtitleStream < (int)m_subtitleStreams.size()) {
-        GstMapInfo map;
-        if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
-        const int kind = m_subtitleStreams[m_currentSubtitleStream].type;
-        const GstClockTime start = GST_BUFFER_PTS(buffer);
-        const GstClockTime dur = GST_BUFFER_DURATION(buffer);
-        if (GST_CLOCK_TIME_IS_VALID(start)) {
-            if (kind == stDVB) {
-                m_dvb_subtitle_parser->processBuffer(map.data, map.size, start / GST_MSECOND);
-            } else if (kind < stVOB) {
-                const uint32_t start_ms = (uint32_t)(start / GST_MSECOND);
-                /* Some MKV text buffers report a valid *zero* duration.
-                 * A zero-length page is discarded by the renderer. */
-                const uint32_t duration_ms =
-                    (GST_CLOCK_TIME_IS_VALID(dur) && dur >= GST_MSECOND) ?
-                    (uint32_t)(dur / GST_MSECOND) : 2500U;
-                std::string line((const char*)map.data, map.size);
-                if (!line.empty() && line[line.length()-1] == '\n')
-                    line.erase(line.length()-1);
-                const uint32_t end_ms = start_ms + duration_ms;
-                m_subtitle_pages.insert(subtitle_pages_map_pair_t(end_ms,
-                    subtitle_page_t(start_ms, end_ms, line)));
-                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] text queued start=%u duration=%u end=%u pages=%zu widget=%d",
-                    start_ms, duration_ms, end_ms, (size_t)m_subtitle_pages.size(),
-                    m_subtitle_widget ? 1 : 0);
-                m_subtitle_sync_timer->start(20, true);
-            }
-            static unsigned v8_sub_debug = 0;
-            if (v8_sub_debug++ < 20)
-                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] embedded subtitle type=%d pts_ms=%lld size=%zu",
-                    kind, (long long)(start / GST_MSECOND), (size_t)map.size);
-        } else {
-            eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V8] invalid embedded subtitle PTS kind=%d", kind);
-        }
-        gst_buffer_unmap(buffer, &map);
-        return;
-    }
-
 	if (buffer && m_currentSubtitleStream >= 0 && m_currentSubtitleStream < (int)m_subtitleStreams.size())
 	{
 		GstMapInfo map;
@@ -7418,10 +6885,22 @@ void eServiceMP3::pullSubtitle(GstBuffer *buffer)
 			eLog(3, "[eServiceMP3] pullSubtitle gst_buffer_map failed");
 			return;
 		}
-		int64_t buf_pos = GST_BUFFER_PTS(buffer);
+        int64_t buf_pos = GST_BUFFER_PTS(buffer);
+        if (!GST_CLOCK_TIME_IS_VALID((GstClockTime)buf_pos))
+        {
+            eDebug("[OPENATV_FULLPORT_1] subtitle buffer has no PTS; skipped");
+            gst_buffer_unmap(buffer, &map);
+            return;
+        }
 		size_t len = map.size;
 		eTrace("[eServiceMP3] gst_buffer_get_size %zu map.size %zu", gst_buffer_get_size(buffer), len);
-		int64_t duration_ns = GST_BUFFER_DURATION(buffer);
+        int64_t duration_ns = GST_BUFFER_DURATION(buffer);
+        // OPENATV_FULLPORT_1: GStreamer uses a UINT64_MAX sentinel for
+        // unknown duration. In the legacy uint32_t maths this wrapped to a
+        // negative/zero end time, permanently dropping embedded text cues.
+        if (!GST_CLOCK_TIME_IS_VALID((GstClockTime)duration_ns) || duration_ns <= 0)
+            duration_ns = 2500LL * GST_MSECOND;
+
 		int subType = m_subtitleStreams[m_currentSubtitleStream].type;
 		eTrace("[eServiceMP3] pullSubtitle type=%d size=%zu", subType, len);
 		if ( subType )
@@ -7474,9 +6953,9 @@ void eServiceMP3::pushDVBSubtitles()
 	/* show_time comes from raw GStreamer buffer PTS (see pullSubtitle()), so
 	 * this must be compared against the same raw domain, not the
 	 * display-corrected getPlayPosition(). */
-	if ((openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio) &&
-                openatv_v8_position(m_gst_playbin, running_pts)) ? false :
-                getRawPlayPosition(running_pts) < 0)
+	if ((!m_sourceinfo.is_streaming && !m_is_live && m_sourceinfo.is_video)
+            ? getPlayPosition(running_pts) < 0
+            : getRawPlayPosition(running_pts) < 0)
 		eTrace("[eServiceMP3] Cant get current decoder time.");
 
 	while (1)
@@ -7514,70 +6993,6 @@ void eServiceMP3::pushDVBSubtitles()
 
 void eServiceMP3::pushSubtitles()
 {
-    /* OPENBH_OPENATV_LOCAL_MOVIE_V9: subtitles for local files use GstBuffer PTS / GStreamer time.
-     * Avoid OpenBH's native decoder clock stability gate for this case.
-     * Each page is consumed once (no repeated setPage calls). */
-    if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio)) {
-        if (m_currentSubtitleStream < 0 ||
-            m_currentSubtitleStream >= (int)m_subtitleStreams.size())
-            return;
-        if (m_paused || openbhV10Busy(m_gst_playbin)) {
-            m_subtitle_sync_timer->start(150, true);
-            return;
-        }
-        pts_t now_pts = 0;
-        if (!openatv_v8_position(m_gst_playbin, now_pts)) {
-            static unsigned v9_clock_fail_count = 0;
-            if (v9_clock_fail_count++ < 8)
-                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] subtitle clock unavailable, queue=%zu",
-                    (size_t)m_subtitle_pages.size());
-            m_subtitle_sync_timer->start(100, true);
-            return;
-        }
-        const int64_t now_ms = now_pts / 90;
-        int32_t retry_ms = 1000;
-        for (subtitle_pages_map_t::iterator it = m_subtitle_pages.begin();
-             it != m_subtitle_pages.end();) {
-            const int64_t start_ms = it->second.start_ms;
-            const int64_t end_ms = it->second.end_ms;
-            if (end_ms <= now_ms || end_ms <= start_ms) {
-                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] subtitle expired now=%lld start=%lld end=%lld",
-                    (long long)now_ms, (long long)start_ms, (long long)end_ms);
-                m_subtitle_pages.erase(it++);
-                continue;
-            }
-            if (now_ms + 20 < start_ms) {
-                int64_t delta = start_ms - now_ms;
-                if (delta < retry_ms) retry_ms = (int32_t)delta;
-                break;
-            }
-            if (m_paused) {
-                retry_ms = 100;
-                break;
-            }
-            if (m_subtitle_widget) {
-                ePangoSubtitlePage page;
-                gRGB color(0xD0, 0xD0, 0xD0);
-                page.m_elements.push_back(ePangoSubtitlePageElement(
-                    color, it->second.text.c_str()));
-                page.m_show_pts = start_ms * 90;
-                page.m_timeout = (int)(end_ms - now_ms);
-                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] RENDER subtitle now=%lld start=%lld end=%lld timeout=%d",
-                    (long long)now_ms, (long long)start_ms, (long long)end_ms,
-                    page.m_timeout);
-                m_subtitle_widget->setPage(page);
-            } else {
-                eDebug("[OPENBH_OPENATV_LOCAL_MOVIE_V9] subtitle renderer missing now=%lld start=%lld",
-                    (long long)now_ms, (long long)start_ms);
-            }
-            m_subtitle_pages.erase(it++);
-        }
-        if (retry_ms < 20) retry_ms = 20;
-        if (retry_ms > 1000) retry_ms = 1000;
-        m_subtitle_sync_timer->start(retry_ms, true);
-        return;
-    }
-
 	pts_t running_pts = 0;
 	int32_t next_timer = 0, decoder_ms, start_ms, end_ms, diff_start_ms, diff_end_ms;
 	subtitle_pages_map_t::iterator current;
@@ -7590,9 +7005,9 @@ void eServiceMP3::pushSubtitles()
 	/* start_ms/end_ms below come from raw GStreamer buffer PTS (see
 	 * pullSubtitle()), so this must be compared against the same raw domain,
 	 * not the display-corrected getPlayPosition(). */
-	if ((openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio) &&
-                openatv_v8_position(m_gst_playbin, running_pts)) ? false :
-                getRawPlayPosition(running_pts) < 0)
+	if ((!m_sourceinfo.is_streaming && !m_is_live && m_sourceinfo.is_video)
+            ? getPlayPosition(running_pts) < 0
+            : getRawPlayPosition(running_pts) < 0)
 		m_decoder_time_valid_state = 0;
 
 	if (m_decoder_time_valid_state < 4)
@@ -7669,7 +7084,9 @@ void eServiceMP3::pushSubtitles()
 			pango_page.m_show_pts = start_ms * 90;			// actually completely unused by widget!
 			pango_page.m_timeout = end_ms - decoder_ms;		// take late start into account
 
-			m_subtitle_widget->setPage(pango_page);
+			eDebug("[OPENATV_FULLPORT_1] SUB_RENDER start_ms=%d clock_ms=%d timeout_ms=%d",
+                start_ms, decoder_ms, pango_page.m_timeout);
+            m_subtitle_widget->setPage(pango_page);
 		}
 
 		//eDebug("[eServiceMP3] *** no next sub scheduled, check NEXT subtitle");
@@ -7717,10 +7134,9 @@ RESULT eServiceMP3::enableSubtitles(iSubtitleUser *user, struct SubtitleTrack &t
 	const bool wasAlreadyShowingSubtitles = (m_currentSubtitleStream >= 0);
 
 	if (m_subtitle_widget) m_subtitle_widget->clearPage();
-	/* V10: local movie goes directly to the newly selected text stream.
-     * Avoid a synchronous -1 selector transition before the async switch. */
-    if (!openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio))
-        g_object_set(G_OBJECT(m_gst_playbin), "current-text", -1, NULL);
+    // OPENATV_FULLPORT_1: do not switch via -1 (it arms a second pending
+    // input-selector pad switch and can deadlock a subsequent flush).
+
 	m_subtitle_sync_timer->stop();
 	m_dvb_subtitle_sync_timer->stop();
 	m_dvb_subtitle_pages.clear();
@@ -7781,10 +7197,7 @@ RESULT eServiceMP3::disableSubtitles()
 	m_currentSubtitleStream = -1;
 	m_cachedSubtitleStream = m_currentSubtitleStream;
 	setCacheEntry(false, -1);
-	if (openatv_v8_is_local_movie(m_ref, m_is_live, m_sourceinfo.is_audio))
-        openbhV10QueueText(m_gst_playbin, -1);
-    else
-        g_object_set(G_OBJECT(m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
+	g_object_set (G_OBJECT (m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
 	m_subtitle_sync_timer->stop();
 	m_dvb_subtitle_sync_timer->stop();
 	m_subtitle_pages.clear();
