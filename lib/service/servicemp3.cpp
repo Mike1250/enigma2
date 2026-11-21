@@ -1,45 +1,75 @@
-	/* note: this requires gstreamer 0.10.x and a big list of plugins. */
-	/* it's currently hardcoded to use a big-endian alsasink as sink. */
+/*
+Copyright (c) 2025 jbleyel and others
+
+This code may be used commercially. Attribution must be given to the original author.
+Licensed under GPLv2.
+*/
+
+
+/* OpenBH DreamTwo compatibility port from OpenATV commit 2a0b702a9b4c1dfad028d3fadaf62f0fb69130cf.
+ * BASE IS THE FULL OpenATV servicemp3.cpp; the OPENBH_2A0B702 blocks address
+ * missing OpenBH interfaces and DreamTwo sink selection. See README for scope. */
+/* note: this requires gstreamer 0.10.x and a big list of plugins. */
+/* it's currently hardcoded to use a big-endian alsasink as sink. */
+#include <inttypes.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <lib/base/ebase.h>
 #include <lib/base/eerror.h>
-#include <lib/base/init_num.h>
+#include <lib/base/estring.h>
 #include <lib/base/init.h>
+#include <lib/base/init_num.h>
 #include <lib/base/nconfig.h>
 #include <lib/base/object.h>
-#include <lib/dvb/epgcache.h>
-#include <lib/dvb/decoder.h>
-#ifdef HAVE_EGL
-#include <lib/gdi/egl/gegldc.h>
-#endif
-#include <lib/dvb/dvb.h>
-#include <lib/dvb/db.h>
 #include <lib/components/file_eraser.h>
+#include <lib/dvb/db.h>
+#include <lib/dvb/decoder.h>
+#include <lib/dvb/epgcache.h>
+#include <lib/dvb/subtitle.h>
+#include <lib/gdi/gpixmap.h>
 #include <lib/gui/esubtitle.h>
+#include <lib/service/service.h>
 #include <lib/service/servicemp3.h>
 #include <lib/service/servicemp3record.h>
-#include <lib/service/service.h>
-#ifdef HAS_SOFTWARE_HDR_DETECTION
-#include <lib/service/hevc_hdr.h>
-#endif
-#include <lib/gdi/gpixmap.h>
-#include <lib/dvb/subtitle.h>
+#include <lib/service/servicedvb.h>
 
 #include <lib/base/cfile.h>
 
-#include <string>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <string>
 #include <vector>
-#include <lib/base/estring.h>
 
 #include <gst/gst.h>
 #include <gst/pbutils/missing-plugins.h>
+#include <gst/video/video.h>
 #include <sys/stat.h>
 
+#include <sys/time.h>
+
 #define HTTP_TIMEOUT 60
+
+/* BEGIN OPENBH_2A0B702_COMPAT: OpenATV DVB-I Navigation support is absent in OpenBH.
+ * Local MKV/MP4 playback does not use DVB-I. Keep its optional metadata methods
+ * buildable but inert until the corresponding Navigation module is ported. */
+struct OpenBHNoDVBIFallbackApp {
+ int m_ControlCode = 0, m_AppId = 0, m_ProfileCode = 0, m_OrgId = 0;
+ std::string m_ApplicationName, m_HbbTVUrl;
+};
+struct OpenBHNoDVBIFallbackData {
+ int tsid = 0, onid = 0, sid = 0;
+ std::vector<OpenBHNoDVBIFallbackApp> applications;
+};
+struct eDVBIFallback {
+ static bool hasSchedule(const eServiceReference &) { return false; }
+ static int availability(const eServiceReference &) { return 0; }
+ static const OpenBHNoDVBIFallbackData *applications(const eServiceReference &) { return nullptr; }
+};
+/* END OPENBH_2A0B702_COMPAT */
 
 /*
  * UNUSED variable from service reference is now used as buffer flag for gstreamer
@@ -51,1428 +81,439 @@
  *
  * Progressive download requires buffering enabled, so it's mandatory to use flag 3 not 2
  */
-typedef enum
-{
-	BUFFERING_ENABLED	= 0x00000001,
-	PROGRESSIVE_DOWNLOAD	= 0x00000002
-} eServiceMP3Flags;
+typedef enum { BUFFERING_ENABLED = 0x00000001, PROGRESSIVE_DOWNLOAD = 0x00000002 } eServiceMP3Flags;
+
+// Worker-verified DVB-I media hints in data[7]; low buffering bits stay unchanged.
+enum { DVB_I_DASH = 0x100, DVB_I_HLS = 0x200, DVB_I_MEDIA_MASK = 0x300 };
 
 /*
  * GstPlayFlags flags from playbin2. It is the policy of GStreamer to
  * not publicly expose element-specific enums. That's why this
  * GstPlayFlags enum has been copied here.
  */
-typedef enum
-{
-	GST_PLAY_FLAG_VIDEO         = (1 << 0),
-	GST_PLAY_FLAG_AUDIO         = (1 << 1),
-	GST_PLAY_FLAG_TEXT          = (1 << 2),
-	GST_PLAY_FLAG_VIS           = (1 << 3),
-	GST_PLAY_FLAG_SOFT_VOLUME   = (1 << 4),
-	GST_PLAY_FLAG_NATIVE_AUDIO  = (1 << 5),
-	GST_PLAY_FLAG_NATIVE_VIDEO  = (1 << 6),
-	GST_PLAY_FLAG_DOWNLOAD      = (1 << 7),
-	GST_PLAY_FLAG_BUFFERING     = (1 << 8),
-	GST_PLAY_FLAG_DEINTERLACE   = (1 << 9),
+typedef enum {
+	GST_PLAY_FLAG_VIDEO = (1 << 0),
+	GST_PLAY_FLAG_AUDIO = (1 << 1),
+	GST_PLAY_FLAG_TEXT = (1 << 2),
+	GST_PLAY_FLAG_VIS = (1 << 3),
+	GST_PLAY_FLAG_SOFT_VOLUME = (1 << 4),
+	GST_PLAY_FLAG_NATIVE_AUDIO = (1 << 5),
+	GST_PLAY_FLAG_NATIVE_VIDEO = (1 << 6),
+	GST_PLAY_FLAG_DOWNLOAD = (1 << 7),
+	GST_PLAY_FLAG_BUFFERING = (1 << 8),
+	GST_PLAY_FLAG_DEINTERLACE = (1 << 9),
 	GST_PLAY_FLAG_SOFT_COLORBALANCE = (1 << 10),
 	GST_PLAY_FLAG_FORCE_FILTERS = (1 << 11),
 } GstPlayFlags;
 
-namespace
-{
+/* static declarations */
+static bool first_play_eServicemp3 = false;
+static GstElement *dvb_audiosink, *dvb_videosink, *dvb_subsink;
+static bool dvb_audiosink_ok, dvb_videosink_ok, dvb_subsink_ok;
 
-bool isDTSStartupSkipbackContainer(const std::string &path)
+static std::string gstLaunchQuote(const std::string& value)
 {
-	size_t end = path.find_first_of("?#");
-	if (end == std::string::npos)
-		end = path.size();
-	size_t dot = path.rfind('.', end);
-	if (dot == std::string::npos || dot + 1 >= end)
-		return false;
-	const std::string ext = path.substr(dot, end - dot);
-	return !strcasecmp(ext.c_str(), ".mkv") || !strcasecmp(ext.c_str(), ".mp4");
+	std::string quoted = "\"";
+	for (std::string::const_iterator it = value.begin(); it != value.end(); ++it) {
+		if (*it == '\\' || *it == '"')
+			quoted += '\\';
+		quoted += *it;
+	}
+	quoted += "\"";
+	return quoted;
 }
 
-struct EAC3AtmosBitReader
+static bool isDashUri(const std::string& uri)
 {
-	const guint8 *data;
-	gsize size;
-	gsize bitpos;
-	bool swap16;
-	bool ok;
+	std::string lower = uri;
+	for (std::string::iterator it = lower.begin(); it != lower.end(); ++it)
+		*it = static_cast<char>(tolower(static_cast<unsigned char>(*it)));
+	return lower.find(".mpd") != std::string::npos ||
+	       lower.find("manifest.mpd") != std::string::npos ||
+	       lower.find("application/dash+xml") != std::string::npos;
+}
 
-	EAC3AtmosBitReader(const guint8 *d, gsize s, bool swap)
-		: data(d), size(s), bitpos(0), swap16(swap), ok(true)
-	{
+/* g_object_set on missing prop logs a critical; skip for sinks that don't expose it. */
+static void gstSetBoolIfAvailable(GstElement* element, const char* property, gboolean value)
+{
+	if (!element || !property) return;
+	if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), property))
+		g_object_set(G_OBJECT(element), property, value, NULL);
+}
+
+static void gstSetStringIfAvailable(GstElement* element, const char* property, const std::string& value)
+{
+	if (!element || !property || value.empty()) return;
+	if (g_object_class_find_property(G_OBJECT_GET_CLASS(element), property))
+		g_object_set(G_OBJECT(element), property, value.c_str(), NULL);
+}
+
+/* PLAYING with no state change in flight; timeout 0, never blocks. */
+static bool pipelineSettledInPlaying(GstElement* pipeline)
+{
+	if (!pipeline) return false;
+	GstState state = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
+	gst_element_get_state(pipeline, &state, &pending, 0);
+	return state == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING;
+}
+
+/* Runs on a GStreamer pool thread, see eServiceMP3::applySubtitleStreamSwitch().
+   user_data is the text-selector sink pad; it holds one ref, released via the
+   GDestroyNotify passed to gst_element_call_async(). */
+static void forceSelectorCommit(GstElement*, gpointer user_data)
+{
+	GstPad* pad = GST_PAD(user_data);
+	gst_pad_send_event(pad, gst_event_new_custom(GST_EVENT_CUSTOM_DOWNSTREAM_OOB,
+												  gst_structure_new_empty("eServiceMP3-force-selector-commit")));
+}
+
+static GstElement* createDashPlaybackPipeline(const std::string& uri, const std::string& useragent)
+{
+	/* HW audio sink expects stream-format=raw post-aacparse. */
+	const char *vsink_factory = "dvbvideosink";
+	const char *asink_factory = "dvbaudiosink";
+	std::string pipeline =
+		"souphttpsrc name=dashsrc location=" + gstLaunchQuote(uri) + " timeout=60 retries=20 "
+		"! dashdemux name=d connection-speed=4000 max-bitrate=3200000 "
+		"max-video-width=1280 max-video-height=720 max-video-framerate=50/1 "
+		"presentation-delay=6s "
+		"d.video_00 ! queue max-size-buffers=0 max-size-bytes=4194304 max-size-time=5000000000 "
+		"! qtdemux ! h264parse "
+		"! video/x-h264,stream-format=avc,alignment=au "
+		"! " + vsink_factory + " name=dashvideosink "
+		"d.audio_00 ! queue max-size-buffers=0 max-size-bytes=1048576 max-size-time=5000000000 "
+		"! qtdemux ! aacparse "
+		"! audio/mpeg,mpegversion=4,framed=true,stream-format=raw "
+		"! " + asink_factory + " name=dashaudiosink";
+
+	GError* error = NULL;
+	GstElement* element = gst_parse_launch(pipeline.c_str(), &error);
+	if (!element) {
+		eWarning("[eServiceMP3] failed to create DASH pipeline: %s",
+		         error ? error->message : "unknown error");
+		if (error) g_error_free(error);
+		return NULL;
+	}
+	if (error) {
+		eWarning("[eServiceMP3] DASH pipeline parse warning: %s", error->message);
+		g_error_free(error);
 	}
 
-	guint read(guint bits)
-	{
-		if (!ok || bits > 32 || bitpos + bits > size * 8)
-		{
-			ok = false;
-			return 0;
-		}
-
-		guint value = 0;
-		for (guint i = 0; i < bits; ++i)
-		{
-			gsize bytepos = bitpos >> 3;
-			if (swap16)
-			{
-				gsize swapped = bytepos ^ 1;
-				if (swapped >= size)
-				{
-					ok = false;
-					return 0;
-				}
-				bytepos = swapped;
-			}
-			value = (value << 1) | ((data[bytepos] >> (7 - (bitpos & 7))) & 1);
-			++bitpos;
-		}
-		return value;
+	GstElement* source = gst_bin_get_by_name(GST_BIN(element), "dashsrc");
+	if (source) {
+		gstSetBoolIfAvailable(source, "ssl-strict", FALSE);
+		gstSetStringIfAvailable(source, "user-agent", useragent);
+		gst_object_unref(source);
 	}
+	/* e2-sync/e2-async are dvb*sink-only; no-op on dream*sinks. */
+	GstElement* vsink = gst_bin_get_by_name(GST_BIN(element), "dashvideosink");
+	if (vsink) {
+		gstSetBoolIfAvailable(vsink, "e2-sync",  FALSE);
+		gstSetBoolIfAvailable(vsink, "e2-async", FALSE);
+		gst_object_unref(vsink);
+	}
+	GstElement* asink = gst_bin_get_by_name(GST_BIN(element), "dashaudiosink");
+	if (asink) {
+		gstSetBoolIfAvailable(asink, "e2-sync",  FALSE);
+		gstSetBoolIfAvailable(asink, "e2-async", FALSE);
+		gst_object_unref(asink);
+	}
+	return element;
+}
 
-	void skip(guint bits)
-	{
-		if (!ok || bitpos + bits > size * 8)
-			ok = false;
+/*static functions */
+
+/* Handy asyncrone timers for developpers */
+/* It could be used for a hack to set somewhere a timeout which does not interupt or blocks signals */
+[[maybe_unused]] static void gst_sleepms(uint32_t msec) {
+	// does not interfere with signals like sleep and usleep do
+	struct timespec req_ts = {};
+	req_ts.tv_sec = msec / 1000;
+	req_ts.tv_nsec = (msec % 1000) * 1000000L;
+	int32_t olderrno = errno; // Some OS seem to set errno to ETIMEDOUT when sleeping
+	while (1) {
+		/* Sleep for the time specified in req_ts. If interrupted by a
+		signal, place the remaining time left to sleep back into req_ts. */
+		int rval = nanosleep(&req_ts, &req_ts);
+		if (rval == 0)
+			break; // Completed the entire sleep time; all done.
+		else if (errno == EINTR)
+			continue; // Interrupted by a signal. Try again.
 		else
-			bitpos += bits;
+			break; // Some other error; bail out.
 	}
+	errno = olderrno;
+}
+
+/**
+ * @brief Retrieves the current system time in milliseconds.
+ *
+ * This function obtains the current time using gettimeofday and returns
+ * the number of milliseconds elapsed since the Unix epoch (January 1, 1970).
+ *
+ * @return int64_t The current time in milliseconds.
+ */
+static int64_t getCurrentTimeMs() {
+	struct timeval tv;
+	gettimeofday(&tv, 0);
+	return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/**
+ * @struct audioMeta
+ * @brief Represents metadata information for an audio stream.
+ *
+ * This structure holds information about an audio track, including its index,
+ * language code, and title. It is typically used to describe audio streams
+ * in multimedia applications.
+ *
+ * @var audioMeta::index
+ *   The index of the audio stream (e.g., track number).
+ * @var audioMeta::lang
+ *   The language code of the audio stream (e.g., "eng" for English).
+ * @var audioMeta::title
+ *   The title or description of the audio stream.
+ */
+struct audioMeta {
+	int index;
+	std::string lang;
+	std::string title;
 };
 
-bool parseEAC3AtmosFrame(const guint8 *data, gsize size, bool swap16, guint &frame_size, bool &atmos)
-{
-	frame_size = 0;
-	atmos = false;
+/**
+ * @brief Parses HLS audio metadata from a file.
+ *
+ * This function reads a file containing audio track metadata in a simple key-value format,
+ * where each track is separated by a line containing "---". Each track's metadata may include
+ * fields such as "index", "lang", and "title". The function constructs a vector of audioMeta
+ * objects, each representing a parsed audio track.
+ *
+ * @param filename The path to the metadata file to parse.
+ * @return std::vector<audioMeta> A vector containing the parsed audioMeta objects.
+ *
+ * The expected file format is:
+ * @code
+ * index=0
+ * lang=eng
+ * title=English
+ * ---
+ * index=1
+ * lang=deu
+ * title=German
+ * ---
+ * @endcode
+ *
+ * @note If the file cannot be opened or is empty, an empty vector is returned.
+ */
+std::vector<audioMeta> parse_hls_audio_meta(const std::string& filename) {
+	std::ifstream file(filename);
+	std::vector<audioMeta> tracks;
+	std::string line;
+	audioMeta current;
 
-	if (!data || size < 7)
-		return false;
+	if (!file.good())
+		return tracks;
 
-	EAC3AtmosBitReader br(data, size, swap16);
-	if (br.read(16) != 0x0b77)
-		return false;
-
-	const guint frame_type = br.read(2);
-	const guint substreamid = br.read(3);
-	frame_size = (br.read(11) + 1) << 1;
-	const guint sr_code = br.read(2);
-
-	guint num_blocks = 6;
-	if (sr_code == 3)
-	{
-		const guint sr_code2 = br.read(2);
-		if (sr_code2 == 3)
-			return false;
-	}
-	else
-	{
-		static const guint blocks[4] = { 1, 2, 3, 6 };
-		num_blocks = blocks[br.read(2)];
-	}
-
-	const guint channel_mode = br.read(3);
-	const bool lfe_on = br.read(1) != 0;
-
-	/* Match FFmpeg's E-AC-3 header validity checks. */
-	if (!br.ok || frame_type == 3 || substreamid != 0 ||
-		frame_size < 7 || frame_size > size)
-		return false;
-
-	const guint bitstream_id = br.read(5);
-	if (!br.ok || bitstream_id <= 10 || bitstream_id > 16)
-		return false;
-
-	/* volume control parameters */
-	for (guint i = 0; i < (channel_mode ? 1U : 2U); ++i)
-	{
-		br.skip(5); /* dialnorm */
-		if (br.read(1))
-			br.skip(8); /* compression */
-	}
-
-	/* dependent stream channel map */
-	if (frame_type == 1)
-	{
-		if (br.read(1))
-			br.skip(16);
-	}
-
-	/* mixing metadata */
-	if (br.read(1))
-	{
-		if (channel_mode > 2)
-		{
-			br.skip(2); /* preferred downmix */
-			if (channel_mode & 1)
-				br.skip(6); /* center mix levels */
-			if (channel_mode & 4)
-				br.skip(6); /* surround mix levels */
-		}
-
-		if (lfe_on && br.read(1))
-			br.skip(5);
-
-		if (frame_type == 0)
-		{
-			for (guint i = 0; i < (channel_mode ? 1U : 2U); ++i)
-			{
-				if (br.read(1))
-					br.skip(6);
-			}
-
-			if (br.read(1))
-				br.skip(6);
-
-			switch (br.read(2))
-			{
-				case 1:
-					br.skip(5);
-					break;
-				case 2:
-					br.skip(12);
-					break;
-				case 3:
-				{
-					const guint mix_data_size = (br.read(5) + 2) << 3;
-					br.skip(mix_data_size);
-					break;
-				}
-				default:
-					break;
-			}
-
-			if (channel_mode < 2)
-			{
-				for (guint i = 0; i < (channel_mode ? 1U : 2U); ++i)
-				{
-					if (br.read(1))
-						br.skip(14);
-				}
-			}
-
-			if (br.read(1))
-			{
-				for (guint i = 0; i < num_blocks; ++i)
-				{
-					if (num_blocks == 1 || br.read(1))
-						br.skip(5);
-				}
+	while (std::getline(file, line)) {
+		if (line == "---") {
+			tracks.push_back(current);
+			current = audioMeta(); // reset
+		} else {
+			size_t eq_pos = line.find('=');
+			if (eq_pos != std::string::npos) {
+				std::string key = line.substr(0, eq_pos);
+				std::string value = line.substr(eq_pos + 1);
+				if (key == "index")
+					current.index = std::stoi(value);
+				else if (key == "lang")
+					current.lang = value;
+				else if (key == "title")
+					current.title = value;
 			}
 		}
 	}
 
-	/* informational metadata */
-	if (br.read(1))
-	{
-		br.skip(3); /* bsmod */
-		br.skip(2); /* copyright + original */
+	if (!current.title.empty())
+		tracks.push_back(current);
 
-		if (channel_mode == 2)
-			br.skip(4);
-		if (channel_mode >= 6)
-			br.skip(2);
-
-		for (guint i = 0; i < (channel_mode ? 1U : 2U); ++i)
-		{
-			if (br.read(1))
-				br.skip(8);
-		}
-
-		if (sr_code != 3)
-			br.skip(1);
-	}
-
-	if (frame_type == 0 && num_blocks != 6)
-		br.skip(1); /* converter sync */
-
-	if (frame_type == 2)
-	{
-		bool have_original_size = num_blocks == 6;
-		if (!have_original_size)
-			have_original_size = br.read(1) != 0;
-		if (have_original_size)
-			br.skip(6);
-	}
-
-	if (!br.ok)
-		return false;
-
-	/* additional bitstream info */
-	if (br.read(1))
-	{
-		const guint addbsil = br.read(6);
-		if (!br.ok || addbsil > 63)
-			return false;
-
-		br.skip(7);
-		atmos = br.ok && br.read(1) != 0;
-	}
-
-	return br.ok;
+	return tracks;
 }
 
-guint8 ac3LogicalByte(const guint8 *data, gsize pos, bool swap16)
-{
-	return swap16 ? data[pos ^ 1] : data[pos];
-}
+/**
+ * @struct SubtitleEntry
+ * @brief Represents a single subtitle entry with timing and text information.
+ *
+ * This structure holds the timing information (start and end times in milliseconds),
+ * a base timestamp for MPEG-TS to WebVTT conversion, and the subtitle text itself.
+ *
+ * Members:
+ * - start_time_ms:      Start time of the subtitle in milliseconds.
+ * - end_time_ms:        End time of the subtitle in milliseconds.
+ * - vtt_mpegts_base:    Base timestamp used for MPEG-TS to WebVTT conversion.
+ * - text:               The subtitle text to be displayed.
+ */
+struct SubtitleEntry {
+	uint64_t start_time_ms;
+	uint64_t end_time_ms;
+	uint64_t vtt_mpegts_base;
+	uint64_t local_offset_ms;
+	std::string text;
+};
 
-guint ac3CoreFrameSize(const guint8 *data, gsize size, bool swap16)
-{
-	if (!data || size < 7 ||
-		ac3LogicalByte(data, 0, swap16) != 0x0b ||
-		ac3LogicalByte(data, 1, swap16) != 0x77)
-		return 0;
-
-	const guint8 fscod_frmsizecod = ac3LogicalByte(data, 4, swap16);
-	const guint fscod = fscod_frmsizecod >> 6;
-	const guint frame_size_code = fscod_frmsizecod & 0x3f;
-	const guint bitstream_id = ac3LogicalByte(data, 5, swap16) >> 3;
-
-	if (bitstream_id > 10 || fscod == 3 || frame_size_code > 37)
-		return 0;
-
-	static const guint bitrates[19] = {
-		32, 40, 48, 56, 64, 80, 96, 112, 128, 160,
-		192, 224, 256, 320, 384, 448, 512, 576, 640
-	};
-	const guint bitrate = bitrates[frame_size_code >> 1];
-
-	switch (fscod)
-	{
-		case 0: /* 48 kHz */
-			return bitrate * 4;
-		case 1: /* 44.1 kHz */
-			return (((bitrate * 320) / 147) + (frame_size_code & 1)) * 2;
-		case 2: /* 32 kHz */
-			return bitrate * 6;
-		default:
-			return 0;
+/**
+ * @brief Parses a timecode string in the format "HH:MM:SS.mmm" into milliseconds.
+ *
+ * This function attempts to parse a timecode string (e.g., "01:23:45.678") and convert it
+ * into the total number of milliseconds. The expected format is hours, minutes, seconds,
+ * and milliseconds separated by colons and a dot.
+ *
+ * @param[in]  s      The input timecode string to parse.
+ * @param[out] ms_out The output variable that will contain the parsed time in milliseconds if parsing succeeds.
+ * @return     true if the string was successfully parsed and ms_out is set; false otherwise.
+ *
+ * @note The function expects the input string to strictly match the "HH:MM:SS.mmm" format.
+ */
+static bool parse_timecode(const std::string& s, uint64_t& ms_out) {
+	unsigned h = 0, m = 0, sec = 0, ms = 0;
+	if (sscanf(s.c_str(), "%u:%u:%u.%u", &h, &m, &sec, &ms) == 4) {
+		ms_out = ((h * 3600 + m * 60 + sec) * 1000 + ms);
+		return true;
 	}
-}
-
-bool eac3FrameSetHasAtmos(const guint8 *data, gsize size, bool swap16)
-{
-	gsize offset = 0;
-
-	/*
-	 * Some E-AC-3 container packets begin with an AC-3-compatible core
-	 * syncframe followed by the E-AC-3 extension. FFmpeg identifies the
-	 * core by bsid <= 10. Skip it by its declared AC-3 frame size, then
-	 * inspect only subsequent real E-AC-3 frame boundaries.
-	 */
-	for (guint frame = 0; frame < 8 && offset + 7 <= size; ++frame)
-	{
-		const guint8 byte5 = ac3LogicalByte(data + offset, 5, swap16);
-		const guint bitstream_id = byte5 >> 3;
-
-		if (bitstream_id <= 10)
-		{
-			const guint frame_size = ac3CoreFrameSize(data + offset, size - offset, swap16);
-			if (!frame_size || frame_size > size - offset)
-				break;
-
-			offset += frame_size;
-			continue;
-		}
-
-		guint frame_size = 0;
-		bool atmos = false;
-		if (!parseEAC3AtmosFrame(data + offset, size - offset, swap16, frame_size, atmos))
-			break;
-
-		if (atmos)
-			return true;
-
-		if (!frame_size || frame_size > size - offset)
-			break;
-
-		offset += frame_size;
-	}
-
 	return false;
 }
 
-/*
- * E-AC-3 Atmos/JOC detection follows FFmpeg's flag_ec3_extension_type_a.
- * Accept only a real framed stream beginning at the buffer boundary (or an
- * IEC61937 burst payload), then walk any concatenated dependent syncframes by
- * their declared frame_size.
- */
-bool eac3FrameHasAtmos(const guint8 *data, gsize size)
-{
-	if (!data || size < 7)
-		return false;
-
-	if (data[0] == 0x0b && data[1] == 0x77)
-		return eac3FrameSetHasAtmos(data, size, false);
-
-	if (data[0] == 0x77 && data[1] == 0x0b)
-		return eac3FrameSetHasAtmos(data, size, true);
-
-	/* IEC61937 little-endian preamble followed by word-swapped E-AC-3. */
-	if (size > 15 &&
-		data[0] == 0x72 && data[1] == 0xf8 &&
-		data[2] == 0x1f && data[3] == 0x4e &&
-		data[8] == 0x77 && data[9] == 0x0b)
-		return eac3FrameSetHasAtmos(data + 8, size - 8, true);
-
-	/* IEC61937 big-endian form. */
-	if (size > 15 &&
-		data[0] == 0xf8 && data[1] == 0x72 &&
-		data[2] == 0x4e && data[3] == 0x1f &&
-		data[8] == 0x0b && data[9] == 0x77)
-		return eac3FrameSetHasAtmos(data + 8, size - 8, false);
-
-	return false;
-}
-
-/* Fallback when DASH-derived compressed caps omit their channel count.
- * E-AC-3 acmod and lfeon identify the actual encoded speaker channels. */
-guint eac3FrameChannels(const guint8 *data, gsize size)
-{
-	if (!data || size < 7)
-		return 0;
-
-	bool swap16 = false;
-	if (size > 15 && data[0] == 0x72 && data[1] == 0xf8 &&
-		data[2] == 0x1f && data[3] == 0x4e)
-	{
-		data += 8;
-		size -= 8;
-		swap16 = true;
-	}
-	else if (size > 15 && data[0] == 0xf8 && data[1] == 0x72 &&
-		data[2] == 0x4e && data[3] == 0x1f)
-	{
-		data += 8;
-		size -= 8;
-	}
-	else if (data[0] == 0x77 && data[1] == 0x0b)
-		swap16 = true;
-
-	EAC3AtmosBitReader br(data, size, swap16);
-	if (br.read(16) != 0x0b77)
-		return 0;
-	const guint frame_type = br.read(2);
-	const guint substream_id = br.read(3);
-	const guint frame_size = (br.read(11) + 1) << 1;
-	const guint sample_rate_code = br.read(2);
-	/* fscod2 when sample_rate_code == 3, numblkscod otherwise. */
-	const guint rate_or_blocks = br.read(2);
-	const guint acmod = br.read(3);
-	const guint lfeon = br.read(1);
-	const guint bsid = br.read(5);
-	if (!br.ok || frame_type == 3 || substream_id != 0 || frame_size > size ||
-		bsid <= 10 || bsid > 16 || (sample_rate_code == 3 && rate_or_blocks == 3))
-		return 0;
-	static const guint channels_for_acmod[8] = { 2, 1, 2, 3, 3, 4, 4, 5 };
-	return channels_for_acmod[acmod] + lfeon;
-}
-
-/* AAC AudioSpecificConfig channelConfiguration, in the MP4 codec_data caps.
- * A value of zero needs a program-config-element and cannot be guessed. */
-guint aacCodecDataChannels(const GstStructure *str)
-{
-	const GValue *value = gst_structure_get_value(str, "codec_data");
-	if (!value || !GST_VALUE_HOLDS_BUFFER(value))
-		return 0;
-	GstBuffer *buf = gst_value_get_buffer(value);
-	GstMapInfo map;
-	if (!buf || !gst_buffer_map(buf, &map, GST_MAP_READ))
-		return 0;
-	guint channels = 0;
-	if (map.size >= 2)
-	{
-		const guint config = (map.data[1] >> 3) & 0x0f;
-		if (config >= 1 && config <= 6)
-			channels = config;
-		else if (config == 7)
-			channels = 8;
-	}
-	gst_buffer_unmap(buf, &map);
-	return channels;
-}
-
-struct EAC3AtmosProbeData
-{
-	int stream;
-	guint buffers;
-	bool channelsReported;
-	bool inspectChannels;	/* true for DASH */
-	/* DASH: keep watching channel count and Atmos for the life of the pad.
-	 * A merged/continuous Period no longer re-creates the audio pad (and
-	 * with it this probe) when programme <-> ad audio changes, so changes
-	 * have to be tracked here, in both directions. */
-	guint lastChannels;
-	guint candidateChannels;
-	guint candidateCount;
-	bool atmosState;	/* last Atmos state reported */
-	bool atmosCandidate;
-	guint atmosCount;
-};
-
-void freeEAC3AtmosProbeData(gpointer data)
-{
-	delete static_cast<EAC3AtmosProbeData*>(data);
-}
-
-static void eac3PostElementEvent(GstPad *pad, GstStructure *event)
-{
-	GstObject *parent = gst_pad_get_parent(pad);
-	if (parent && GST_IS_ELEMENT(parent))
-		gst_element_post_message(GST_ELEMENT(parent), gst_message_new_element(parent, event));
-	else
-		gst_structure_free(event);
-	if (parent)
-		gst_object_unref(parent);
-}
-
-GstPadProbeReturn eac3AtmosProbe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-	EAC3AtmosProbeData *probe = static_cast<EAC3AtmosProbeData*>(user_data);
-	GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-
-	if (!probe || !buffer)
-		return GST_PAD_PROBE_OK;
-
-	++probe->buffers;
-
-	GstMapInfo map;
-	bool detected = false;		/* non-DASH: one-shot Atmos detection */
-	bool report_channels = false;
-	bool report_atmos = false;
-	guint encoded_channels = 0;
-	if (gst_buffer_map(buffer, &map, GST_MAP_READ))
-	{
-		if (probe->inspectChannels)
-		{
-			const guint ch = eac3FrameChannels(map.data, map.size);
-			if (ch > 0)
-			{
-				/* require 3 consecutive identical frames before believing a change */
-				if (ch == probe->candidateChannels)
-					++probe->candidateCount;
-				else
-				{
-					probe->candidateChannels = ch;
-					probe->candidateCount = 1;
-				}
-				if (probe->candidateCount >= 3 && probe->candidateChannels != probe->lastChannels)
-				{
-					probe->lastChannels = probe->candidateChannels;
-					encoded_channels = probe->candidateChannels;
-					report_channels = true;
-				}
-			}
-
-			/* Atmos on/off: quick to switch on (2 frames), slower to switch
-			 * off (16 frames, about half a second) so a stray frame can't flip it */
-			const bool atmos_now = eac3FrameHasAtmos(map.data, map.size);
-			if (atmos_now == probe->atmosCandidate)
-			{
-				if (probe->atmosCount < 1000)
-					++probe->atmosCount;
-			}
-			else
-			{
-				probe->atmosCandidate = atmos_now;
-				probe->atmosCount = 1;
-			}
-			if (probe->atmosCandidate != probe->atmosState &&
-				probe->atmosCount >= (probe->atmosCandidate ? 2u : 16u))
-			{
-				probe->atmosState = probe->atmosCandidate;
-				report_atmos = true;
-			}
-		}
-		else
-			detected = eac3FrameHasAtmos(map.data, map.size);
-		gst_buffer_unmap(buffer, &map);
-	}
-
-	if (report_channels && encoded_channels > 0)
-	{
-		probe->channelsReported = true;
-		eac3PostElementEvent(pad, gst_structure_new("eventAudioChannelsDetected",
-			"stream", G_TYPE_INT, probe->stream,
-			"channels", G_TYPE_INT, (gint)encoded_channels,
-			NULL));
-	}
-
-	if (report_atmos)
-	{
-		eDebug("[eServiceMP3] E-AC3 Atmos/JOC %s on audio stream %d",
-			probe->atmosState ? "started" : "ended", probe->stream);
-		eac3PostElementEvent(pad, gst_structure_new("eventAtmosDetected",
-			"stream", G_TYPE_INT, probe->stream,
-			"present", G_TYPE_INT, probe->atmosState ? 1 : 0,
-			NULL));
-	}
-
-	if (detected)
-	{
-		eDebug("[eServiceMP3] E-AC3 Atmos/JOC detected on audio stream %d", probe->stream);
-		eac3PostElementEvent(pad, gst_structure_new("eventAtmosDetected",
-			"stream", G_TYPE_INT, probe->stream,
-			NULL));
-		return GST_PAD_PROBE_REMOVE;
-	}
-
-	/* non-DASH keeps the original behaviour: give up after 64 buffers */
-	if (!probe->inspectChannels && probe->buffers >= 64)
-		return GST_PAD_PROBE_REMOVE;
-
-	return GST_PAD_PROBE_OK;
-}
-
-struct ByteCounterProbeData
-{
-	std::shared_ptr<std::atomic<guint64> > counter;
-};
-
-static void freeByteCounterProbeData(gpointer data)
-{
-	delete static_cast<ByteCounterProbeData*>(data);
-}
-
-static GstPadProbeReturn byteCounterProbe(GstPad *, GstPadProbeInfo *info, gpointer user_data)
-{
-	ByteCounterProbeData *probe = static_cast<ByteCounterProbeData*>(user_data);
-	guint64 size = 0;
-	if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST)
-	{
-		GstBufferList *list = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
-		if (list)
-			size = gst_buffer_list_calculate_size(list);
-	}
-	else if (GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info))
-		size = gst_buffer_get_size(buffer);
-	if (probe && size)
-		probe->counter->fetch_add(size, std::memory_order_relaxed);
-	return GST_PAD_PROBE_OK;
-}
-
-static GQuark byteCounterProbeQuark()
-{
-	static GQuark quark = g_quark_from_static_string("enigma2-byte-counter-probe");
-	return quark;
-}
-
-GQuark eac3AtmosProbeQuark()
-{
-	static GQuark quark = g_quark_from_static_string("enigma2-eac3-atmos-probe");
-	return quark;
-}
-
-
-struct DTSHDProbeData
-{
-	int stream;
-	guint buffers;
-	std::string codec;
-
-	explicit DTSHDProbeData(int s)
-		: stream(s), buffers(0)
-	{
-	}
-};
-
-void freeDTSHDProbeData(gpointer data)
-{
-	delete static_cast<DTSHDProbeData*>(data);
-}
-
-/*
- * DTS-HD MA carries the full channel count in the XLL lossless header.
- * GStreamer may expose only the embedded DTS core count (normally 5.1), so
- * read the XLL metadata directly from the compressed buffer.
+/**
+ * @brief Parses WebVTT subtitle data and extracts subtitle entries.
  *
- * XLL layout follows FFmpeg's dca_xll parser: the common header declares up
- * to three channel sets, and each byte-aligned channel-set sub-header starts
- * with its byte size and a 4-bit (channels - 1) field.  Multi-set streams
- * form a hierarchy; accumulate their channels while validating the early
- * header fields FFmpeg requires for that hierarchy.  If anything is unclear,
- * return 0 and leave the existing negotiated caps value untouched.
- */
-guint detectDTSXLLChannels(const guint8 *data, gsize size)
-{
-	if (!data || size < 8)
-		return 0;
-
-	for (gsize n = 0; n + 7 < size; ++n)
-	{
-		const guint32 word = (guint32(data[n]) << 24) | (guint32(data[n + 1]) << 16) |
-			(guint32(data[n + 2]) << 8) | guint32(data[n + 3]);
-		if (word != 0x41a29547)
-			continue;
-
-		EAC3AtmosBitReader br(data + n, size - n, false);
-		if (br.read(32) != 0x41a29547)
-			continue;
-
-		const guint stream_version = br.read(4) + 1;
-		const guint common_header_size = br.read(8) + 1;
-		const guint frame_size_nbits = br.read(5) + 1;
-		if (!br.ok || stream_version != 1 || frame_size_nbits > 32)
-			continue;
-
-		const guint frame_size = br.read(frame_size_nbits) + 1;
-		const guint channel_sets = br.read(4) + 1;
-		if (!br.ok || channel_sets < 1 || channel_sets > 3 ||
-			common_header_size > size - n || frame_size < common_header_size ||
-			frame_size > (240U << 10))
-			continue;
-
-		gsize sub_offset = common_header_size;
-		guint total_channels = 0;
-		bool valid = true;
-
-		for (guint set = 0; set < channel_sets; ++set)
-		{
-			if (sub_offset >= size - n || size - n - sub_offset < 2)
-			{
-				valid = false;
-				break;
-			}
-
-			const gsize sub_size = size - n - sub_offset;
-			EAC3AtmosBitReader chbr(data + n + sub_offset, sub_size, false);
-			const guint channel_header_size = chbr.read(10) + 1;
-			const guint channels = chbr.read(4) + 1;
-			if (!chbr.ok || channel_header_size > sub_size || channels < 1 || channels > 8 ||
-				total_channels + channels > 8)
-			{
-				valid = false;
-				break;
-			}
-
-			/* Fields before the hierarchy flag in FFmpeg's chs_parse_header(). */
-			chbr.skip(channels); /* residual_encode */
-			chbr.skip(5);        /* pcm_bit_res */
-			chbr.skip(5);        /* storage_bit_res */
-			chbr.skip(4);        /* sampling frequency */
-			const guint freq_modifier = chbr.read(2);
-			const guint replacement_set = chbr.read(2);
-			if (!chbr.ok || freq_modifier != 0 || replacement_set != 0)
-			{
-				valid = false;
-				break;
-			}
-
-			if (channel_sets > 1)
-			{
-				const bool primary = chbr.read(1) != 0;
-				const bool dmix_present = chbr.read(1) != 0;
-				if (dmix_present)
-				{
-					chbr.read(1); /* dmix_embedded */
-					if (primary)
-						chbr.skip(3); /* dmix_type */
-				}
-				const bool hierarchy = chbr.read(1) != 0;
-				if (!chbr.ok || primary != (set == 0) || !hierarchy)
-				{
-					valid = false;
-					break;
-				}
-			}
-
-			total_channels += channels;
-			sub_offset += channel_header_size;
-		}
-
-		if (valid && total_channels >= 1 && total_channels <= 8)
-			return total_channels;
-	}
-
-	return 0;
-}
-
-/*
- * DTS-HD HRA carries the total channel count in the EXSS audio asset
- * descriptor. GStreamer may expose only the embedded DTS core count, so
- * read the descriptor directly from the compressed EXSS header.
+ * This function processes a string containing WebVTT subtitle data, extracting
+ * individual subtitle entries with their timing and text. It supports parsing
+ * the X-TIMESTAMP-MAP header for MPEGTS to LOCAL time mapping, and handles
+ * multi-line subtitle text blocks. The parsed subtitle entries are appended to
+ * the provided output vector.
  *
- * This follows the relevant fields in FFmpeg's dca_exss parser. Keep this
- * separate from detectDTSXLLChannels(): XLL/MA and HRA use different metadata.
+ * @param vtt_data      The input string containing the WebVTT subtitle data.
+ * @param subs_out      Output vector to which parsed SubtitleEntry objects will be appended.
+ * @return true if at least one subtitle entry was successfully parsed, false otherwise.
+ *
+ * @note The function expects the existence of a parse_timecode helper function and
+ *       a SubtitleEntry struct/class with at least the following members:
+ *       - uint64_t start_time_ms
+ *       - uint64_t end_time_ms
+ *       - uint64_t vtt_mpegts_base
+ *       - std::string text
+ *
+ * @details
+ * - Ignores empty lines and lines containing only numbers (cue identifiers).
+ * - Handles carriage return at the end of lines.
+ * - Parses and applies X-TIMESTAMP-MAP if present, but the adjustment is currently commented out.
+ * - Supports multi-line subtitle text.
  */
-guint detectDTSExssChannels(const guint8 *data, gsize size)
-{
-	if (!data || size < 16)
-		return 0;
+bool parseWebVTT(const std::string& vtt_data, std::vector<SubtitleEntry>& subs_out) {
+	std::istringstream stream(vtt_data);
+	std::string line;
 
-	for (gsize n = 0; n + 7 < size; ++n)
-	{
-		const guint32 word = (guint32(data[n]) << 24) | (guint32(data[n + 1]) << 16) |
-			(guint32(data[n + 2]) << 8) | guint32(data[n + 3]);
-		if (word != 0x64582025)
+	std::string current_text;
+	uint64_t start_ms = 0, end_ms = 0, vtt_mpegts_base = 0, local_offset_ms = 0;
+	bool expecting_text = false;
+
+	// Persistent across calls to detect MPEGTS jumps between segments
+	static uint64_t s_last_mpegts_ms = 0;
+	static bool s_has_last_mpegts = false;
+
+	while (std::getline(stream, line)) {
+		if (!line.empty() && line.back() == '\r')
+			line.pop_back();
+		if (line.empty())
 			continue;
 
-		EAC3AtmosBitReader br(data + n, size - n, false);
-		if (br.read(32) != 0x64582025)
-			continue;
+		if (line.rfind("X-TIMESTAMP-MAP=", 0) == 0) {
+			size_t mpegts_pos = line.find("MPEGTS:");
+			size_t local_pos = line.find("LOCAL:");
 
-		br.skip(8); /* user defined bits */
-		const guint exss_index = br.read(2);
-		const guint wide_header = br.read(1);
-		const guint header_size = br.read(8 + 4 * wide_header) + 1;
-		const guint exss_size_nbits = 16 + 4 * wide_header;
-		const guint exss_size = br.read(exss_size_nbits) + 1;
-		if (!br.ok || exss_index > 3 || header_size > size - n ||
-			exss_size > size - n || exss_size < header_size)
-			continue;
+			if (mpegts_pos != std::string::npos && local_pos != std::string::npos) {
+				mpegts_pos += 7;
+				local_pos += 6;
 
-		const bool static_fields_present = br.read(1) != 0;
-		if (!br.ok)
-			continue;
+				size_t comma_pos = line.find(',', mpegts_pos);
+				std::string mpegts_str = line.substr(mpegts_pos, comma_pos - mpegts_pos);
+				std::string local_str = line.substr(local_pos);
 
-		guint nassets = 1;
-		if (static_fields_present)
-		{
-			br.skip(2); /* reference clock code */
-			br.skip(3); /* frame duration */
-			if (br.read(1))
-				br.skip(36); /* timecode */
-
-			const guint npresents = br.read(3) + 1;
-			nassets = br.read(3) + 1;
-			if (!br.ok || npresents != 1 || nassets != 1)
-				continue;
-
-			const guint active_mask = br.read(exss_index + 1);
-			if (!br.ok)
-				continue;
-			br.skip(__builtin_popcount(active_mask) * 8); /* active asset mask */
-
-			if (br.read(1))
-			{
-				br.skip(2); /* mixing metadata adjustment level */
-				const guint spkr_mask_nbits = (br.read(2) + 1) << 2;
-				const guint nmixoutconfigs = br.read(2) + 1;
-				br.skip(nmixoutconfigs * spkr_mask_nbits);
+				vtt_mpegts_base = std::stoull(mpegts_str);
+				if (vtt_mpegts_base < 1000000) // Ignore less than 1000000
+					vtt_mpegts_base = 0;
+				parse_timecode(local_str, local_offset_ms);
+				// Detect backward jumps in MPEGTS (advertisement -> content switch)
+				if (vtt_mpegts_base > 0) {
+					const uint64_t local_mpegts_ms = vtt_mpegts_base / 90; // 90kHz -> ms
+					if (s_has_last_mpegts && local_mpegts_ms < s_last_mpegts_ms) {
+						// If MPEGTS jump back -> deactivate this segment.
+						eDebug("[parseWebVTT] MPEGTS backward jump detected: %llu -> %llu, disabling mapping for this segment", (unsigned long long)s_last_mpegts_ms,
+							   (unsigned long long)local_mpegts_ms);
+						vtt_mpegts_base = 0; // reset offsets
+					}
+					s_last_mpegts_ms = local_mpegts_ms;
+					s_has_last_mpegts = true;
+				}
 			}
-			if (!br.ok)
+			continue;
+		}
+
+		if (line.find("-->") != std::string::npos) {
+			if (!current_text.empty()) {
+				SubtitleEntry entry;
+				entry.start_time_ms = start_ms;
+				entry.end_time_ms = end_ms;
+				entry.vtt_mpegts_base = vtt_mpegts_base;
+				entry.local_offset_ms = local_offset_ms;
+				entry.text = current_text;
+				subs_out.push_back(entry);
+				current_text.clear();
+			}
+
+			size_t arrow = line.find("-->");
+			std::string start_str = line.substr(0, arrow);
+			std::string end_str = line.substr(arrow + 3);
+			if (!parse_timecode(start_str, start_ms))
 				continue;
+			if (!parse_timecode(end_str, end_ms))
+				continue;
+
+			// Apply timestamp mapping adjustment
+			// ignore for now
+			/*
+			if (vtt_mpegts_base > 0) {
+				const uint64_t local_mpegts_ms = vtt_mpegts_base / 90; // MPEGTS-Ticks (90 kHz) → ms
+				const int64_t delta = static_cast<int64_t>(local_mpegts_ms) - static_cast<int64_t>(local_offset_ms);
+				start_ms += delta;
+				end_ms += delta;
+			}
+			*/
+			expecting_text = true;
+			continue;
 		}
 
-		const guint asset_size = br.read(exss_size_nbits) + 1;
-		if (!br.ok || header_size + asset_size > exss_size)
+		if (!expecting_text || line.find_first_not_of("0123456789") == std::string::npos)
 			continue;
 
-		const gsize descriptor_pos = br.bitpos;
-		const guint descriptor_size = br.read(9) + 1;
-		br.skip(3); /* asset identifier */
-		if (!br.ok || descriptor_size * 8 > exss_size * 8 - descriptor_pos)
-			continue;
-
-		if (!static_fields_present)
-			continue;
-
-		if (br.read(1))
-			br.skip(4); /* asset type descriptor */
-		if (br.read(1))
-			br.skip(24); /* language descriptor */
-		if (br.read(1))
-		{
-			const guint text_size = br.read(10) + 1;
-			br.skip(text_size * 8);
-		}
-
-		br.skip(5); /* PCM bit resolution */
-		br.skip(4); /* maximum sample rate */
-		const guint channels = br.read(8) + 1;
-		if (!br.ok || channels < 1 || channels > 16)
-			continue;
-
-		return channels;
-	}
-
-	return 0;
-}
-
-const char *detectDTSProfile(const guint8 *data, gsize size)
-{
-	bool exss = false;
-	bool xll = false;
-	bool xbr = false;
-	bool xch = false;
-	bool xxch = false;
-	bool x96 = false;
-	bool lbr = false;
-	bool dtsx = false;
-	bool dtsx_imax = false;
-
-	for (gsize n = 0; n + 3 < size; ++n)
-	{
-		const guint32 word = (guint32(data[n]) << 24) | (guint32(data[n + 1]) << 16) |
-			(guint32(data[n + 2]) << 8) | guint32(data[n + 3]);
-
-		switch (word)
-		{
-			case 0x64582025: exss = true; break; /* DTS extension substream */
-			case 0x41a29547: xll = true; break;  /* lossless / DTS-HD MA */
-			case 0x655e315e: xbr = true; break;
-			case 0x5a5a5a5a: xch = true; break;   /* core XCH / DTS-ES */
-			case 0x47004a03: xxch = true; break;
-			case 0x1d95f262: x96 = true; break;
-			case 0x0a801921: lbr = true; break;  /* DTS Express */
-			case 0x02000850: dtsx = true; break;
-			default:
-				/* FFmpeg accepts either low bit for the DTS:X IMAX marker. */
-				if ((word >> 1) == (0xf14000d0U >> 1))
-					dtsx_imax = true;
-				break;
+		if (expecting_text) {
+			if (!current_text.empty())
+				current_text += "\n";
+			current_text += line;
 		}
 	}
 
-	/*
-	 * Match FFmpeg's DTS profile rules:
-	 * core XCH/XXCH is DTS-ES and core X96 is DTS 96/24;
-	 * XLL is DTS-HD MA; XBR/XXCH/X96 in EXSS are DTS-HD HRA;
-	 * LBR is DTS Express. DTS:X markers are XLL extensions.
-	 */
-	if (xll && dtsx_imax)
-		return "DTS-HD MA + DTS:X IMAX";
-	if (xll && dtsx)
-		return "DTS-HD MA + DTS:X";
-	if (xll)
-		return "DTS-HD MA";
-	if (exss && (xbr || xxch || x96))
-		return "DTS-HD HRA";
-	if (exss && lbr)
-		return "DTS Express";
-	if (!exss && (xch || xxch))
-		return "DTS-ES";
-	if (!exss && x96)
-		return "DTS 96/24";
-
-	return NULL;
-}
-
-GstPadProbeReturn dtsHDProbe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-	DTSHDProbeData *probe = static_cast<DTSHDProbeData*>(user_data);
-	GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-	if (!probe || !buffer)
-		return GST_PAD_PROBE_OK;
-
-	++probe->buffers;
-
-	const char *detected_codec = NULL;
-	guint channels = 0;
-	GstMapInfo map;
-	if (gst_buffer_map(buffer, &map, GST_MAP_READ))
-	{
-		detected_codec = detectDTSProfile(map.data, map.size);
-		if (detected_codec)
-			probe->codec = detected_codec;
-		if (!probe->codec.empty() && !strncmp(probe->codec.c_str(), "DTS-HD MA", 9))
-			channels = detectDTSXLLChannels(map.data, map.size);
-		else if (!probe->codec.empty() && !strcmp(probe->codec.c_str(), "DTS-HD HRA"))
-			channels = detectDTSExssChannels(map.data, map.size);
-		gst_buffer_unmap(buffer, &map);
+	if (!current_text.empty()) {
+		SubtitleEntry entry;
+		entry.start_time_ms = start_ms;
+		entry.end_time_ms = end_ms;
+		entry.vtt_mpegts_base = vtt_mpegts_base;
+		entry.local_offset_ms = local_offset_ms;
+		entry.text = current_text;
+		subs_out.push_back(entry);
 	}
 
-	/* For DTS-HD MA and HRA, wait briefly for a buffer with a complete
-	 * parsable channel-count header. Other DTS profiles can be reported
-	 * immediately. */
-	const bool dtshd_profile = !probe->codec.empty() &&
-		(!strncmp(probe->codec.c_str(), "DTS-HD MA", 9) || !strcmp(probe->codec.c_str(), "DTS-HD HRA"));
-	if (!probe->codec.empty() && (!dtshd_profile || channels || probe->buffers >= 64))
-	{
-		const char *codec = probe->codec.c_str();
-		if (channels)
-			eDebug("[eServiceMP3] DTS profile detected on audio stream %d: %s channels=%u", probe->stream, codec, channels);
-		else
-			eDebug("[eServiceMP3] DTS profile detected on audio stream %d: %s (channel count unavailable)", probe->stream, codec);
-
-		GstObject *parent = gst_pad_get_parent(pad);
-		if (parent && GST_IS_ELEMENT(parent))
-		{
-			GstStructure *event = gst_structure_new("eventDTSProfileDetected",
-				"stream", G_TYPE_INT, probe->stream,
-				"codec", G_TYPE_STRING, codec,
-				"channels", G_TYPE_INT, (gint)channels,
-				NULL);
-			gst_element_post_message(GST_ELEMENT(parent),
-				gst_message_new_element(parent, event));
-		}
-		if (parent)
-			gst_object_unref(parent);
-
-		return GST_PAD_PROBE_REMOVE;
-	}
-
-	if (probe->buffers >= 64)
-		return GST_PAD_PROBE_REMOVE;
-
-	return GST_PAD_PROBE_OK;
+	return !subs_out.empty();
 }
-
-GQuark dtsHDProbeQuark()
-{
-	static GQuark quark = g_quark_from_static_string("enigma2-dtshd-probe");
-	return quark;
-}
-
-enum HDAudioAuxMode
-{
-	hdAuxNone,
-	hdAuxAC3
-};
-
-struct HDAudioAuxState
-{
-	GstElement *pipeline;
-	GstElement *dvbSink;
-	GstElement *mainAudioSink;
-	int audioIndex;
-	guint mainFlags;
-	HDAudioAuxMode mode;
-	bool linked;
-	GMutex linkMutex;
-	GCond linkCond;
-};
-
-GQuark hdAudioAuxStateQuark()
-{
-	static GQuark quark = g_quark_from_static_string("enigma2-hd-audio-aux");
-	return quark;
-}
-
-GQuark hdAudioAuxReconfigQuark()
-{
-	static GQuark quark = g_quark_from_static_string("enigma2-hd-audio-aux-reconfig");
-	return quark;
-}
-
-GQuark hdAudioAuxRetryBlockQuark()
-{
-	static GQuark quark = g_quark_from_static_string("enigma2-hd-audio-aux-retry-block");
-	return quark;
-}
-
-GQuark hdAudioNativeEac3ResetPendingQuark()
-{
-	static GQuark quark = g_quark_from_static_string("enigma2-hd-audio-native-eac3-reset-pending");
-	return quark;
-}
-
-GQuark hdAudioNativeRetryQuark()
-{
-	static GQuark quark = g_quark_from_static_string("enigma2-hd-audio-native-retry");
-	return quark;
-}
-
-HDAudioAuxState *getHDAudioAuxState(GstElement *playbin)
-{
-	return playbin ? static_cast<HDAudioAuxState *>(
-		g_object_get_qdata(G_OBJECT(playbin), hdAudioAuxStateQuark())) : NULL;
-}
-
-bool hdAudioAuxReconfiguring(GstElement *playbin)
-{
-	return playbin && GPOINTER_TO_INT(g_object_get_qdata(G_OBJECT(playbin), hdAudioAuxReconfigQuark()));
-}
-
-void setHDAudioAuxReconfiguring(GstElement *playbin, bool active)
-{
-	if (playbin)
-		g_object_set_qdata(G_OBJECT(playbin), hdAudioAuxReconfigQuark(), GINT_TO_POINTER(active ? 1 : 0));
-}
-
-bool hdAudioAuxRetryBlocked(GstElement *playbin)
-{
-	return playbin && GPOINTER_TO_INT(g_object_get_qdata(G_OBJECT(playbin), hdAudioAuxRetryBlockQuark()));
-}
-
-void setHDAudioAuxRetryBlocked(GstElement *playbin, bool blocked)
-{
-	if (playbin)
-		g_object_set_qdata(G_OBJECT(playbin), hdAudioAuxRetryBlockQuark(), GINT_TO_POINTER(blocked ? 1 : 0));
-}
-
-bool hdAudioNativeEac3ResetPending(GstElement *playbin)
-{
-	return playbin && GPOINTER_TO_INT(g_object_get_qdata(G_OBJECT(playbin), hdAudioNativeEac3ResetPendingQuark()));
-}
-
-void setHDAudioNativeEac3ResetPending(GstElement *playbin, bool pending)
-{
-	if (playbin)
-		g_object_set_qdata(G_OBJECT(playbin), hdAudioNativeEac3ResetPendingQuark(), GINT_TO_POINTER(pending ? 1 : 0));
-}
-
-int hdAudioNativeRetry(GstElement *playbin)
-{
-	return playbin ? GPOINTER_TO_INT(g_object_get_qdata(G_OBJECT(playbin), hdAudioNativeRetryQuark())) - 1 : -1;
-}
-
-void setHDAudioNativeRetry(GstElement *playbin, int stream)
-{
-	if (playbin)
-		g_object_set_qdata(G_OBJECT(playbin), hdAudioNativeRetryQuark(), stream >= 0 ? GINT_TO_POINTER(stream + 1) : NULL);
-}
-
-gint hdAudioAuxMatchSinkType(const GValue *velement, gpointer user_data)
-{
-	GstElement *element = GST_ELEMENT_CAST(g_value_get_object(velement));
-	const gchar *type = static_cast<const gchar *>(user_data);
-	return element && type ? strcmp(g_type_name(G_OBJECT_TYPE(element)), type) : 1;
-}
-
-GstElement *findHDAudioMainSink(GstElement *playbin)
-{
-	if (!playbin || !GST_IS_BIN(playbin))
-		return NULL;
-	GstIterator *children = gst_bin_iterate_recurse(GST_BIN(playbin));
-	GValue result = G_VALUE_INIT;
-	GstElement *sink = NULL;
-	if (children && gst_iterator_find_custom(children, (GCompareFunc)hdAudioAuxMatchSinkType,
-		&result, (gpointer)"GstDVBAudioSink"))
-	{
-		sink = GST_ELEMENT_CAST(g_value_dup_object(&result));
-		g_value_unset(&result);
-	}
-	if (children)
-		gst_iterator_free(children);
-	return sink;
-}
-
-GstElement *quiesceHDAudioMainSink(GstElement *playbin)
-{
-	GstElement *sink = findHDAudioMainSink(playbin);
-	if (!sink)
-		return NULL;
-
-	gst_element_set_locked_state(sink, TRUE);
-	GstStateChangeReturn set_ret = gst_element_set_state(sink, GST_STATE_NULL);
-	GstState state = GST_STATE_VOID_PENDING, pending = GST_STATE_VOID_PENDING;
-	gst_element_get_state(sink, &state, &pending, 2 * GST_SECOND);
-	if (set_ret == GST_STATE_CHANGE_FAILURE || state != GST_STATE_NULL)
-	{
-		gst_element_set_locked_state(sink, FALSE);
-		gst_element_sync_state_with_parent(sink);
-		gst_object_unref(sink);
-		return NULL;
-	}
-	return sink;
-}
-
-void restoreHDAudioMainSink(GstElement *playbin, GstElement *sink, guint flags)
-{
-	if (!playbin)
-		return;
-	g_object_set(G_OBJECT(playbin), "flags", flags, NULL);
-	if (sink)
-	{
-		gst_element_set_locked_state(sink, FALSE);
-		gst_element_sync_state_with_parent(sink);
-	}
-}
-
-HDAudioAuxMode hdAudioAuxModeForCodec(const std::string &codec)
-{
-	if (codec.find("TrueHD") != std::string::npos)
-		return eConfigManager::getConfigValue("config.av.truehd_playback") == "ac3" ? hdAuxAC3 : hdAuxNone;
-	if (codec.compare(0, 3, "DTS") == 0)
-		return eConfigManager::getConfigValue("config.av.dts_playback") == "ac3" ? hdAuxAC3 : hdAuxNone;
-	return hdAuxNone;
-}
-
-GstBusSyncReply hdAudioAuxBusSync(GstBus *, GstMessage *, gpointer)
-{
-	return GST_BUS_DROP;
-}
-
-gint hdAudioAuxSelectStream(GstElement *, GstStreamCollection *collection, GstStream *stream, gpointer user_data)
-{
-	HDAudioAuxState *state = static_cast<HDAudioAuxState *>(user_data);
-	if (!state || !stream || !(gst_stream_get_stream_type(stream) & GST_STREAM_TYPE_AUDIO))
-		return 0;
-
-	int audio_ordinal = 0;
-	const guint size = gst_stream_collection_get_size(collection);
-	for (guint n = 0; n < size; ++n)
-	{
-		GstStream *candidate = gst_stream_collection_get_stream(collection, n);
-		if (!candidate || !(gst_stream_get_stream_type(candidate) & GST_STREAM_TYPE_AUDIO))
-			continue;
-		if (candidate == stream)
-			return audio_ordinal == state->audioIndex ? 1 : 0;
-		++audio_ordinal;
-	}
-	return 0;
-}
-
-void hdAudioAuxPadAdded(GstElement *, GstPad *pad, gpointer user_data)
-{
-	HDAudioAuxState *state = static_cast<HDAudioAuxState *>(user_data);
-	if (!state || state->linked)
-		return;
-
-	GstCaps *caps = gst_pad_get_current_caps(pad);
-	if (!caps)
-		caps = gst_pad_query_caps(pad, NULL);
-	const GstStructure *structure = caps && gst_caps_get_size(caps) ? gst_caps_get_structure(caps, 0) : NULL;
-	const gchar *name = structure ? gst_structure_get_name(structure) : NULL;
-	if (!name || g_strcmp0(name, "audio/x-raw"))
-	{
-		if (caps) gst_caps_unref(caps);
-		return;
-	}
-
-	GstElement *queue = gst_bin_get_by_name(GST_BIN(state->pipeline), "hdaudio_aux_queue");
-	GstPad *sink_pad = queue ? gst_element_get_static_pad(queue, "sink") : NULL;
-	const GstPadLinkReturn link_ret = sink_pad ? gst_pad_link(pad, sink_pad) : GST_PAD_LINK_REFUSED;
-	g_mutex_lock(&state->linkMutex);
-	state->linked = link_ret == GST_PAD_LINK_OK;
-	if (state->linked)
-		g_cond_broadcast(&state->linkCond);
-	g_mutex_unlock(&state->linkMutex);
-	if (sink_pad) gst_object_unref(sink_pad);
-	if (queue) gst_object_unref(queue);
-	if (caps) gst_caps_unref(caps);
-}
-
-void stopHDAudioAuxPipeline(GstElement *playbin, bool restore_main_audio)
-{
-	HDAudioAuxState *state = getHDAudioAuxState(playbin);
-	if (!state)
-		return;
-
-	g_object_set_qdata(G_OBJECT(playbin), hdAudioAuxStateQuark(), NULL);
-	if (state->dvbSink)
-		gst_element_set_locked_state(state->dvbSink, FALSE);
-	gst_element_set_state(state->pipeline, GST_STATE_NULL);
-	GstState null_state = GST_STATE_VOID_PENDING, null_pending = GST_STATE_VOID_PENDING;
-	gst_element_get_state(state->pipeline, &null_state, &null_pending, 2 * GST_SECOND);
-
-	GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(state->pipeline));
-	if (bus)
-	{
-		gst_bus_set_sync_handler(bus, NULL, NULL, NULL);
-		gst_object_unref(bus);
-	}
-	gst_object_unref(state->pipeline);
-
-	if (restore_main_audio)
-		restoreHDAudioMainSink(playbin, state->mainAudioSink, state->mainFlags);
-	if (state->mainAudioSink)
-		gst_object_unref(state->mainAudioSink);
-	g_cond_clear(&state->linkCond);
-	g_mutex_clear(&state->linkMutex);
-	delete state;
-}
-
-bool prepareHDAudioAuxPipeline(GstElement *playbin, const gchar *uri, int audio_index,
-	HDAudioAuxMode mode, int source_channels, guint main_flags, gint64 position_ns,
-	GstElement *main_audio_sink)
-{
-	if (!playbin || !uri || mode == hdAuxNone)
-		return false;
-
-	GstElement *pipeline = gst_pipeline_new("enigma2_hdaudio_aux_pipeline");
-	GstElement *decode = gst_element_factory_make("uridecodebin3", "hdaudio_aux_decode");
-	GstElement *queue = gst_element_factory_make("queue", "hdaudio_aux_queue");
-	GstElement *convert = gst_element_factory_make("audioconvert", "hdaudio_aux_convert");
-	GstElement *resample = gst_element_factory_make("audioresample", "hdaudio_aux_resample");
-	GstElement *raw_capsfilter = gst_element_factory_make("capsfilter", "hdaudio_aux_raw_caps");
-	GstElement *encoder = gst_element_factory_make("avenc_ac3", "hdaudio_aux_encoder");
-	GstElement *parser = gst_element_factory_make("ac3parse", "hdaudio_aux_parser");
-	GstElement *out_capsfilter = gst_element_factory_make("capsfilter", "hdaudio_aux_output_caps");
-	GstElement *dvb_sink = gst_element_factory_make("dvbaudiosink", "enigma2_hdaudio_aux_dvb_sink");
-
-	if (!pipeline || !decode || !queue || !convert || !resample || !raw_capsfilter ||
-		!encoder || !parser || !out_capsfilter || !dvb_sink)
-	{
-		if (pipeline) gst_object_unref(pipeline);
-		if (decode) gst_object_unref(decode);
-		if (queue) gst_object_unref(queue);
-		if (convert) gst_object_unref(convert);
-		if (resample) gst_object_unref(resample);
-		if (raw_capsfilter) gst_object_unref(raw_capsfilter);
-		if (encoder) gst_object_unref(encoder);
-		if (parser) gst_object_unref(parser);
-		if (out_capsfilter) gst_object_unref(out_capsfilter);
-		if (dvb_sink) gst_object_unref(dvb_sink);
-		return false;
-	}
-
-	const guint64 channel_mask = G_GUINT64_CONSTANT(0x003f);
-	GstCaps *raw_caps = gst_caps_new_simple("audio/x-raw",
-		"format", G_TYPE_STRING, "F32LE",
-		"layout", G_TYPE_STRING, "interleaved",
-		"rate", G_TYPE_INT, 48000,
-		"channels", G_TYPE_INT, 6,
-		"channel-mask", GST_TYPE_BITMASK, channel_mask,
-		NULL);
-	GstCaps *out_caps = gst_caps_new_simple("audio/x-ac3",
-		"framed", G_TYPE_BOOLEAN, TRUE,
-		"alignment", G_TYPE_STRING, "frame",
-		"rate", G_TYPE_INT, 48000,
-		"channels", G_TYPE_INT, 6,
-		NULL);
-	if (!raw_caps || !out_caps)
-	{
-		if (raw_caps) gst_caps_unref(raw_caps);
-		if (out_caps) gst_caps_unref(out_caps);
-		gst_object_unref(pipeline);
-		gst_object_unref(decode); gst_object_unref(queue); gst_object_unref(convert);
-		gst_object_unref(resample); gst_object_unref(raw_capsfilter); gst_object_unref(encoder);
-		gst_object_unref(parser); gst_object_unref(out_capsfilter); gst_object_unref(dvb_sink);
-		return false;
-	}
-
-	GstPad *dvb_pad = gst_element_get_static_pad(dvb_sink, "sink");
-	GstCaps *accepted = dvb_pad ? gst_pad_query_caps(dvb_pad, out_caps) : NULL;
-	const bool accepted_output = accepted && !gst_caps_is_empty(accepted);
-	if (accepted) gst_caps_unref(accepted);
-	if (dvb_pad) gst_object_unref(dvb_pad);
-	if (!accepted_output)
-	{
-		gst_caps_unref(raw_caps); gst_caps_unref(out_caps);
-		gst_object_unref(pipeline);
-		gst_object_unref(decode); gst_object_unref(queue); gst_object_unref(convert);
-		gst_object_unref(resample); gst_object_unref(raw_capsfilter); gst_object_unref(encoder);
-		gst_object_unref(parser); gst_object_unref(out_capsfilter); gst_object_unref(dvb_sink);
-		return false;
-	}
-
-	g_object_set(G_OBJECT(raw_capsfilter), "caps", raw_caps, NULL);
-	g_object_set(G_OBJECT(out_capsfilter), "caps", out_caps, NULL);
-	gst_caps_unref(raw_caps);
-	gst_caps_unref(out_caps);
-	if (g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "bitrate"))
-		g_object_set(G_OBJECT(encoder), "bitrate", 640000, NULL);
-	g_object_set(G_OBJECT(decode), "uri", uri, NULL);
-	(void)source_channels;
-	(void)position_ns;
-
-	HDAudioAuxState *state = new HDAudioAuxState();
-	state->pipeline = pipeline;
-	state->dvbSink = dvb_sink;
-	state->mainAudioSink = main_audio_sink ? GST_ELEMENT(gst_object_ref(main_audio_sink)) : NULL;
-	state->audioIndex = audio_index;
-	state->mainFlags = main_flags;
-	state->mode = mode;
-	state->linked = false;
-	g_mutex_init(&state->linkMutex);
-	g_cond_init(&state->linkCond);
-	g_signal_connect(G_OBJECT(decode), "select-stream", G_CALLBACK(hdAudioAuxSelectStream), state);
-	g_signal_connect(G_OBJECT(decode), "pad-added", G_CALLBACK(hdAudioAuxPadAdded), state);
-
-	gst_bin_add_many(GST_BIN(pipeline), decode, queue, convert, resample, raw_capsfilter,
-		encoder, parser, out_capsfilter, dvb_sink, NULL);
-	if (!gst_element_link_many(queue, convert, resample, raw_capsfilter,
-		encoder, parser, out_capsfilter, dvb_sink, NULL))
-	{
-		gst_object_unref(pipeline);
-		if (state->mainAudioSink) gst_object_unref(state->mainAudioSink);
-		g_cond_clear(&state->linkCond);
-		g_mutex_clear(&state->linkMutex);
-		delete state;
-		return false;
-	}
-
-	GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
-	if (bus)
-	{
-		gst_bus_set_sync_handler(bus, hdAudioAuxBusSync, state, NULL);
-		gst_object_unref(bus);
-	}
-
-	g_object_set_qdata(G_OBJECT(playbin), hdAudioAuxStateQuark(), state);
-	if (gst_element_set_state(pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE)
-	{
-		stopHDAudioAuxPipeline(playbin, false);
-		return false;
-	}
-	GstState aux_state = GST_STATE_NULL, aux_pending = GST_STATE_VOID_PENDING;
-	gst_element_get_state(pipeline, &aux_state, &aux_pending, 2 * GST_SECOND);
-	gst_element_set_locked_state(dvb_sink, TRUE);
-	return true;
-}
-
-void setHDAudioAuxState(GstElement *playbin, GstState target)
-{
-	HDAudioAuxState *state = getHDAudioAuxState(playbin);
-	if (state)
-		gst_element_set_state(state->pipeline, target);
-}
-
-bool seekHDAudioAuxThenResetSink(GstElement *playbin, gint64 position_ns)
-{
-	HDAudioAuxState *state = getHDAudioAuxState(playbin);
-	if (!state || !state->dvbSink || position_ns < 0)
-		return false;
-
-	if (!gst_element_seek_simple(state->pipeline, GST_FORMAT_TIME,
-		(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), position_ns))
-		return false;
-
-	gst_element_set_locked_state(state->dvbSink, TRUE);
-	GstStateChangeReturn null_ret = gst_element_set_state(state->dvbSink, GST_STATE_NULL);
-	GstState sink_state = GST_STATE_VOID_PENDING, sink_pending = GST_STATE_VOID_PENDING;
-	gst_element_get_state(state->dvbSink, &sink_state, &sink_pending, 250 * GST_MSECOND);
-	if (null_ret == GST_STATE_CHANGE_FAILURE || sink_state != GST_STATE_NULL)
-	{
-		gst_element_set_locked_state(state->dvbSink, FALSE);
-		gst_element_sync_state_with_parent(state->dvbSink);
-		return false;
-	}
-
-	gst_element_set_locked_state(state->dvbSink, FALSE);
-	return gst_element_sync_state_with_parent(state->dvbSink);
-}
-
-bool positionHDAudioAuxAfterStart(GstElement *playbin, gint64 position_ns)
-{
-	HDAudioAuxState *state = getHDAudioAuxState(playbin);
-	if (!state)
-		return false;
-
-	g_mutex_lock(&state->linkMutex);
-	if (!state->linked)
-	{
-		const gint64 until = g_get_monotonic_time() + G_TIME_SPAN_SECOND;
-		while (!state->linked && g_cond_wait_until(&state->linkCond, &state->linkMutex, until))
-			;
-	}
-	const bool linked = state->linked;
-	g_mutex_unlock(&state->linkMutex);
-	if (!linked)
-		return false;
-
-	if (position_ns < 500 * GST_MSECOND)
-	{
-		gst_element_set_locked_state(state->dvbSink, FALSE);
-		return gst_element_sync_state_with_parent(state->dvbSink);
-	}
-	return seekHDAudioAuxThenResetSink(playbin, position_ns);
-}
-
-bool seekHDAudioAuxPersistent(GstElement *playbin, gint64 position_ns)
-{
-	HDAudioAuxState *state = getHDAudioAuxState(playbin);
-	if (!state || position_ns < 0)
-		return false;
-
-	const bool already_reconfiguring = hdAudioAuxReconfiguring(playbin);
-	if (!already_reconfiguring)
-		setHDAudioAuxReconfiguring(playbin, true);
-	const gboolean seek_ok = gst_element_seek_simple(state->pipeline, GST_FORMAT_TIME,
-		(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), position_ns);
-	if (!already_reconfiguring)
-		setHDAudioAuxReconfiguring(playbin, false);
-	return seek_ok;
-}
-
-} // namespace
-
 
 // eServiceFactoryMP3
 
@@ -1484,71 +525,62 @@ bool seekHDAudioAuxPersistent(GstElement *playbin, gint64 position_ns)
 #undef GSTREAMER_SUBTITLE_SYNC_MODE_BUG
 /**/
 
-eServiceFactoryMP3::eServiceFactoryMP3()
-{
+eServiceFactoryMP3 *eServiceFactoryMP3::instance = nullptr;
+
+eServiceFactoryMP3 *eServiceFactoryMP3::getDVBIFactory(const eServiceReference &ref) {
+	const int hint = ref.getData(7) & DVB_I_MEDIA_MASK;
+	const std::string &url = ref.path;
+	// Only worker-marked DVB-I adaptive HTTP streams bypass a third-party 4097 factory.
+	// eAutoInitPtr keeps the native factory alive even after its public registration is replaced.
+	return ref.type == id && (hint == DVB_I_DASH || hint == DVB_I_HLS)
+		&& (url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0) ? instance : nullptr;
+}
+
+eServiceFactoryMP3::eServiceFactoryMP3() {
+	instance = this;
 	ePtr<eServiceCenter> sc;
 
 	eServiceCenter::getPrivInstance(sc);
-	if (sc)
-	{
+	if (sc) {
 		std::list<std::string> extensions;
-		extensions.push_back("dtshd");
 		extensions.push_back("dts");
-		extensions.push_back("mp3");
-		extensions.push_back("wav");
-		extensions.push_back("wave");
-		extensions.push_back("oga");
-		extensions.push_back("ogg");
-		extensions.push_back("flac");
-		extensions.push_back("m4a");
-		extensions.push_back("mp2");
-		extensions.push_back("m2a");
-		extensions.push_back("wma");
-		extensions.push_back("eac3");
-		extensions.push_back("ac3");
-		extensions.push_back("mka");
-		extensions.push_back("aache");
 		extensions.push_back("aac");
-		extensions.push_back("ape");
-		extensions.push_back("alac");
+		extensions.push_back("mp2");
+		extensions.push_back("mp3");
+		extensions.push_back("ogg");
+		extensions.push_back("ogm");
+		extensions.push_back("ogv");
 		extensions.push_back("mpg");
 		extensions.push_back("vob");
+		extensions.push_back("wav");
+		extensions.push_back("wave");
 		extensions.push_back("m4v");
 		extensions.push_back("mkv");
 		extensions.push_back("avi");
 		extensions.push_back("divx");
 		extensions.push_back("dat");
+		extensions.push_back("flac");
 		extensions.push_back("flv");
 		extensions.push_back("mp4");
 		extensions.push_back("mov");
-		extensions.push_back("wmv");
-		extensions.push_back("asf");
+		extensions.push_back("m4a");
 		extensions.push_back("3gp");
 		extensions.push_back("3g2");
-		extensions.push_back("mpeg");
-		extensions.push_back("mpe");
-		extensions.push_back("rm");
-		extensions.push_back("rmvb");
-		extensions.push_back("ogm");
-		extensions.push_back("ogv");
-		extensions.push_back("m3u8");
-		extensions.push_back("mpd");
-		extensions.push_back("stream");
+		extensions.push_back("asf");
+		extensions.push_back("wmv");
+		extensions.push_back("wma");
 		extensions.push_back("webm");
-		extensions.push_back("amr");
-		extensions.push_back("au");
-		extensions.push_back("mid");
-		extensions.push_back("wv");
-		extensions.push_back("pva");
-		extensions.push_back("wtv");
+		extensions.push_back("m3u8");
+		extensions.push_back("stream");
 		sc->addServiceFactory(eServiceFactoryMP3::id, this, extensions);
 	}
 
 	m_service_info = new eStaticServiceMP3Info();
 }
 
-eServiceFactoryMP3::~eServiceFactoryMP3()
-{
+eServiceFactoryMP3::~eServiceFactoryMP3() {
+	if (instance == this)
+		instance = nullptr;
 	ePtr<eServiceCenter> sc;
 
 	eServiceCenter::getPrivInstance(sc);
@@ -1558,70 +590,201 @@ eServiceFactoryMP3::~eServiceFactoryMP3()
 
 DEFINE_REF(eServiceFactoryMP3)
 
-	// iServiceHandler
-RESULT eServiceFactoryMP3::play(const eServiceReference &ref, ePtr<iPlayableService> &ptr)
-{
-		// check resources...
+/**
+ * @brief Initializes and creates GStreamer sink elements for audio, video, and subtitles.
+ *
+ * This static function attempts to create and initialize the following GStreamer sink elements:
+ * - Audio sink ("dvbaudiosink")
+ * - Video sink ("dvbvideosink")
+ * - Subtitle sink ("subsink")
+ *
+ * For each sink, it tries to create the element using gst_element_factory_make. If creation is successful,
+ * the element is referenced and a debug message is logged. If creation fails (e.g., the required plugin is missing),
+ * an error message is logged. The function also sets corresponding boolean flags to indicate the success or failure
+ * of each sink's creation.
+ *
+ * Global variables affected:
+ * - dvb_audiosink, dvb_videosink, dvb_subsink: Pointers to the created GStreamer elements.
+ * - dvb_audiosink_ok, dvb_videosink_ok, dvb_subsink_ok: Flags indicating successful creation of each sink.
+ *
+ * No parameters or return value.
+ */
+static void create_gstreamer_sinks() {
+	dvb_subsink = dvb_audiosink = dvb_videosink = NULL;
+	dvb_subsink_ok = dvb_audiosink_ok = dvb_videosink_ok = false;
+	dvb_audiosink = gst_element_factory_make("dvbaudiosink", NULL);
+	if (!dvb_audiosink) {
+		/* DreamTwo's known working local-playback sink takes priority over ALSA. */
+		dvb_audiosink = gst_element_factory_make("dreamaudiosink", "openbh_movie_native_audio");
+		if (dvb_audiosink)
+			eDebug("[OPENBH_2A0B702] fallback local audio = dreamaudiosink");
+	}
+	if (!dvb_audiosink) {
+		dvb_audiosink = gst_element_factory_make("alsasink", "openbh_movie_pcm");
+		if (dvb_audiosink) {
+			gstSetStringIfAvailable(dvb_audiosink, "device", "hw:0,0");
+			gstSetBoolIfAvailable(dvb_audiosink, "sync", TRUE);
+			eDebug("[OPENBH_2A0B702] fallback local PCM audio = alsasink hw:0,0");
+		}
+	}
+	if (dvb_audiosink) {
+		gst_object_ref_sink(dvb_audiosink);
+		eDebug("[eServiceFactoryMP3] **** dvb_audiosink created ***");
+		dvb_audiosink_ok = true;
+	} else
+		eDebug("[eServiceFactoryMP3] **** audio_sink NOT created missing plugin ****");
+	dvb_videosink = gst_element_factory_make("dvbvideosink", NULL);
+ if (!dvb_videosink) {
+  dvb_videosink = gst_element_factory_make("dreamvideosink", "openbh_movie_video");
+  if (dvb_videosink) {
+   gstSetBoolIfAvailable(dvb_videosink, "sync", FALSE);
+   eDebug("[OPENBH_2A0B702] fallback native video = dreamvideosink sync=false");
+  }
+ }
+	if (dvb_videosink) {
+		gst_object_ref_sink(dvb_videosink);
+		eDebug("[eServiceFactoryMP3] **** dvb_videosink created ***");
+	} else
+		eDebug("[eServiceFactoryMP3] **** dvb_videosink NOT created missing plugin ****");
+	dvb_subsink = gst_element_factory_make("subsink", NULL);
+	if (dvb_subsink) {
+		gst_object_ref_sink(dvb_subsink);
+		eDebug("[eServiceFactoryMP3] **** dvb_subsink created ***");
+		dvb_subsink_ok = true;
+	} else
+		eDebug("[eServiceFactoryMP3] **** dvb_subsink NOT created missing plugin subsink ****");
+}
+
+/**
+ * @brief Starts playback of a media service referenced by the given service reference.
+ *
+ * This method checks and manages resources required for playback. On the very first play,
+ * it initializes GStreamer sinks and sets up internal counters. For subsequent plays,
+ * it increments the service counter. It then creates a new MP3 service instance and assigns
+ * it to the provided pointer.
+ *
+ * @param ref The service reference identifying the media to play.
+ * @param ptr Reference to a smart pointer where the newly created playable service will be stored.
+ * @return RESULT Returns 0 on success, or an error code otherwise.
+ *
+ * @note This function manages the initialization of GStreamer sinks only on the first play.
+ * @note The total number of services played is tracked and logged for debugging purposes.
+ */
+RESULT eServiceFactoryMP3::play(const eServiceReference& ref, ePtr<iPlayableService>& ptr) {
+	// check resources...
+	// creating gstreamer sinks for the very fisrt media
+	if (first_play_eServicemp3)
+		m_eServicemp3_counter++;
+	else {
+		first_play_eServicemp3 = true;
+		m_eServicemp3_counter = 1;
+		create_gstreamer_sinks();
+	}
+	eDebug("[eServiceFactoryMP3] ****new play service total services played is %d****", m_eServicemp3_counter);
 	ptr = new eServiceMP3(ref);
 	return 0;
 }
 
-RESULT eServiceFactoryMP3::record(const eServiceReference &ref, ePtr<iRecordableService> &ptr)
-{
-	if (ref.path.find("://") != std::string::npos)
-	{
+/**
+ * @brief Attempts to create a recordable MP3 service from the given service reference.
+ *
+ * This function checks if the provided service reference contains a path with a protocol (i.e., "://").
+ * If so, it creates a new eServiceMP3Record instance and assigns it to the output pointer.
+ * Otherwise, it sets the pointer to nullptr and returns an error code.
+ *
+ * @param ref The service reference to attempt to record from.
+ * @param ptr Output pointer that will be set to the created recordable service, or nullptr on failure.
+ * @return RESULT 0 on success, -1 on failure.
+ */
+RESULT eServiceFactoryMP3::record(const eServiceReference& ref, ePtr<iRecordableService>& ptr) {
+	if (ref.path.find("://") != std::string::npos) {
 		ptr = new eServiceMP3Record((eServiceReference&)ref);
 		return 0;
 	}
-	ptr=0;
+	ptr = nullptr;
 	return -1;
 }
 
-RESULT eServiceFactoryMP3::list(const eServiceReference &, ePtr<iListableService> &ptr)
-{
-	ptr=0;
+/**
+ * @brief Lists available MP3 services for a given service reference.
+ *
+ * This method attempts to populate the provided pointer with a list of
+ * MP3 services corresponding to the specified service reference.
+ *
+ * @param ref The service reference for which to list available MP3 services.
+ * @param ptr Reference to a pointer that will be set to the list of services if available,
+ *            or set to nullptr if no services are found.
+ * @return RESULT Returns 0 on success, or -1 if no services are available or an error occurs.
+ */
+RESULT eServiceFactoryMP3::list(const eServiceReference&, ePtr<iListableService>& ptr) {
+	ptr = nullptr;
 	return -1;
 }
 
-RESULT eServiceFactoryMP3::info(const eServiceReference &ref, ePtr<iStaticServiceInformation> &ptr)
-{
+/**
+ * @brief Provides static service information for a given service reference.
+ *
+ * This method retrieves static service information for the specified service reference
+ * and assigns it to the provided pointer. The information is typically used to display
+ * metadata about the service without opening it.
+ *
+ * @param ref The service reference for which to retrieve information.
+ * @param ptr Reference to a pointer that will be set to the static service information.
+ * @return RESULT Returns 0 on success, or an error code if the operation fails.
+ */
+RESULT eServiceFactoryMP3::info(const eServiceReference& ref, ePtr<iStaticServiceInformation>& ptr) {
 	ptr = m_service_info;
 	return 0;
 }
 
-class eMP3ServiceOfflineOperations: public iServiceOfflineOperations
-{
+/**
+ * @brief Provides offline operations for a given service reference.
+ *
+ * This method creates an instance of eMP3ServiceOfflineOperations for the specified service reference
+ * and assigns it to the provided pointer. This allows for operations such as deleting files or reindexing.
+ *
+ * @param ref The service reference for which to perform offline operations.
+ * @param ptr Reference to a pointer that will be set to the offline operations instance.
+ * @return RESULT Returns 0 on success, or an error code if the operation fails.
+ */
+class eMP3ServiceOfflineOperations : public iServiceOfflineOperations {
 	DECLARE_REF(eMP3ServiceOfflineOperations);
 	eServiceReference m_ref;
+
 public:
-	eMP3ServiceOfflineOperations(const eServiceReference &ref);
+	eMP3ServiceOfflineOperations(const eServiceReference& ref);
 
 	RESULT deleteFromDisk(int simulate);
-	RESULT getListOfFilenames(std::list<std::string> &);
+	RESULT getListOfFilenames(std::list<std::string>&);
 	RESULT reindex();
 };
 
 DEFINE_REF(eMP3ServiceOfflineOperations);
 
-eMP3ServiceOfflineOperations::eMP3ServiceOfflineOperations(const eServiceReference &ref): m_ref((const eServiceReference&)ref)
-{
-}
+eMP3ServiceOfflineOperations::eMP3ServiceOfflineOperations(const eServiceReference& ref)
+	: m_ref((const eServiceReference&)ref) {}
 
-RESULT eMP3ServiceOfflineOperations::deleteFromDisk(int simulate)
-{
-	if (!simulate)
-	{
+/**
+ * @brief Deletes the files associated with the service reference from disk.
+ *
+ * This method removes the main file, its metadata, and any associated cut files from disk.
+ * If the simulate parameter is set to 0, it performs the deletion; otherwise, it only simulates it.
+ *
+ * @param simulate If set to 0, actual deletion is performed; if non-zero, only simulation occurs.
+ * @return RESULT Returns 0 on success, or -1 if an error occurs.
+ */
+RESULT eMP3ServiceOfflineOperations::deleteFromDisk(int simulate) {
+	if (!simulate) {
 		std::list<std::string> res;
 		if (getListOfFilenames(res))
 			return -1;
 
-		eBackgroundFileEraser *eraser = eBackgroundFileEraser::getInstance();
+		eBackgroundFileEraser* eraser = eBackgroundFileEraser::getInstance();
 		if (!eraser)
 			eDebug("[eMP3ServiceOfflineOperations] FATAL !! can't get background file eraser");
 
-		for (std::list<std::string>::iterator i(res.begin()); i != res.end(); ++i)
-		{
-			eDebug("[eMP3ServiceOfflineOperations] Removing %s...", i->c_str());
+		for (std::list<std::string>::iterator i(res.begin()); i != res.end(); ++i) {
+			// eDebug("[eMP3ServiceOfflineOperations] Removing %s...", i->c_str());
 			if (eraser)
 				eraser->erase(i->c_str());
 			else
@@ -1631,27 +794,41 @@ RESULT eMP3ServiceOfflineOperations::deleteFromDisk(int simulate)
 	return 0;
 }
 
-RESULT eMP3ServiceOfflineOperations::getListOfFilenames(std::list<std::string> &res)
-{
+/**
+ * @brief Retrieves a list of filenames associated with the service reference.
+ *
+ * This method populates the provided list with the main file, its metadata file,
+ * cut files, and EIT files (if applicable). The filenames are derived from the
+ * service reference's path.
+ *
+ * @param res Output list that will be filled with the filenames.
+ * @return RESULT Returns 0 on success, or an error code if the operation fails.
+ */
+RESULT eMP3ServiceOfflineOperations::getListOfFilenames(std::list<std::string>& res) {
 	res.clear();
 	res.push_back(m_ref.path);
+	res.push_back(m_ref.path + ".meta");
+	res.push_back(m_ref.path + ".cuts");
+	std::string filename = m_ref.path;
+	size_t pos;
+	if ((pos = filename.rfind('.')) != std::string::npos) {
+		filename.erase(pos + 1);
+		res.push_back(filename + ".eit");
+		res.push_back(filename + ".txt");
+	}
 	return 0;
 }
 
-RESULT eMP3ServiceOfflineOperations::reindex()
-{
+RESULT eMP3ServiceOfflineOperations::reindex() {
 	return -1;
 }
 
-
-RESULT eServiceFactoryMP3::offlineOperations(const eServiceReference &ref, ePtr<iServiceOfflineOperations> &ptr)
-{
+RESULT eServiceFactoryMP3::offlineOperations(const eServiceReference& ref, ePtr<iServiceOfflineOperations>& ptr) {
 	ptr = new eMP3ServiceOfflineOperations(ref);
 	return 0;
 }
 
 // eStaticServiceMP3Info
-
 
 // eStaticServiceMP3Info is seperated from eServiceMP3 to give information
 // about unopened files.
@@ -1662,30 +839,35 @@ RESULT eServiceFactoryMP3::offlineOperations(const eServiceReference &ref, ePtr<
 
 DEFINE_REF(eStaticServiceMP3Info)
 
-eStaticServiceMP3Info::eStaticServiceMP3Info()
-{
-}
+eStaticServiceMP3Info::eStaticServiceMP3Info() {}
 
-RESULT eStaticServiceMP3Info::getName(const eServiceReference &ref, std::string &name)
-{
+/**
+ * @brief Retrieves the name of the service referenced by the given service reference.
+ *
+ * This method attempts to extract the name from the service reference. If the name is already set,
+ * it uses that; otherwise, it tries to parse metadata from a stream file or extracts the last part
+ * of the path as the name.
+ *
+ * @param ref The service reference for which to retrieve the name.
+ * @param name Output string that will be set to the service name.
+ * @return RESULT Returns 0 on success, or an error code if the operation fails.
+ */
+RESULT eStaticServiceMP3Info::getName(const eServiceReference& ref, std::string& name) {
 	if (ref.name.length())
 		name = ref.name;
-	else
-	{
+	else {
 		if (endsWith(ref.path, ".stream") && !m_parser.parseMeta(ref.path)) {
 			name = m_parser.m_name;
 			return 0;
 		}
 		size_t last = ref.path.rfind('/');
 		if (last != std::string::npos)
-			name = ref.path.substr(last+1);
+			name = ref.path.substr(last + 1);
 		else
 			name = ref.path;
 	}
-
 	return 0;
 }
-
 
 /**
  * @brief eStaticServiceMP3Info::getLength
@@ -1742,62 +924,79 @@ int eStaticServiceMP3Info::getLength(const eServiceReference& ref) {
 	return -1;
 }
 
-int eStaticServiceMP3Info::getInfo(const eServiceReference &ref, int w)
-{
-	switch (w)
-	{
-	case iServiceInformation::sTimeCreate:
-		{
+/**
+ * @brief Retrieves specific information about the service referenced by the given service reference.
+ *
+ * This method checks the requested information type (w) and retrieves the corresponding data
+ * from the file system, such as creation time or file size. If the requested information is not
+ * available, it returns a predefined constant indicating that the information is not applicable.
+ *
+ * @param ref The service reference for which to retrieve information.
+ * @param w The type of information requested (e.g., creation time, file size).
+ * @return int Returns the requested information or iServiceInformation::resNA if not available.
+ */
+int eStaticServiceMP3Info::getInfo(const eServiceReference& ref, int w) {
+	switch (w) {
+		case iServiceInformation::sTimeCreate: {
 			struct stat s = {};
-			if (stat(ref.path.c_str(), &s) == 0)
-			{
+			if (stat(ref.path.c_str(), &s) == 0) {
 				return s.st_mtime;
 			}
-		}
-		break;
-	case iServiceInformation::sFileSize:
-		{
+		} break;
+		case iServiceInformation::sFileSize: {
 			struct stat s = {};
-			if (stat(ref.path.c_str(), &s) == 0)
-			{
+			if (stat(ref.path.c_str(), &s) == 0) {
 				return s.st_size;
 			}
-		}
-		break;
+		} break;
 	}
 	return iServiceInformation::resNA;
 }
 
-long long eStaticServiceMP3Info::getFileSize(const eServiceReference &ref)
-{
+/**
+ * @brief Retrieves the file size of the service referenced by the given service reference.
+ *
+ * This method checks the file system for the size of the file associated with the service reference.
+ * If the file exists, it returns its size; otherwise, it returns 0.
+ *
+ * @param ref The service reference for which to retrieve the file size.
+ * @return long long Returns the file size in bytes, or 0 if the file does not exist.
+ */
+long long eStaticServiceMP3Info::getFileSize(const eServiceReference& ref) {
 	struct stat s = {};
-	if (stat(ref.path.c_str(), &s) == 0)
-	{
+	if (stat(ref.path.c_str(), &s) == 0) {
 		return s.st_size;
 	}
 	return 0;
 }
 
-RESULT eStaticServiceMP3Info::getEvent(const eServiceReference &ref, ePtr<eServiceEvent> &evt, time_t start_time)
-{
-	if (ref.path.find("://") != std::string::npos)
-	{
+/**
+ * @brief Retrieves the event associated with the service reference at a specific start time.
+ *
+ * This method attempts to find an event for the given service reference at the specified start time.
+ * If the service reference contains a protocol (e.g., "://"), it looks up the event in the EPG cache.
+ * If not, it tries to read an EIT file corresponding to the service reference's path.
+ *
+ * @param ref The service reference for which to retrieve the event.
+ * @param evt Output pointer that will be set to the found event, or nullptr if not found.
+ * @param start_time The start time for which to look up the event.
+ * @return RESULT Returns 0 on success, or -1 if no event is found or an error occurs.
+ */
+RESULT eStaticServiceMP3Info::getEvent(const eServiceReference& ref, ePtr<eServiceEvent>& evt, time_t start_time) {
+	if (ref.path.find("://") != std::string::npos) {
 		eServiceReference equivalentref(ref);
 		equivalentref.type = eServiceFactoryMP3::id;
 		equivalentref.path.clear();
 		return eEPGCache::getInstance()->lookupEventTime(equivalentref, start_time, evt);
-	}
-	else // try to read .eit file
+	} else // try to read .eit file
 	{
 		size_t pos;
 		ePtr<eServiceEvent> event = new eServiceEvent;
 		std::string filename = ref.path;
-		if ( (pos = filename.rfind('.')) != std::string::npos)
-		{
+		if ((pos = filename.rfind('.')) != std::string::npos) {
 			filename.erase(pos + 1);
 			filename += "eit";
-			if (!event->parseFrom(filename, 0))
-			{
+			if (!event->parseFrom(filename, 0)) {
 				evt = event;
 				return 0;
 			}
@@ -1810,50 +1009,36 @@ RESULT eStaticServiceMP3Info::getEvent(const eServiceReference &ref, ePtr<eServi
 DEFINE_REF(eStreamBufferInfo)
 
 eStreamBufferInfo::eStreamBufferInfo(int percentage, int inputrate, int outputrate, int space, int size)
-: bufferPercentage(percentage),
-	inputRate(inputrate),
-	outputRate(outputrate),
-	bufferSpace(space),
-	bufferSize(size)
-{
+	: bufferPercentage(percentage), inputRate(inputrate), outputRate(outputrate), bufferSpace(space), bufferSize(size) {
 }
 
-int eStreamBufferInfo::getBufferPercentage() const
-{
+int eStreamBufferInfo::getBufferPercentage() const {
 	return bufferPercentage;
 }
 
-int eStreamBufferInfo::getAverageInputRate() const
-{
+int eStreamBufferInfo::getAverageInputRate() const {
 	return inputRate;
 }
 
-int eStreamBufferInfo::getAverageOutputRate() const
-{
+int eStreamBufferInfo::getAverageOutputRate() const {
 	return outputRate;
 }
 
-int eStreamBufferInfo::getBufferSpace() const
-{
+int eStreamBufferInfo::getBufferSpace() const {
 	return bufferSpace;
 }
 
-int eStreamBufferInfo::getBufferSize() const
-{
+int eStreamBufferInfo::getBufferSize() const {
 	return bufferSize;
 }
 
 DEFINE_REF(eServiceMP3InfoContainer);
 
 eServiceMP3InfoContainer::eServiceMP3InfoContainer()
-: doubleValue(0.0), bufferValue(NULL), bufferData(NULL), bufferSize(0)
-{
-}
+	: doubleValue(0.0), bufferValue(NULL), bufferData(NULL), bufferSize(0) {}
 
-eServiceMP3InfoContainer::~eServiceMP3InfoContainer()
-{
-	if (bufferValue)
-	{
+eServiceMP3InfoContainer::~eServiceMP3InfoContainer() {
+	if (bufferValue) {
 		gst_buffer_unmap(bufferValue, &map);
 		gst_buffer_unref(bufferValue);
 		bufferValue = NULL;
@@ -1862,24 +1047,28 @@ eServiceMP3InfoContainer::~eServiceMP3InfoContainer()
 	}
 }
 
-double eServiceMP3InfoContainer::getDouble(unsigned int index) const
-{
+double eServiceMP3InfoContainer::getDouble(unsigned int index) const {
 	return doubleValue;
 }
 
-unsigned char *eServiceMP3InfoContainer::getBuffer(unsigned int &size) const
-{
+unsigned char* eServiceMP3InfoContainer::getBuffer(unsigned int& size) const {
 	size = bufferSize;
 	return bufferData;
 }
 
-void eServiceMP3InfoContainer::setDouble(double value)
-{
+void eServiceMP3InfoContainer::setDouble(double value) {
 	doubleValue = value;
 }
 
-void eServiceMP3InfoContainer::setBuffer(GstBuffer *buffer)
-{
+/**
+ * @brief Sets the buffer for the container and maps it for reading.
+ *
+ * This method takes a GstBuffer pointer, references it, and maps it for reading.
+ * It stores the mapped data and size in the container for later access.
+ *
+ * @param buffer The GstBuffer to set in the container.
+ */
+void eServiceMP3InfoContainer::setBuffer(GstBuffer* buffer) {
 	bufferValue = buffer;
 	gst_buffer_ref(bufferValue);
 	gst_buffer_map(bufferValue, &map, GST_MAP_READ);
@@ -1887,164 +1076,145 @@ void eServiceMP3InfoContainer::setBuffer(GstBuffer *buffer)
 	bufferSize = map.size;
 }
 
+/* OPENBH_2A0B702_COMPAT: OpenATV's synchronous stop() completes before return. */
+bool eServiceMP3::waitForHardwareRelease(unsigned int timeout_ms)
+{
+ (void)timeout_ms;
+ return true;
+}
+
 // eServiceMP3
-int eServiceMP3::ac3_delay = 0,
-    eServiceMP3::pcm_delay = 0;
+int eServiceMP3::ac3_delay = 0, eServiceMP3::pcm_delay = 0;
 
-
-// OPENATV_FULLPORT_1: OpenATV subtitle selector active-pad commit.
-// This callback runs in a GStreamer thread.  It neither accesses the
-// eServiceMP3 object nor waits on a streaming thread from the E2 UI.
-static void openatv_port_force_selector_commit(GstElement *, gpointer user_data)
-{
-    GstPad *pad = GST_PAD(user_data);
-    gst_pad_send_event(pad, gst_event_new_custom(
-        GST_EVENT_CUSTOM_DOWNSTREAM_OOB,
-        gst_structure_new_empty("eServiceMP3-force-selector-commit")));
-}
-
-// OPENATV_FULLPORT_1: states are requested on the GStreamer pool, never using
-// a blocking gst_element_get_state() wait on Enigma2's UI thread. The playbin
-// owns the queued call and the callback never dereferences eServiceMP3.
-static void openatv_port_set_pipeline_state(GstElement *element, gpointer user_data)
-{
-    GstState target = (GstState)GPOINTER_TO_INT(user_data);
-    GstStateChangeReturn result = gst_element_set_state(element, target);
-    eDebug("[OPENATV_FULLPORT_1] worker set_state target=%d result=%d", (int)target, (int)result);
-}
-
-eServiceMP3::eServiceMP3(eServiceReference ref):
-	m_nownext_timer(eTimer::create(eApp)),
-	m_cuesheet_changed(0),
-	m_cutlist_enabled(1),
-	m_ref(ref),
-	m_pump(eApp, 1, "Servicemp3")
-{
+/**
+ * @brief Constructs an eServiceMP3 object with the given service reference.
+ *
+ * This constructor initializes various timers, subtitle parsers, and other member variables
+ * required for handling MP3 services. It also sets up connections for handling subtitle synchronization,
+ * DVB subtitle parsing, and other service-related events.
+ *
+ * @param ref The service reference for the MP3 service to be created.
+ */
+eServiceMP3::eServiceMP3(eServiceReference ref)
+	: m_nownext_timer(eTimer::create(eApp)), m_cuesheet_changed(0), m_cutlist_enabled(1), m_ref(ref),
+	  m_pump(eApp, 1, "eServiceMP3") {
 	m_subtitle_sync_timer = eTimer::create(eApp);
 	m_dvb_subtitle_sync_timer = eTimer::create(eApp);
+	m_audio_switch_timer = eTimer::create(eApp);
 	m_dvb_subtitle_parser = new eDVBSubtitleParser();
-	m_dvb_subtitle_parser->connectNewPage(sigc::mem_fun(*this, &eServiceMP3::newDVBSubtitlePage), m_new_dvb_subtitle_page_connection);
-	m_passthrough_fix_timer = eTimer::create(eApp);
-	m_dash_recover_timer = eTimer::create(eApp);
-	m_dash_recover_count = 0;
-	m_dash_recover_last = 0;
-	m_audio_switch_deferred = -1;
-	m_audio_switch_flush_phase = AudioSwitchFlushNone;
-	m_audio_switch_flush_resume = true;
-	m_audio_switch_flush_resuming = false;
-	m_subtitle_switch_deferred = false;
-	m_subtitle_switch_needs_flush = false;
-	m_subtitle_generation = 0;
+	m_dvb_subtitle_parser->connectNewPage(sigc::mem_fun(*this, &eServiceMP3::newDVBSubtitlePage),
+										  m_new_dvb_subtitle_page_connection);
+	m_pgs_subtitle_parser = new ePGSSubtitleParser();
+	m_pgs_subtitle_parser->connectNewPage(sigc::mem_fun(*this, &eServiceMP3::newDVBSubtitlePage),
+										  m_new_pgs_subtitle_page_connection);
 	m_stream_tags = 0;
 	m_currentAudioStream = -1;
 	m_currentSubtitleStream = -1;
-	m_cachedSubtitleStream = -2; /* report subtitle stream to be 'cached'. TODO: use an actual cache. */
-	m_autoturnon = eConfigManager::getConfigBoolValue("config.subtitles.pango_autoturnon", true);
+	m_cachedSubtitleStream = -2; /* report the first subtitle stream to be 'cached'. TODO: use an actual cache. */
 	m_subtitle_widget = 0;
 	m_currentTrickRatio = 1.0;
-	m_buffer_size = 5 * 1024 * 1024;
+	m_buffer_size = 5LL * 1024LL * 1024LL;
 	m_ignore_buffering_messages = 0;
 	m_is_live = false;
-	m_pip_decoder = -1;
-	m_pip_applied = false;
 	m_use_prefillbuffer = false;
 	m_paused = false;
 	m_clear_buffers = true;
 	m_initial_start = false;
 	m_send_ev_start = true;
-	m_first_frame_fired = false;
-	m_seek_paused = false;
+	m_pending_seek_pos = -1;
+	m_prerolled = false;
+	m_resume_pending = false;
+	m_subtitle_requested = false;
+	m_first_paused = false;
 	m_cuesheet_loaded = false; /* cuesheet CVR */
+	m_audiosink_not_running = false;
+	m_is_dash_pipeline = false;
+	m_is_adaptive_stream = false;
 	m_use_chapter_entries = false; /* TOC chapter support CVR */
-	m_last_seek_pos = 0; /* CVR last seek position */
-	m_pending_start_position = -1;
-	m_start_events_deferred = false;
-	m_useragent = "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36";
+	m_play_position_timer = eTimer::create(eApp);
+	CONNECT(m_play_position_timer->timeout, eServiceMP3::playPositionTiming);
+	m_last_seek_count = -10;
+	m_seeking_or_paused = false;
+	m_last_trickseek_ms = 0;
+#ifdef DREAMNEXTGEN
+	m_wind_timer = eTimer::create(eApp);
+	CONNECT(m_wind_timer->timeout, eServiceMP3::windTick);
+	m_wind_ratio = 0;
+	m_wind_start = 0;
+	m_wind_start_ms = 0;
+	m_wind_seek_ms = 0;
+	m_wind_vpts = 0;
+#endif
+	m_to_paused = false;
+	m_last_seek_pos = 0;
+	m_media_lenght = 0;
+	m_useragent = "HbbTV/1.1.1 (+PVR+RTSP+DL; Sonic; TV44; 1.32.455; 2.002) Bee/3.5";
 	m_extra_headers = "";
 	m_download_buffer_path = "";
 	m_prev_decoder_time = -1;
 	m_decoder_time_valid_state = 0;
-	m_position_baseline_valid = false;
-	m_position_correction_enabled = true;
-	m_position_baseline = 0;
-	m_position_baseline_provisional = -1;
-	m_position_baseline_first_seen_us = 0;
+	m_initial_vtt_mpegts = 0; // Initialize base MPEGTS for WebVTT sync
+	m_vtt_live_base_time = -1;
+	m_vtt_live = false;
 	m_errorInfo.missing_codec = "";
-	audioSink = videoSink = NULL;
 	m_decoder = NULL;
+	m_subs_to_pull_handler_id = m_notify_source_handler_id = m_notify_element_added_handler_id = 0;
+	m_cc_probe_pad = nullptr;
+	m_cc_probe_id = 0;
+	m_cc_probe_context = nullptr;
+	m_cc_notify_pipe[0] = m_cc_notify_pipe[1] = -1;
+	m_cc_available = false;
+	m_cc_generation = 0;
+	m_cc_enabled = false;
+	m_cc_from_video = true;
+	gst_segment_init(&m_cc_segment, GST_FORMAT_TIME);
+	m_cc_sync_timer = eTimer::create(eApp);
+	CONNECT(m_cc_sync_timer->timeout, eServiceMP3::pushClosedCaptions);
+	if (pipe2(m_cc_notify_pipe, O_NONBLOCK | O_CLOEXEC) == 0) {
+		m_cc_notify = eSocketNotifier::create(eApp, m_cc_notify_pipe[0], eSocketNotifier::Read);
+		CONNECT(m_cc_notify->activated, eServiceMP3::captionDataReady);
+	} else {
+		eWarning("[eServiceMP3] caption notification pipe failed: %m");
+	}
 
 	std::string sref = ref.toString();
-	eDebug("[eServiceMP3] Init start %s", ref.toString().c_str());
-	if (!sref.empty())
-	{
-		eDebug("[eServiceMP3] Init start !sref.empty()");
-		std::vector<eIPTVDBItem> &iptv_services = eDVBDB::getInstance()->iptv_services;
-		for(std::vector<eIPTVDBItem>::iterator it = iptv_services.begin(); it != iptv_services.end(); ++it)
-		{
-			if (sref.find(it->s_ref) != std::string::npos)
-			{
-				m_currentAudioStream = it->ampeg_pid;
-				m_currentSubtitleStream = it->subtitle_pid;
+	if (!sref.empty()) {
+		sref = replace_all(sref, ",", "_");
+		std::vector<ePtr<eDVBService>>& iptv_services = eDVBDB::getInstance()->iptv_services;
+		for (std::vector<ePtr<eDVBService>>::iterator it = iptv_services.begin(); it != iptv_services.end(); ++it) {
+			// eDebug("[eServiceMP3] iptv_services m_reference_str : %s", (*it)->m_reference_str.c_str());
+			if (sref.find((*it)->m_reference_str) != std::string::npos) {
+				if (eConfigManager::getConfigBoolValue("config.autolanguage.audio_usecache", true))
+					m_initialAudioStream = (*it)->getCacheEntry(eDVBService::cMPEGAPID);
+				m_currentSubtitleStream = (*it)->getCacheEntry(eDVBService::cSUBTITLE);
 				m_cachedSubtitleStream = m_currentSubtitleStream;
-				eDebug("[eServiceMP3] Init start iptv_service use sref pid's A: %d; S: %d", m_currentAudioStream, it->subtitle_pid);
 				break;
 			}
 		}
 	}
-
 	CONNECT(m_subtitle_sync_timer->timeout, eServiceMP3::pushSubtitles);
 	CONNECT(m_dvb_subtitle_sync_timer->timeout, eServiceMP3::pushDVBSubtitles);
+	CONNECT(m_audio_switch_timer->timeout, eServiceMP3::retryAudioSwitch);
 	CONNECT(m_pump.recv_msg, eServiceMP3::gstPoll);
 	CONNECT(m_nownext_timer->timeout, eServiceMP3::updateEpgCacheNowNext);
-	CONNECT(m_passthrough_fix_timer->timeout, eServiceMP3::forceAudioReset);
-	CONNECT(m_dash_recover_timer->timeout, eServiceMP3::dashRecover);
-
 	m_aspect = m_width = m_height = m_framerate = m_progressive = m_gamma = -1;
-	m_hdr_type = 0;
-	m_br_last_video_bytes = m_br_last_audio_bytes = 0;
-	m_br_last_us = 0;
-	m_br_audio_idx = -1;
-	m_br_video_kbps = m_br_audio_kbps = 0;
-#ifdef HAS_SOFTWARE_HDR_DETECTION
-	m_hdr_probe_id = 0;
-	m_hdr_probe_pad = NULL;
-	g_atomic_int_set(&m_hdr_probe_active, 0);
-	m_hdr_probe_last_classify = 0;
-	m_hdr_probe_first_sps_at = 0;
-	g_mutex_init(&m_hdr_probe_mutex);
-#endif
 
 	m_state = stIdle;
+	m_gstdot = eConfigManager::getConfigBoolValue("config.crash.gstdot", false);
 	m_coverart = false;
-	eDebug("[eServiceMP3] construct!");
+	m_subtitles_paused = false;
+	// eDebug("[eServiceMP3] construct!");
 
-	const char *filename;
+	const char* filename;
 	std::string filename_str;
-	/* "&e2clearkeys=<kid>=<key>[,<kid>=<key>...]" (hex) - ClearKey CENC keys
-	 * handed to the cencdec element via handleDeepElementAdded(). Stripped from
-	 * the path here, ahead of the extension/"#" parsing below, so that neither
-	 * is thrown off by it (e.g. "x.mpd&e2clearkeys=..." must still be seen as
-	 * ".mpd") and it never reaches the source element. */
-	size_t pos = m_ref.path.find("&e2clearkeys=");
-	if (pos != std::string::npos && m_ref.path.compare(0, 4, "http") == 0)
-	{
-		size_t kstart = pos + strlen("&e2clearkeys=");
-		size_t kend = m_ref.path.find_first_of("&#", kstart);
-		m_clearkeys = m_ref.path.substr(kstart, kend == std::string::npos ? std::string::npos : kend - kstart);
-		m_ref.path.erase(pos, kend == std::string::npos ? std::string::npos : kend - pos);
-		eDebug("[eServiceMP3] construct: e2clearkeys supplied (%zu bytes)", m_clearkeys.size());
-	}
-	pos = m_ref.path.find('#');
-	size_t pos_q = m_ref.path.find('?');
-	if (pos != std::string::npos && (m_ref.path.compare(0, 4, "http") == 0 || m_ref.path.compare(0, 4, "rtsp") == 0))
-	{
+	size_t pos = m_ref.path.find('#');
+	if (pos != std::string::npos && (m_ref.path.compare(0, 4, "http") == 0 || m_ref.path.compare(0, 4, "rtsp") == 0)) {
 		filename_str = m_ref.path.substr(0, pos);
 		filename = filename_str.c_str();
 		m_extra_headers = m_ref.path.substr(pos + 1);
 
 		pos = m_extra_headers.find("User-Agent=");
-		if (pos != std::string::npos)
-		{
+		if (pos != std::string::npos) {
 			size_t hpos_start = pos + 11;
 			size_t hpos_end = m_extra_headers.find('&', hpos_start);
 			if (hpos_end != std::string::npos)
@@ -2052,273 +1222,291 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			else
 				m_useragent = m_extra_headers.substr(hpos_start);
 		}
-	}
-	else
-	{
-		filename_str = m_ref.path;
+	} else
 		filename = m_ref.path.c_str();
-	}
 
-	std::string realFilename_str;
-	const char *realFilename;
+	/* OpenBH eServiceReference exposes path; no alternativeurl field. */
 
-	if (pos_q != std::string::npos)
+	// optional start position/tracks, strip them before "&suburi=" below
 	{
-		realFilename_str = filename_str.substr(0, pos_q);
-		realFilename = realFilename_str.c_str();
+		static const char* const markers[] = {"&e2startoffset=", "&e2audiotrack=", "&e2subtitletrack="};
+		std::string url = filename;
+		bool stripped = false;
+		for (int p = 0; p < 3; p++) {
+			size_t ppos = url.find(markers[p]);
+			if (ppos == std::string::npos)
+				continue;
+			size_t value_start = ppos + strlen(markers[p]);
+			size_t value_end = url.find('&', value_start);
+			std::string value = url.substr(value_start, value_end == std::string::npos ? std::string::npos : value_end - value_start);
+			url.erase(ppos, (value_end == std::string::npos ? url.size() : value_end) - ppos);
+			stripped = true;
+			switch (p) {
+				case 0:
+					m_pending_seek_pos = atoll(value.c_str());
+					if (m_pending_seek_pos < 0)
+						m_pending_seek_pos = -1;
+					else
+						m_resume_pending = true;
+					eDebug("[eServiceMP3] e2startoffset=%lld", (long long)m_pending_seek_pos);
+					break;
+				case 1:
+					m_initialAudioStream = atoi(value.c_str());
+					eDebug("[eServiceMP3] e2audiotrack=%d", m_initialAudioStream);
+					break;
+				case 2: {
+					// picked up via getCachedSubtitle(), negative = no subtitle
+					int index = atoi(value.c_str());
+					m_cachedSubtitleStream = index >= 0 ? index : -1;
+					m_subtitle_requested = true;
+					eDebug("[eServiceMP3] e2subtitletrack=%d", m_cachedSubtitleStream);
+				} break;
+			}
+		}
+		if (stripped) {
+			filename_str = url;
+			filename = filename_str.c_str();
+		}
 	}
-	else
-		realFilename = filename_str.c_str();
 
-	const char *ext = strrchr(realFilename, '.');
+	gchar* suburi = NULL;
+
+	m_external_subtitle_path = "";
+	m_external_subtitle_language = "";
+	m_external_subtitle_extension = "";
+
+	std::string suburi_source = filename;
+	pos = suburi_source.find("&suburi=");
+	if (pos != std::string::npos) {
+		filename_str = suburi_source;
+
+		std::string suburi_str = filename_str.substr(pos + 8);
+		filename = suburi_str.c_str();
+		m_external_subtitle_path = suburi_str;
+		suburi = g_strdup_printf("%s", filename);
+
+		filename_str = filename_str.substr(0, pos);
+		filename = filename_str.c_str();
+	} /* OpenBH eServiceReference has no suburi member; &suburi= is supported above. */
+
+	if (!m_external_subtitle_path.empty()) {
+		std::string suburi_str = m_external_subtitle_path;
+		pos = suburi_str.find_last_of(".");
+		if (pos != std::string::npos) {
+			m_external_subtitle_extension = suburi_str.substr(pos + 1);
+			suburi_str = suburi_str.substr(0, pos);
+		}
+
+		pos = suburi_str.find_last_of(".");
+		if (pos != std::string::npos) {
+			m_external_subtitle_language = suburi_str.substr(pos + 1);
+			if (m_external_subtitle_language.size() > 3)
+				m_external_subtitle_language = "";
+		}
+		eDebug("[eServiceMP3] m_external_subtitle_path: %s m_external_subtitle_extension: %s "
+			   "m_external_subtitle_language: %s",
+			   m_external_subtitle_path.c_str(), m_external_subtitle_extension.c_str(),
+			   m_external_subtitle_language.c_str());
+	}
+
+	const char* ext = strrchr(filename, '.');
 	if (!ext)
-		ext = realFilename + strlen(realFilename);
-
-	eDebug("[ServiceMP3] ext = %s", ext);
+		ext = filename + strlen(filename);
 
 	m_sourceinfo.is_video = FALSE;
 	m_sourceinfo.audiotype = atUnknown;
-	if (strcasecmp(ext, ".mpeg") == 0 || strcasecmp(ext, ".mpe") == 0 || strcasecmp(ext, ".mpg") == 0 || strcasecmp(ext, ".vob") == 0 || strcasecmp(ext, ".bin") == 0)
-	{
+	if ((strcasecmp(ext, ".mpeg") && strcasecmp(ext, ".mpg") && strcasecmp(ext, ".vob") && strcasecmp(ext, ".bin") &&
+		 strcasecmp(ext, ".dat")) == 0) {
 		m_sourceinfo.containertype = ctMPEGPS;
 		m_sourceinfo.is_video = TRUE;
-	}
-	else if (strcasecmp(ext, ".ts") == 0)
-	{
+	} else if (strcasecmp(ext, ".ts") == 0) {
 		m_sourceinfo.containertype = ctMPEGTS;
 		m_sourceinfo.is_video = TRUE;
-	}
-	else if (strcasecmp(ext, ".mkv") == 0)
-	{
+	} else if (strcasecmp(ext, ".mkv") == 0) {
 		m_sourceinfo.containertype = ctMKV;
 		m_sourceinfo.is_video = TRUE;
-	}
-	else if (strcasecmp(ext, ".ogm") == 0 || strcasecmp(ext, ".ogv") == 0)
-	{
+	} else if (strcasecmp(ext, ".ogm") == 0 || strcasecmp(ext, ".ogv") == 0) {
 		m_sourceinfo.containertype = ctOGG;
 		m_sourceinfo.is_video = TRUE;
-	}
-	else if (strcasecmp(ext, ".avi") == 0 || strcasecmp(ext, ".divx") == 0)
-	{
+	} else if (strcasecmp(ext, ".avi") == 0 || strcasecmp(ext, ".divx") == 0) {
 		m_sourceinfo.containertype = ctAVI;
 		m_sourceinfo.is_video = TRUE;
-	}
-	else if (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".mov") == 0 || strcasecmp(ext, ".m4v") == 0 || strcasecmp(ext, ".3gp") == 0 || strcasecmp(ext, ".3g2") == 0)
-	{
+	} else if (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".mov") == 0 || strcasecmp(ext, ".m4v") == 0 ||
+			   strcasecmp(ext, ".3gp") == 0 || strcasecmp(ext, ".3g2") == 0) {
 		m_sourceinfo.containertype = ctMP4;
 		m_sourceinfo.is_video = TRUE;
-	}
-	else if (strcasecmp(ext, ".asf") == 0 || strcasecmp(ext, ".wmv") == 0)
-	{
+	} else if (strcasecmp(ext, ".asf") == 0 || strcasecmp(ext, ".wmv") == 0) {
 		m_sourceinfo.containertype = ctASF;
 		m_sourceinfo.is_video = TRUE;
-	}
-	else if (strcasecmp(ext, ".webm") == 0)
-	{
-		m_sourceinfo.containertype = ctWEBM;
+	} else if (strcasecmp(ext, ".webm") == 0) {
+		m_sourceinfo.containertype = ctMKV;
 		m_sourceinfo.is_video = TRUE;
-	}
-	else if ( strcasecmp(ext, ".dra") == 0 )
-	{
+	} else if (strcasecmp(ext, ".m4a") == 0) {
+		m_sourceinfo.containertype = ctMP4;
+		m_sourceinfo.audiotype = atAAC;
+	} else if (strcasecmp(ext, ".dra") == 0) {
 		m_sourceinfo.containertype = ctDRA;
 		m_sourceinfo.audiotype = atDRA;
-	}
-	else if (strcasecmp(ext, ".m3u8") == 0)
+	} else if (strcasecmp(ext, ".m3u8") == 0)
 		m_sourceinfo.is_hls = TRUE;
-	else if (strcasecmp(ext, ".mpd") == 0)
-		m_sourceinfo.is_dash = TRUE;
-	else if (strcasecmp(ext, ".mp3") == 0)
-	{
+	else if (strcasecmp(ext, ".mpd") == 0) {
+		m_sourceinfo.is_video = TRUE;  /* .mpd → DASH pipeline branch below */
+	}
+	else if (strcasecmp(ext, ".mp3") == 0) {
 		m_sourceinfo.audiotype = atMP3;
 		m_sourceinfo.is_audio = TRUE;
-	}
-	else if (strcasecmp(ext, ".wma") == 0)
-	{
+	} else if (strcasecmp(ext, ".wma") == 0) {
 		m_sourceinfo.audiotype = atWMA;
 		m_sourceinfo.is_audio = TRUE;
-	}
-	else if (strcasecmp(ext, ".wav") == 0 || strcasecmp(ext, ".wave") == 0 || strcasecmp(ext, ".wv") == 0)
-	{
+	} else if (strcasecmp(ext, ".wav") == 0) {
+		m_sourceinfo.audiotype = atPCM;
+		m_sourceinfo.is_audio = TRUE;
+	} else if (strcasecmp(ext, ".dts") == 0) {
+		m_sourceinfo.audiotype = atDTS;
+		m_sourceinfo.is_audio = TRUE;
+	} else if (strcasecmp(ext, ".flac") == 0) {
+		m_sourceinfo.audiotype = atFLAC;
+		m_sourceinfo.is_audio = TRUE;
+	} else if (strcasecmp(ext, ".cda") == 0) {
+		m_sourceinfo.containertype = ctCDA;
 		m_sourceinfo.audiotype = atPCM;
 		m_sourceinfo.is_audio = TRUE;
 	}
-	else if (strcasecmp(ext, ".dtshd") == 0 || strcasecmp(ext, ".dts-hd") == 0)
-	{
-		m_sourceinfo.audiotype = atDTSHD;
-		m_sourceinfo.is_audio = TRUE;
-	}
-	else if (strcasecmp(ext, ".dts") == 0)
-	{
-		m_sourceinfo.audiotype = atDTS;
-		m_sourceinfo.is_audio = TRUE;
-	}
-	else if (strcasecmp(ext, ".flac") == 0)
-	{
-		m_sourceinfo.audiotype = atFLAC;
-		m_sourceinfo.is_audio = TRUE;
-	}
-	else if (strcasecmp(ext, ".ac3") == 0)
-	{
-		m_sourceinfo.audiotype = atAC3;
-		m_sourceinfo.is_audio = TRUE;
-	}
-	else if (strcasecmp(ext, ".aache") == 0 || strcasecmp(ext, ".heaac") == 0 || strcasecmp(ext, ".he-aac") == 0 || strcasecmp(ext, ".aac-he") == 0)
-	{
-		m_sourceinfo.audiotype = atAACHE;
-		m_sourceinfo.is_audio = TRUE;
-	}
-	else if (strcasecmp(ext, ".aac") == 0 || strcasecmp(ext, ".adts") == 0 || strcasecmp(ext, ".aac-lc") == 0 || strcasecmp(ext, ".aaclc") == 0 || strcasecmp(ext, ".mp4a") == 0 || strcasecmp(ext, ".m4a") == 0 ||
-         strcasecmp(ext, ".alac") == 0)
-	{
-		m_sourceinfo.audiotype = atAAC;
-		m_sourceinfo.is_audio = TRUE;
-	}
-	else if (strcasecmp(ext, ".cda") == 0)
-		m_sourceinfo.containertype = ctCDA;
-	if (strcasecmp(ext, ".dat") == 0)
-	{
+	if (strcasecmp(ext, ".dat") == 0) {
 		m_sourceinfo.containertype = ctVCD;
 		m_sourceinfo.is_video = TRUE;
 	}
 	if (strstr(filename, "://"))
 		m_sourceinfo.is_streaming = TRUE;
-
-	/* Optional "&e2startoffset=<pts>", "&e2audiotrack=<index>" and
-	 * "&e2subtitletrack=<index>" parameters, in the same ad-hoc
-	 * "&key=value" style as "&suburi=" below - lets a caller (e.g. a
-	 * custom Python movie player) request the position/tracks playback
-	 * starts at directly, instead of always starting at 0/track 0 and
-	 * jumping/switching afterward. Parsed and stripped from filename/
-	 * filename_str here, before "&suburi=" below, so that catch-all
-	 * (which takes everything to the end of the string as its value)
-	 * doesn't swallow whichever of these happens to follow it. */
-	{
-		static const struct { const char *marker; int which; } url_params[] = {
-			{ "&e2startoffset=", 0 },
-			{ "&e2audiotrack=", 1 },
-			{ "&e2subtitletrack=", 2 },
-		};
-		for (unsigned int p = 0; p < sizeof(url_params) / sizeof(url_params[0]); p++)
-		{
-			size_t ppos = filename_str.find(url_params[p].marker);
-			if (ppos == std::string::npos)
-				continue;
-			size_t value_start = ppos + strlen(url_params[p].marker);
-			size_t value_end = filename_str.find('&', value_start);
-			std::string value = (value_end == std::string::npos) ?
-				filename_str.substr(value_start) :
-				filename_str.substr(value_start, value_end - value_start);
-			switch (url_params[p].which)
-			{
-			case 0:
-				m_pending_start_position = atoll(value.c_str());
-				eDebug("[eServiceMP3] construct: e2startoffset=%lld", (long long)m_pending_start_position);
-				break;
-			case 1:
-				m_currentAudioStream = atoi(value.c_str());
-				eDebug("[eServiceMP3] construct: e2audiotrack=%d", m_currentAudioStream);
-				break;
-			case 2:
-			{
-				int subtitle_idx = atoi(value.c_str());
-				/* Normalize any negative value to exactly -1 ("no track"),
-				 * matching the convention used everywhere else. */
-				m_currentSubtitleStream = subtitle_idx >= 0 ? subtitle_idx : -1;
-				m_cachedSubtitleStream = m_currentSubtitleStream;
-				eDebug("[eServiceMP3] construct: e2subtitletrack=%d", m_currentSubtitleStream);
-				break;
-			}
-			}
-			filename_str.erase(ppos, (value_end == std::string::npos ? filename_str.size() : value_end) - ppos);
-			filename = filename_str.c_str();
-		}
+	const int mediaHint = m_ref.getData(7) & DVB_I_MEDIA_MASK;
+	const bool isHttp = !strncmp(filename, "http://", 7) || !strncmp(filename, "https://", 8);
+	m_is_adaptive_stream = isHttp && (mediaHint == DVB_I_DASH || mediaHint == DVB_I_HLS);
+#ifndef DREAMNEXTGEN
+	// Use caps discovery on DVB hardware, also for broadcast Internet links.
+	// The Dream-specific fixed DASH pipeline forces AVC instead of byte-stream
+	// and only exposes one audio track; it must not replace normal playbin here.
+	m_is_adaptive_stream = m_is_adaptive_stream || (isHttp && isDashUri(filename));
+#endif
+	if (m_is_adaptive_stream) {
+		m_sourceinfo.is_hls = mediaHint == DVB_I_HLS;
+		m_sourceinfo.is_audio = m_ref.getData(0) == 2;
+		m_sourceinfo.is_video = !m_sourceinfo.is_audio;
 	}
 
-	gchar *uri;
-	gchar *suburi = NULL;
-
-	pos = m_ref.path.find("&suburi=");
-	if (pos != std::string::npos)
-	{
-		filename_str = filename;
-
-		std::string suburi_str = filename_str.substr(pos + 8);
-		filename = suburi_str.c_str();
-		suburi = g_strdup_printf ("%s", filename);
-
-		filename_str = filename_str.substr(0, pos);
-		filename = filename_str.c_str();
+	/* extension-less URLs: detect audio-only via bouquet service type or URL path */
+	if (!m_sourceinfo.is_audio && !m_sourceinfo.is_video) {
+		if (m_ref.getData(0) == 2
+		    || strcasestr(filename, "/mp3/")
+		    || strcasestr(filename, "/aac/")
+		    || strcasestr(filename, "/audio/"))
+			m_sourceinfo.is_audio = TRUE;
 	}
 
-	if ( m_sourceinfo.is_streaming )
-	{
+	gchar* uri;
+
+	if (m_sourceinfo.is_streaming) {
 		if (eConfigManager::getConfigBoolValue("config.mediaplayer.useAlternateUserAgent"))
 			m_useragent = eConfigManager::getConfigValue("config.mediaplayer.alternateUserAgent");
 
-		uri = g_strdup_printf ("%s", filename);
+		uri = g_strdup_printf("%s", filename);
 
-		if ( m_ref.getData(7) & BUFFERING_ENABLED )
-		{
+		if (m_ref.getData(7) & BUFFERING_ENABLED) {
 			m_use_prefillbuffer = true;
-			if ( m_ref.getData(7) & PROGRESSIVE_DOWNLOAD )
-			{
+			if (m_ref.getData(7) & PROGRESSIVE_DOWNLOAD) {
 				/* progressive download buffering */
-				if (::access("/hdd/movie", X_OK) >= 0)
-				{
+				if (::access("/hdd/movie", X_OK) >= 0) {
 					/* It looks like /hdd points to a valid mount, so we can store a download buffer on it */
 					m_download_buffer_path = "/hdd/gstreamer_XXXXXXXXXX";
 				}
 			}
 		}
-	}
-	else if ( m_sourceinfo.containertype == ctCDA )
-	{
-		int i_track = atoi(filename+17);
-		uri = g_strdup_printf ("cdda://%i", i_track);
-	}
-	else if ( m_sourceinfo.containertype == ctVCD )
-	{
+	} else if (m_sourceinfo.containertype == ctCDA) {
+		int i_track = atoi(filename + (strlen(filename) - 6));
+		uri = g_strdup_printf("cdda://%i", i_track);
+	} else if (m_sourceinfo.containertype == ctVCD) {
 		int ret = -1;
-		int fd = open(filename,O_RDONLY);
-		if (fd >= 0)
-		{
-			char* tmp = new char[128*1024];
-			ret = read(fd, tmp, 128*1024);
+		int fd = open(filename, O_RDONLY);
+		if (fd >= 0) {
+			char* tmp = new char[128 * 1024];
+			ret = read(fd, tmp, 128 * 1024);
 			close(fd);
-			delete [] tmp;
+			delete[] tmp;
 		}
-		if ( ret == -1 ) // this is a "REAL" VCD
-			uri = g_strdup_printf ("vcd://");
+		if (ret == -1) // this is a "REAL" VCD
+			uri = g_strdup_printf("vcd://");
 		else
 			uri = g_filename_to_uri(filename, NULL, NULL);
-	}
-	else
+	} else
 		uri = g_filename_to_uri(filename, NULL, NULL);
 
+	std::string uri_string = uri ? uri : "";
+	// Keep the legacy HbbTV workaround. DVB-I uses normal caps discovery and HW sinks.
+	m_is_dash_pipeline = m_sourceinfo.is_streaming && isDashUri(uri_string) && !m_is_adaptive_stream;
+
+	if (m_is_dash_pipeline) {
+		/* playbin auto-plug stalls dreamvideosink on .mpd; build explicit pipeline. */
+		eDebug("[eServiceMP3] DASH uri=%s", uri);
+		m_is_live = true;
+		m_use_prefillbuffer = false;
+		m_gst_playbin = createDashPlaybackPipeline(uri_string, m_useragent);
+		if (m_gst_playbin) {
+			GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(m_gst_playbin));
+			gst_bus_set_sync_handler(bus, gstBusSyncHandler, this, NULL);
+			gst_object_unref(bus);
+
+			/* Single AAC entry for the audio-track UI; track switching N/A. */
+			m_audioStreams.clear();
+			audioStream audio;
+			audio.type = atAAC;
+			audio.language_code = "und";
+			audio.codec = "AAC";
+			m_audioStreams.push_back(audio);
+			m_currentAudioStream = 0;
+		} else {
+			m_event((iPlayableService*)this, evUser + 12);
+			m_gst_playbin = NULL;
+			m_errorInfo.error_message = "failed to create GStreamer DASH pipeline!\n";
+			eDebug("[eServiceMP3] sorry, can't play DASH: %s", m_errorInfo.error_message.c_str());
+		}
+	} else {
 	eDebug("[eServiceMP3] playbin uri=%s", uri);
 	if (suburi != NULL)
 		eDebug("[eServiceMP3] playbin suburi=%s", suburi);
-	m_gst_playbin = gst_element_factory_make("playbin", "playbin");
-	if ( m_gst_playbin )
-	{
-		/*
-		 * avoid video conversion, let the dvbmediasink handle that using native video flag
-		 * volume control is done by hardware, do not use soft volume flag
-		 */
-		guint flags = GST_PLAY_FLAG_AUDIO | GST_PLAY_FLAG_VIDEO | \
-				GST_PLAY_FLAG_TEXT | GST_PLAY_FLAG_NATIVE_VIDEO;
+	bool useplaybin3 = eConfigManager::getConfigBoolValue("config.misc.usegstplaybin3", false);
+	if (useplaybin3)
+		m_gst_playbin = gst_element_factory_make("playbin3", "playbin3");
+	else
+		m_gst_playbin = gst_element_factory_make("playbin", "playbin");
+	if (m_gst_playbin) {
+		if (dvb_audiosink) {
+			if (m_sourceinfo.is_audio) {
+				gstSetBoolIfAvailable(dvb_audiosink, "e2-sync", TRUE);
+				gstSetBoolIfAvailable(dvb_audiosink, "e2-async", TRUE);
+			} else {
+				gstSetBoolIfAvailable(dvb_audiosink, "e2-sync", FALSE);
+				gstSetBoolIfAvailable(dvb_audiosink, "e2-async", FALSE);
+			}
+			g_object_set(m_gst_playbin, "audio-sink", dvb_audiosink, NULL);
+		}
+		if (dvb_videosink && !m_sourceinfo.is_audio) {
+			gstSetBoolIfAvailable(dvb_videosink, "e2-sync", FALSE);
+			gstSetBoolIfAvailable(dvb_videosink, "e2-async", FALSE);
+			g_object_set(m_gst_playbin, "video-sink", dvb_videosink, NULL);
+		}
 
-		if ( m_sourceinfo.is_streaming )
-		{
-			g_signal_connect (G_OBJECT (m_gst_playbin), "notify::source", G_CALLBACK (playbinNotifySource), this);
-			/* always hooked now: besides handing clearkeys to cencdec it also
-			 * strips SCTE-35 / emsg ad-marker handling out of the pipeline */
-			g_signal_connect(G_OBJECT(m_gst_playbin), "deep-element-added", G_CALLBACK(handleDeepElementAdded), this);
-			if (m_download_buffer_path != "")
-			{
+		/* native video flag = no GStreamer video conversion */
+		guint flags = GST_PLAY_FLAG_AUDIO | GST_PLAY_FLAG_VIDEO | GST_PLAY_FLAG_TEXT | GST_PLAY_FLAG_NATIVE_VIDEO;
+  if (dvb_audiosink && gst_element_get_factory(dvb_audiosink) && g_strcmp0(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(gst_element_get_factory(dvb_audiosink))), "alsasink") == 0)
+   flags |= GST_PLAY_FLAG_SOFT_VOLUME;
+
+		if (m_sourceinfo.is_streaming) {
+			m_notify_source_handler_id =
+				g_signal_connect(m_gst_playbin, "notify::source", G_CALLBACK(playbinNotifySource), this);
+			if (m_download_buffer_path != "") {
 				/* use progressive download buffering */
 				flags |= GST_PLAY_FLAG_DOWNLOAD;
-				g_signal_connect(G_OBJECT(m_gst_playbin), "element-added", G_CALLBACK(handleElementAdded), this);
+				m_notify_element_added_handler_id =
+					g_signal_connect(m_gst_playbin, "element-added", G_CALLBACK(handleElementAdded), this);
 				/* limit file size */
 				g_object_set(m_gst_playbin, "ring-buffer-max-size", (guint64)(8LL * 1024LL * 1024LL), NULL);
 			}
@@ -2327,208 +1515,181 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			 * (progressive download might not work for all formats)
 			 */
 			flags |= GST_PLAY_FLAG_BUFFERING;
-			/* increase the default 2 second / 2 MB buffer limitations to 5s / 5MB */
-			g_object_set(G_OBJECT(m_gst_playbin), "buffer-duration", 5LL * GST_SECOND, NULL);
-			g_object_set(G_OBJECT(m_gst_playbin), "buffer-size", m_buffer_size, NULL);
-			if (m_sourceinfo.is_hls || m_sourceinfo.is_dash)
-				g_object_set(G_OBJECT(m_gst_playbin), "connection-speed", (guint64)(4495000LL), NULL);
+			/* increase the default 2 second / 2 MB buffer limitations to 10s / 10MB */
+			g_object_set(m_gst_playbin, "buffer-duration", (gint64)(5LL * GST_SECOND), NULL);
+			g_object_set(m_gst_playbin, "buffer-size", m_buffer_size, NULL);
+			if (m_sourceinfo.is_hls)
+				g_object_set(m_gst_playbin, "connection-speed", (guint64)(4495000LL), NULL);
 		}
-		/*
-		 * DreamTwo/OpenBH MoviePlayer sound-first handoff (OpenATV-inspired):
-		 * choose concrete media sinks before the playbin state transition,
-		 * rather than selecting the highest-ranked system audio sink.
-		 * This receiver's dreamaudiosink decodes AAC but produced silence;
-		 * gst-launch playbin + alsasink device=hw:0,0 produced audible PCM.
-		 * Native Dreambox video sink already works independently. Do not
-		 * change live DVB eAudioDecoder/eAlsaOutput or the Amlogic driver.
-		 */
-		if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
-		{
-			GstElement *movie_alsa = gst_element_factory_make("alsasink", "movie_audio_hw00");
-			if (movie_alsa)
-			{
-				g_object_set(G_OBJECT(movie_alsa), "device", "hw:0,0", "sync", TRUE, NULL);
-				g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", movie_alsa, NULL);
-				/* MOVIE_ALSA_V3_LIFETIME: playbin takes ownership of the
-				 * factory-created sink's floating reference. Do NOT unref it
-				 * here: doing so can destroy the sink while playbin uses it,
-				 * leading to a crash when closing MoviePlayer. */
-				flags |= GST_PLAY_FLAG_SOFT_VOLUME;
-				eDebug("[eServiceMP3] MOVIE_ALSA_V3_LIFETIME: ALSA hw:0,0 handed to playbin");
-			}
-			else
-				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: alsasink missing, falling back to default sink");
+		g_object_set(m_gst_playbin, "flags", flags, NULL);
+		g_object_set(m_gst_playbin, "uri", uri, NULL);
+		if (dvb_subsink) {
+			m_subs_to_pull_handler_id =
+				g_signal_connect(dvb_subsink, "new-buffer", G_CALLBACK(gstCBsubtitleAvail), this);
+			GstCaps* caps = gst_caps_from_string("text/plain; "
+												 "text/x-plain; "
+												 "text/x-raw; "
+												 "text/x-pango-markup; "
+												 "subpicture/x-dvd; "
+												 "subpicture/x-dvb; "
+												 "subpicture/x-pgs; "
+												 "text/vtt; "
+												 "text/x-webvtt; "
+												 "text/x-ssa; " // SubStation Alpha
+												 "text/x-ass; " // Advanced SubStation Alpha
+												 "application/x-ass; " // Alternative ASS format
+												 "application/x-ssa; " // Alternative SSA format
+												 "application/x-subtitle-vtt; "
+												 "video/x-dvd-subpicture; "
+												 "closedcaption/x-cea-608; " // MP4 c608 caption track
+												 "closedcaption/x-cea-708; " // MP4 c708 caption track
+												 "subpicture/x-xsub");
+			g_object_set(dvb_subsink, "caps", caps, NULL);
+			gst_caps_unref(caps);
 
-			/* OpenATV DREAMNEXTGEN explicitly selects dreamvideosink. Keep
-			 * its default hardware pacing (sync=false), which matches the
-			 * existing local video playback. A/V offset is a separate task. */
-			GstElement *movie_video = gst_element_factory_make("dreamvideosink", "movie_amlogic_video");
-			if (movie_video)
-			{
-				g_object_set(G_OBJECT(movie_video), "sync", FALSE, NULL);
-				g_object_set(G_OBJECT(m_gst_playbin), "video-sink", movie_video, NULL);
-				/* MOVIE_ALSA_V3_LIFETIME: playbin owns the floating sink
-				 * reference after g_object_set(), just as for audio above. */
-				eDebug("[eServiceMP3] MOVIE_ALSA_V3_LIFETIME: native dreamvideosink handed to playbin");
-			}
-			else
-				eWarning("[eServiceMP3] MOVIE_OPENATV_ALSA_V2: dreamvideosink missing; using default video sink");
+			g_object_set(m_gst_playbin, "text-sink", dvb_subsink, NULL);
+			g_object_set(m_gst_playbin, "current-text", m_currentSubtitleStream, NULL);
 		}
-		g_object_set (G_OBJECT (m_gst_playbin), "flags", flags, NULL);
-		g_object_set (G_OBJECT (m_gst_playbin), "uri", uri, NULL);
-		GstElement *subsink = gst_element_factory_make("subsink", "subtitle_sink");
-		if (!subsink)
-			eDebug("[eServiceMP3] sorry, can't play: missing gst-plugin-subsink");
-		else
-		{
-			m_subs_to_pull_handler_id = g_signal_connect (subsink, "new-buffer", G_CALLBACK (gstCBsubtitleAvail), this);
-			g_object_set (G_OBJECT (subsink), "caps", gst_caps_from_string("text/plain; text/x-plain; text/x-raw; text/x-pango-markup; subpicture/x-dvd; subpicture/x-dvb; subpicture/x-pgs"), NULL);
-			g_object_set (G_OBJECT (m_gst_playbin), "text-sink", subsink, NULL);
-			g_object_set (G_OBJECT (m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
-		}
-		GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE (m_gst_playbin));
+		GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(m_gst_playbin));
 		gst_bus_set_sync_handler(bus, gstBusSyncHandler, this, NULL);
 		gst_object_unref(bus);
 
 		if (suburi != NULL)
-			g_object_set (G_OBJECT (m_gst_playbin), "suburi", suburi, NULL);
-	} else
-	{
-		m_event((iPlayableService*)this, evUser+12);
-		m_gst_playbin = 0;
-		m_errorInfo.error_message = "failed to create GStreamer pipeline!\n";
+			g_object_set(m_gst_playbin, "suburi", suburi, NULL);
+		else {
+			if (m_external_subtitle_path.empty()) {
+				char srt_filename[ext - filename + 5];
+				strncpy(srt_filename, filename, ext - filename);
+				srt_filename[ext - filename] = '\0';
+				strcat(srt_filename, ".srt");
+				if (::access(srt_filename, R_OK) >= 0) {
+					gchar* luri = g_filename_to_uri(srt_filename, NULL, NULL);
+					eDebug("[eServiceMP3] subtitle uri: %s", luri);
+					g_object_set(m_gst_playbin, "suburi", luri, NULL);
+					g_free(luri);
+				}
 
-		eDebug("[eServiceMP3] sorry, can't play: %s",m_errorInfo.error_message.c_str());
+			} else {
+				if (::access(m_external_subtitle_path.c_str(), R_OK) >= 0) {
+					gchar* luri = g_filename_to_uri(m_external_subtitle_path.c_str(), NULL, NULL);
+					eDebug("[eServiceMP3] m_external_subtitle uri: %s", luri);
+					g_object_set(m_gst_playbin, "suburi", luri, NULL);
+					g_free(luri);
+				} else {
+					m_external_subtitle_extension = "";
+				}
+			}
+		}
+
+	} else {
+		m_event((iPlayableService*)this, evUser + 12);
+		m_gst_playbin = NULL;
+		m_errorInfo.error_message = "failed to create GStreamer pipeline!\n";
+		eDebug("[eServiceMP3] sorry, can't play: %s", m_errorInfo.error_message.c_str());
 	}
+	}  /* end !m_is_dash_pipeline */
+	if (m_gst_playbin)
+		installCCProbe();
 	g_free(uri);
 	if (suburi != NULL)
 		g_free(suburi);
 }
 
-eServiceMP3::~eServiceMP3()
-{
-	// disconnect subtitle callback
-	GstElement *subsink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "subtitle_sink");
+/**
+ * @brief Destructor for eServiceMP3.
+ *
+ * This destructor cleans up resources, disconnects signals, and stops the service.
+ * It ensures that all GStreamer elements are properly released and any active timers
+ * are stopped to prevent memory leaks or dangling pointers.
+ */
+eServiceMP3::~eServiceMP3() {
+	invalidateCCProbe();
+	if (m_cc_notify)
+		m_cc_notify->stop();
+	m_cc_enabled = false;
+	m_cc_sync_timer->stop();
 
-	if (subsink)
-	{
-		g_signal_handler_disconnect (subsink, m_subs_to_pull_handler_id);
-		gst_object_unref(subsink);
+	// disconnect subtitle callback
+
+	if (dvb_subsink) {
+		g_signal_handler_disconnect(dvb_subsink, m_subs_to_pull_handler_id);
+		if (m_subtitle_widget) {
+			int oldsubs = m_currentSubtitleStream; // remember the last subtitle stream
+			disableSubtitles();
+			setCacheEntry(false, oldsubs);
+		}
 	}
 
-	if (m_subtitle_widget) m_subtitle_widget->destroy();
-	m_subtitle_widget = 0;
-
-	if (m_gst_playbin)
-	{
+	if (m_gst_playbin) {
+		if (m_notify_source_handler_id) {
+			g_signal_handler_disconnect(m_gst_playbin, m_notify_source_handler_id);
+			m_notify_source_handler_id = 0;
+		}
+		if (m_notify_element_added_handler_id) {
+			g_signal_handler_disconnect(m_gst_playbin, m_notify_element_added_handler_id);
+			m_notify_element_added_handler_id = 0;
+		}
 		// disconnect sync handler callback
-		GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE (m_gst_playbin));
+		GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(m_gst_playbin));
 		gst_bus_set_sync_handler(bus, NULL, NULL, NULL);
 		gst_object_unref(bus);
 	}
 
 	stop();
+	removeCCProbe();
+	for (int fd : m_cc_notify_pipe)
+		if (fd >= 0)
+			close(fd);
 
-	if (m_decoder)
-	{
+	if (m_decoder) {
 		m_decoder = NULL;
 	}
 
 	if (m_stream_tags)
 		gst_tag_list_free(m_stream_tags);
 
-	if (audioSink)
-	{
-		gst_object_unref(GST_OBJECT(audioSink));
-		audioSink = NULL;
+	if (m_gst_playbin) {
+		gst_object_unref(GST_OBJECT(m_gst_playbin));
+		m_ref.path.clear();
+		m_ref.name.clear();
+		m_media_lenght = 0;
+		m_play_position_timer->stop();
+		m_last_seek_pos = 0;
+		m_last_seek_count = -10;
+		m_seeking_or_paused = false;
+		m_to_paused = false;
+		eDebug("[eServiceMP3] **** PIPELINE DESTRUCTED ****");
 	}
-	if (videoSink)
-	{
-		gst_object_unref(GST_OBJECT(videoSink));
-		videoSink = NULL;
-	}
-	if (m_gst_playbin)
-	{
-		gst_object_unref (GST_OBJECT (m_gst_playbin));
-		eDebug("[eServiceMP3] destruct!");
-	}
+
 	m_new_dvb_subtitle_page_connection = 0;
+	m_new_pgs_subtitle_page_connection = nullptr;
 }
 
-int eServiceMP3PendingStopWorkers();
-
-void eServiceMP3::forceAudioReset()
-{
-	/* A fresh DTS -> AC3 auxiliary handoff can leave the main playbin
-	 * several seconds ahead by the time the 300ms startup reset fires.
-	 * Mark that one startup reset and perform a 10-second skip-back after
-	 * the normal buffer flush. This is deliberately a DTS-transcoding-only
-	 * test and does not alter normal AC3/E-AC3 playback or later track
-	 * switches. */
-	if (m_pending_start_position == -2 && m_currentAudioStream >= 0 &&
-		m_currentAudioStream < (int)m_audioStreams.size() &&
-		m_audioStreams[m_currentAudioStream].codec.compare(0, 3, "DTS") == 0 &&
-		isDTSStartupSkipbackContainer(m_ref.path))
-	{
-		m_pending_start_position = -1;
-		if (!m_is_live)
-		{
-			m_clear_buffers = true;
-			clearBuffers();
-			pts_t pos = 0;
-			if (getRawPlayPosition(pos) >= 0)
-			{
-				const pts_t skip_back = 900000; /* 10 seconds at 90 kHz */
-				pts_t target = pos > skip_back ? pos - skip_back : 0;
-				eDebug("[eServiceMP3] forceAudioReset: DTS startup skip-back %lld -> %lld",
-					(long long)pos, (long long)target);
-				seekTo(target);
-			}
-		}
-		return;
-	}
-
-	/* start() reuses this existing main-loop timer while a previous
-	 * GStreamer pipeline is still releasing the shared hardware sinks.
-	 * Polling here keeps Enigma2 responsive and adds no fixed handover
-	 * delay: playback starts on the first tick after teardown completes. */
-	if (m_state == stIdle && m_gst_playbin)
-	{
-		int pending = eServiceMP3PendingStopWorkers();
-		if (pending > 0)
-		{
-			m_passthrough_fix_timer->start(10, true);
-			return;
-		}
-		eDebug("[eServiceMP3] previous pipeline teardown complete; starting deferred pipeline");
-		start();
-		return;
-	}
-
-	setHDAudioNativeEac3ResetPending(m_gst_playbin, false);
-	setHDAudioNativeRetry(m_gst_playbin, -1);
-	m_clear_buffers = true;
-	clearBuffers();
-}
-
-void eServiceMP3::updateEpgCacheNowNext()
-{
+/**
+ * @brief Updates the EPG cache for the current and next events.
+ *
+ * This function updates the EPG cache for the current and next events, using
+ * information from the `eEPGCache` singleton instance. It checks if there are any
+ * changes to the event listings for this service, and if so, it updates the
+ * corresponding class fields (`m_event_now`, `m_event_next`) and notifies the
+ * observers of changes to the event information.
+ *
+ * @param[in] update Whether an update is required.
+ */
+void eServiceMP3::updateEpgCacheNowNext() {
 	bool update = false;
 	ePtr<eServiceEvent> next = 0;
 	ePtr<eServiceEvent> ptr = 0;
 	eServiceReference ref(m_ref);
 	ref.type = eServiceFactoryMP3::id;
 	ref.path.clear();
-	if (eEPGCache::getInstance() && eEPGCache::getInstance()->lookupEventTime(ref, -1, ptr) >= 0)
-	{
+	if (eEPGCache::getInstance() && eEPGCache::getInstance()->lookupEventTime(ref, -1, ptr) >= 0) {
 		ePtr<eServiceEvent> current = m_event_now;
-		if (!current || !ptr || current->getEventId() != ptr->getEventId())
-		{
+		if (!current || !ptr || current->getEventId() != ptr->getEventId()) {
 			update = true;
 			m_event_now = ptr;
 			time_t next_time = ptr->getBeginTime() + ptr->getDuration();
-			if (eEPGCache::getInstance()->lookupEventTime(ref, next_time, ptr) >= 0)
-			{
+			if (eEPGCache::getInstance()->lookupEventTime(ref, next_time, ptr) >= 0) {
 				next = ptr;
 				m_event_next = ptr;
 			}
@@ -2536,22 +1697,18 @@ void eServiceMP3::updateEpgCacheNowNext()
 	}
 
 	int refreshtime = 60;
-	if (!next)
-	{
+	if (!next) {
 		next = m_event_next;
 	}
-	if (next)
-	{
+	if (next) {
 		time_t now = eDVBLocalTimeHandler::getInstance()->nowTime();
 		refreshtime = (int)(next->getBeginTime() - now) + 3;
-		if (refreshtime <= 0 || refreshtime > 60)
-		{
+		if (refreshtime <= 0 || refreshtime > 60) {
 			refreshtime = 60;
 		}
 	}
 	m_nownext_timer->startLongTimer(refreshtime);
-	if (update)
-	{
+	if (update) {
 		m_event((iPlayableService*)this, evUpdatedEventInfo);
 	}
 }
@@ -2560,232 +1717,107 @@ DEFINE_REF(eServiceMP3);
 
 DEFINE_REF(GstMessageContainer);
 
-void eServiceMP3::setCacheEntry(bool isAudio, int pid)
-{
+/**
+ * @brief Sets a cache entry for this service.
+ *
+ * This function sets a cache entry for this service, which can be used to store
+ * information about the service's streams and other relevant details. The cache
+ * entry is identified by the `ref` parameter, which should contain a string that
+ * uniquely identifies the service.
+ *
+ * @param[in] ref A reference string for this service.
+ * @param[in] isAudio Whether the stream is an audio stream or not.
+ * @param[in] pid The PID of the audio or subtitle stream.
+ */
+void eServiceMP3::setCacheEntry(bool isAudio, int pid) {
+	// eDebug("[eServiceMP3] setCacheEntry %d %d / %s", isAudio, pid, m_ref.toString().c_str());
+	std::string ref = replace_all(m_ref.toString(), ",", "_");
 	bool hasFoundItem = false;
-
-	std::vector<eIPTVDBItem> &iptv_services = eDVBDB::getInstance()->iptv_services;
-	for(std::vector<eIPTVDBItem>::iterator it = iptv_services.begin(); it != iptv_services.end(); ++it) {
-		if (m_ref.toString().find(it->s_ref) != std::string::npos) {
+	std::vector<ePtr<eDVBService>>& iptv_services = eDVBDB::getInstance()->iptv_services;
+	for (std::vector<ePtr<eDVBService>>::iterator it = iptv_services.begin(); it != iptv_services.end(); ++it) {
+		if (ref.find((*it)->m_reference_str) != std::string::npos) {
 			hasFoundItem = true;
-			if (isAudio) {
-				it->ampeg_pid = pid;
-			}
-			else
-			{
-				it->subtitle_pid = pid;
-			}
+			(*it)->setCacheEntry(isAudio ? eDVBService::cMPEGAPID : eDVBService::cSUBTITLE, pid);
 			break;
 		}
 	}
 	if (!hasFoundItem) {
-		eIPTVDBItem item(m_sourceinfo.is_streaming ? m_ref.toReferenceString() : m_ref.toString(), isAudio ? pid : -1, -1, -1, -1, -1, -1, -1, isAudio ? -1 : pid, -1);
-		iptv_services.push_back(item);
+		ePtr<eDVBService> s = new eDVBService;
+		s->m_reference_str = ref;
+		s->setCacheEntry(isAudio ? eDVBService::cMPEGAPID : eDVBService::cSUBTITLE, pid);
+		iptv_services.push_back(s);
 	}
 }
 
-RESULT eServiceMP3::connectEvent(const sigc::slot<void(iPlayableService*,int)> &event, ePtr<eConnection> &connection)
-{
+/**
+ * @brief Connects an event to the service.
+ *
+ * This function connects a signal slot to the service's event system, allowing
+ * external components to listen for specific events related to the service.
+ *
+ * @param[in] event The signal slot to connect.
+ * @param[out] connection An output pointer that will hold the connection reference.
+ * @return RESULT Returns 0 on success, or an error code if the connection fails.
+ */
+RESULT eServiceMP3::connectEvent(const sigc::slot<void(iPlayableService*, int)>& event, ePtr<eConnection>& connection) {
 	connection = new eConnection((iPlayableService*)this, m_event.connect(event));
 	return 0;
 }
 
-/* See m_start_events_deferred's header comment. Called either immediately,
- * at READY_TO_PAUSED, for the normal non-deferred case, or later - once -
- * from tryApplyPendingStartOffset(), for a session that deferred these
- * because a start offset was pending. */
-void eServiceMP3::fireDeferredStartEvents()
-{
-	m_start_events_deferred = false;
-	m_event(this, evGstreamerStart);
-	if (m_send_ev_start)
-		m_event(this, evStart);
-}
-
-/* Applies a pending "&e2startoffset=" (see the constructor) once the
- * pipeline is first able to seek reliably - this simple, single-element
- * playbin pipeline (unlike a manually-assembled decodebin3 one) already has
- * every sink it needs the moment it first reaches PAUSED_TO_PLAYING, so
- * unlike a more elaborate pipeline this needs no retry loop: one attempt
- * here is reliable. Also responsible for firing evResumed once that seek has
- * actually landed - see evResumed's own doc comment in iservice.h - and for
- * releasing whatever evStart/evGstreamerStart this session held back for it
- * (see fireDeferredStartEvents()), whether or not there turned out to be
- * anything to seek to. */
-void eServiceMP3::tryApplyPendingStartOffset()
-{
-	if (m_pending_start_position < 0)
-	{
-		if (m_start_events_deferred)
-			fireDeferredStartEvents();
-		return;
-	}
-
-	if (m_is_live)
-	{
-		/* Live sources can't seek - drop the request rather than retrying
-		 * forever against a source that will never accept it. */
-		m_pending_start_position = -1;
-		if (m_start_events_deferred)
-			fireDeferredStartEvents();
-		return;
-	}
-
-	pts_t pos = m_pending_start_position;
-	m_pending_start_position = -1;
-	eDebug("[eServiceMP3] tryApplyPendingStartOffset: applying %lld", (long long)pos);
-
-	/* This seek is landing at a known, already-meaningful position (a
-	 * resume point), not at the start of the stream - unlike the generic
-	 * "disable correction only once a baseline has actually been
-	 * confirmed" logic in seekToImpl() (which exists to avoid leaving
-	 * getPlayPosition() stuck on an unconfirmed/uncorrected raw reading
-	 * when an *early* seek races the startup confirm window), there is
-	 * nothing to preserve here: the raw reading from here on is correct
-	 * relative to this resume position, so baking in any baseline at all
-	 * - whether already confirmed or captured fresh from readings taken
-	 * after this seek - would wrongly zero the displayed time back to the
-	 * resume point instead of leaving it at pos. Disable correction
-	 * outright and discard any in-progress candidate so it can't still
-	 * confirm later from stale (pre-seek) readings. */
-	if (pos > 0)
-	{
-		m_position_correction_enabled = false;
-		m_position_baseline_provisional = -1;
-	}
-
-	/*
-	 * Deliberately NOT wrapped in an explicit PAUSE -> (blocking wait) ->
-	 * PLAY: confirmed on device that pattern hangs the whole UI for several
-	 * seconds (the "Main thread is busy" watchdog firing). seekTo()
-	 * already performs the same flushing seek via seekToImpl(), the
-	 * identical, long-proven, non-blocking mechanism every ordinary user
-	 * seek in this class already relies on.
-	 */
-	seekTo(pos);
-
-	/* Tell the outside world the resume seek actually landed and playback is
-	 * running from it, not merely requested - see evResumed's own doc
-	 * comment in iservice.h. */
-	m_event((iPlayableService*)this, evResumed);
-
-	if (m_start_events_deferred)
-		fireDeferredStartEvents();
-}
-
-/*
- * PiP support. PictureInPicture calls setTarget(1, true) before start(): play
- * video only, on hardware decoder 1. The playbin already exists (built in the
- * constructor), so the target is only recorded here and applied from start().
- * Requires a dvbvideosink with the "decoder" property; without it we refuse.
+/**
+ * @brief Starts the MP3 service.
+ *
+ * This function initializes the GStreamer playbin element, sets its state to
+ * READY or PLAYING, and prepares the service for playback. It also attempts to
+ * read event information from an associated .eit file if available.
+ *
+ * @return RESULT Returns 0 on success, or an error code if the service fails to start.
  */
-RESULT eServiceMP3::setTarget(int target, bool noaudio)
-{
-	if (target != 1 || !m_gst_playbin || m_state != stIdle)
-		return -1;
-	GstElementFactory *factory = gst_element_factory_find("dvbvideosink");
-	if (!factory)
-		return -1;
-	GstElement *probe = gst_element_factory_create(factory, NULL);
-	gst_object_unref(factory);
-	if (!probe)
-		return -1;
-	const bool hasDecoderProp = g_object_class_find_property(G_OBJECT_GET_CLASS(probe), "decoder") != NULL;
-	gst_object_unref(probe);
-	if (!hasDecoderProp)
-	{
-		eDebug("[eServiceMP3] setTarget: dvbvideosink has no 'decoder' property, PiP unsupported");
-		return -1;
-	}
-	m_pip_decoder = target;
-	return 0;
-}
-
-void eServiceMP3::applyPipTarget()
-{
-	if (m_pip_decoder < 0 || m_pip_applied || !m_gst_playbin)
-		return;
-	m_pip_applied = true;
-	guint flags = 0;
-	g_object_get(G_OBJECT(m_gst_playbin), "flags", &flags, NULL);
-	flags &= ~(GST_PLAY_FLAG_AUDIO | GST_PLAY_FLAG_TEXT);
-	g_object_set(G_OBJECT(m_gst_playbin), "flags", flags, NULL);
-	GstElement *vsink = gst_element_factory_make("dvbvideosink", "pip_videosink");
-	if (vsink)
-	{
-		/* free-running: no clock sync or preroll on the PiP sink, so it can't
-		 * influence the main service's timing. "sync"/"async" are ignored by
-		 * the sink, the e2- variants are the real switches. */
-		g_object_set(G_OBJECT(vsink), "decoder", (guint)m_pip_decoder, "e2-sync", FALSE, "e2-async", FALSE, NULL);
-		g_object_set(G_OBJECT(m_gst_playbin), "video-sink", vsink, NULL);
-	}
-	/* Belt and braces: with GST_PLAY_FLAG_AUDIO cleared playbin should never build
-	 * an audio chain, but if it ever did it would autoplug dvbaudiosink and open
-	 * the audio decoder, taking it from the main service. Hand it a fakesink. */
-	GstElement *asink = gst_element_factory_make("fakesink", "pip_audiosink");
-	if (asink)
-	{
-		g_object_set(G_OBJECT(asink), "sync", FALSE, "async", FALSE, NULL);
-		g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", asink, NULL);
-	}
-	eDebug("[eServiceMP3] PiP: video-only on decoder %d", m_pip_decoder);
-}
-
-RESULT eServiceMP3::start()
-{
+RESULT eServiceMP3::start() {
 	ASSERT(m_state == stIdle);
-
-	int pending = eServiceMP3PendingStopWorkers();
-	if (pending > 0)
+	if (m_cc_available || m_cc_enabled)
+		m_cc_sync_timer->start(100, true);
+	if (eDVBIFallback::hasSchedule(m_ref))
 	{
-		m_passthrough_fix_timer->start(10, true);
-		return 0;
+		m_dvbiAvailabilityTimer = eTimer::create(eApp);
+		CONNECT(m_dvbiAvailabilityTimer->timeout, eServiceMP3::checkDVBIAvailability);
+		m_dvbiAvailabilityTimer->start(1000);
 	}
 
-	if (m_gst_playbin)
-	{
-		/* See m_start_events_deferred's header comment - only this session's
-		 * evGstreamerStart/evStart (normally fired below at READY_TO_PAUSED)
-		 * need holding back, and only when there's actually a pending start
-		 * offset to apply first. */
-		m_start_events_deferred = m_pending_start_position >= 0;
-
-		applyPipTarget();
-
-		eDebug("[eServiceMP3] starting pipeline");
+	m_subtitles_paused = false;
+	m_base_mpegts = -1;  // Reset MPEGTS base for WebVTT at new start
+	m_prerolled = false;
+	if (m_gst_playbin) {
+		eDebug("[eServiceMP3] *** starting pipeline ****");
 		GstStateChangeReturn ret;
-		ret = gst_element_set_state (m_gst_playbin, GST_STATE_PLAYING);
+		ret = gst_element_set_state(m_gst_playbin, GST_STATE_READY);
 
-		switch(ret)
-		{
-		case GST_STATE_CHANGE_FAILURE:
-			eDebug("[eServiceMP3] failed to start pipeline");
-			stop();
-			return -1;
-			break;
-		case GST_STATE_CHANGE_SUCCESS:
-			m_is_live = false;
-			break;
-		case GST_STATE_CHANGE_NO_PREROLL:
-			m_is_live = true;
-			break;
-		default:
-			break;
+		switch (ret) {
+			case GST_STATE_CHANGE_FAILURE:
+				eDebug("[eServiceMP3] failed to start pipeline");
+				stop();
+				return -1;
+			case GST_STATE_CHANGE_SUCCESS:
+				m_is_live = false;
+				break;
+			case GST_STATE_CHANGE_NO_PREROLL:
+				gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+				m_is_live = true;
+				break;
+			default:
+				break;
 		}
 	}
 
-	if (m_ref && m_ref.path.find("://") == std::string::npos)
-	{
+	if (m_ref.path.find("://") == std::string::npos) {
 		/* read event from .eit file */
 		size_t pos;
 		ePtr<eServiceEvent> event = new eServiceEvent;
 		std::string filename = m_ref.path;
-		if ( (pos = filename.rfind('.')) != std::string::npos)
-		{
+		if ((pos = filename.rfind('.')) != std::string::npos) {
 			filename.erase(pos + 1);
 			filename += "eit";
-			if (!event->parseFrom(filename, 0))
-			{
+			if (!event->parseFrom(filename, 0)) {
 				ePtr<eServiceEvent> empty;
 				m_event_now = event;
 				m_event_next = empty;
@@ -2796,344 +1828,290 @@ RESULT eServiceMP3::start()
 	return 0;
 }
 
-static volatile gint s_mp3_stop_workers = 0;
-
-int eServiceMP3PendingStopWorkers()
-{
-	return g_atomic_int_get(&s_mp3_stop_workers);
-}
-
-namespace {
-
-const guint STOP_WATCHDOG_TIMEOUT_SECONDS = 10;
-
-/* Shared between stopWorker() and stopWatchdog() only - never touches
- * eServiceMP3/"this", same reasoning as not passing "this" to stopWorker
- * itself: this teardown can outlive the object it came from. refcount starts
- * at 2 (one per thread below); whichever of the two finishes second frees it,
- * so it's torn down properly regardless of which one happens to win the race
- * for the normal (fast) case. */
-struct StopWatchdog
-{
-	gint done;      // atomic bool, set by stopWorker() once GST_STATE_NULL actually returns
-	gint refcount;  // atomic
-};
-
-void stopWatchdogRelease(StopWatchdog *watchdog)
-{
-	if (g_atomic_int_dec_and_test(&watchdog->refcount))
-		delete watchdog;
-}
-
-struct StopWorkerArgs
-{
-	GstElement *playbin;
-	StopWatchdog *watchdog;
-	bool hadVideo;
-};
-
-/* gst_element_set_state(..., GST_STATE_NULL) is the call that can still block
- * this (main) thread for seconds: unlike other transitions it is defined to
- * not return until the element has fully stopped, and some vendor hardware
- * sinks on this class of STB block synchronously inside their change_state()
- * vfunc instead of returning ASYNC, especially for H.265. Doing it here on a
- * worker thread instead just moves that wait off the main thread; nothing
- * else needs to be touched, since stop() itself already takes just a raw
- * ref (not "this"), and every eServiceMP3 member accessed after this call
- * in stop() (stopHDRProbe(), saveCuesheet()) is independently safe to run
- * before the pipeline has actually reached NULL - see the comments there. */
-gpointer stopWorker(gpointer data)
-{
-	StopWorkerArgs *args = static_cast<StopWorkerArgs*>(data);
-	GstElement *playbin = args->playbin;
-	StopWatchdog *watchdog = args->watchdog;
-	bool hadVideo = args->hadVideo;
-	delete args;
-
-	GstStateChangeReturn ret = gst_element_set_state(playbin, GST_STATE_NULL);
-	if (ret != GST_STATE_CHANGE_SUCCESS)
-		eDebug("[eServiceMP3] stop GST_STATE_NULL failure");
-	gst_object_unref(playbin);
-
-	int remaining = g_atomic_int_add(&s_mp3_stop_workers, -1) - 1;
-	eDebug("[eServiceMP3] stop worker released hardware; %d teardown(s) remain", remaining);
-
-	/* GstDVBVideoSink's own device fd is gone once GST_STATE_NULL has actually
-	 * returned (guaranteed synchronous per the comment above), but whether it
-	 * blanks the video plane on the way down is up to that (out-of-tree) sink.
-	 * Force it here too so the last decoded frame doesn't stay frozen on
-	 * screen after playback has genuinely stopped - this opens its own fd, so
-	 * it doesn't race the sink's teardown. */
-	if (hadVideo)
-		eTSMPEGDecoder::blankPrimaryVideoDecoder();
-
-	g_atomic_int_set(&watchdog->done, 1);
-	stopWatchdogRelease(watchdog);
-	return NULL;
-}
-
-/* Detection only, not recovery - there is no safe way to force-abort a
- * thread stuck inside gst_element_set_state(), so this can't do anything
- * about a genuinely wedged teardown beyond making it visible in the log
- * instead of silently leaking a thread + pipeline forever. Runs as its own
- * thread rather than an eTimer specifically because it has to outlive "this"
- * (the eServiceMP3 destructor calls stop() and then immediately proceeds to
- * destroy the object) - a member eTimer would be destroyed right along with
- * it and never get a chance to fire for exactly the case that matters most. */
-gpointer stopWatchdog(gpointer data)
-{
-	StopWatchdog *watchdog = static_cast<StopWatchdog*>(data);
-	g_usleep(STOP_WATCHDOG_TIMEOUT_SECONDS * G_USEC_PER_SEC);
-	if (!g_atomic_int_get(&watchdog->done))
-		eDebug("[eServiceMP3] stop(): GST_STATE_NULL still hasn't completed after %u seconds - hardware sink likely stuck", STOP_WATCHDOG_TIMEOUT_SECONDS);
-	stopWatchdogRelease(watchdog);
-	return NULL;
-}
-
-}  // namespace
-
-/* Bounded poll on s_mp3_stop_workers - see this function's declaration in
- * servicemp3.h for why a caller would want this. Deliberately a short sleep
- * loop rather than a condition variable: s_mp3_stop_workers is a plain
- * atomic counter shared with stopWorker() (which already has no associated
- * lock/condvar, by design - see stop()'s comment), and the caller here needs
- * a hard cap on how long it waits regardless, so polling costs nothing extra
- * in practice while keeping stopWorker() itself unchanged. */
-bool eServiceMP3::waitForHardwareRelease(unsigned int timeout_ms)
-{
-	const unsigned int pollIntervalMs = 5;
-	unsigned int waited_ms = 0;
-	while (g_atomic_int_get(&s_mp3_stop_workers) > 0 && waited_ms < timeout_ms)
-	{
-		g_usleep(pollIntervalMs * 1000);
-		waited_ms += pollIntervalMs;
-	}
-	int remaining = g_atomic_int_get(&s_mp3_stop_workers);
-	if (remaining > 0)
-		eDebug("[eServiceMP3] waitForHardwareRelease: %d teardown(s) still outstanding after %ums, giving up", remaining, waited_ms);
-	return remaining == 0;
-}
-
-void eServiceMP3::dashRecover()
-{
-	if (!m_gst_playbin || m_state != stRunning)
-		return;
-	eDebug("[eServiceMP3] restarting dash pipeline (attempt %d)", m_dash_recover_count);
-	m_dash_recover_last = time(NULL);
-	/* same sequence as the "redirect" element message: the playbin keeps its uri,
-	 * and the deep-element-added hook hands the clearkeys to the new cencdec elements */
-	gst_element_set_state(m_gst_playbin, GST_STATE_NULL);
-	gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-}
-
-void eServiceMP3::disconnectAsyncSignalHandlers()
-{
-	if (!m_gst_playbin)
-		return;
-
-	/* playbinNotifySource()/handleElementAdded()/gstTextpadHasCAPS() were all
-	 * connected with "this" as user_data to react to the pipeline's dynamic
-	 * reconfiguration during normal playback. Now that stop() moves
-	 * GST_STATE_NULL off the main thread (see stopWorker()), the pipeline can
-	 * keep running - and keep emitting these signals - for a while after this
-	 * object itself has been destroyed, since the two are no longer
-	 * synchronized. A real crash from exactly this (gstTextpadHasCAPS firing
-	 * into an already-freed "this") is what prompted this function. None of
-	 * these signals' actions matter once we're stopping regardless, so
-	 * disconnect all of them synchronously here, before handing the actual
-	 * teardown off to the worker thread: g_signal_handlers_disconnect_by_func()
-	 * is fast and non-blocking (it doesn't wait for the pipeline to reach any
-	 * particular state), so this doesn't reintroduce the freeze stopWorker()
-	 * exists to avoid.
-	 *
-	 * handleElementAdded() reconnects itself on every decodebin/uridecodebin
-	 * element it discovers (see its own body) - there is no fixed, known set
-	 * of objects it ends up connected to, so walk the live pipeline and
-	 * disconnect it from every bin found, not just m_gst_playbin itself.
-	 * g_signal_handlers_disconnect_by_func() is a safe no-op on any object
-	 * that callback was never actually connected to. */
-	g_signal_handlers_disconnect_by_func(m_gst_playbin, (gpointer)playbinNotifySource, this);
-	g_signal_handlers_disconnect_by_func(m_gst_playbin, (gpointer)handleElementAdded, this);
-	g_signal_handlers_disconnect_by_func(m_gst_playbin, (gpointer)handleDeepElementAdded, this);
-
-	GstIterator *eit = gst_bin_iterate_recurse(GST_BIN(m_gst_playbin));
-	GValue eitem = G_VALUE_INIT;
-	bool edone = false;
-	while (!edone)
-	{
-		switch (gst_iterator_next(eit, &eitem))
-		{
-			case GST_ITERATOR_OK:
-			{
-				GstElement *el = GST_ELEMENT(g_value_get_object(&eitem));
-				if (el && GST_IS_BIN(el))
-					g_signal_handlers_disconnect_by_func(el, (gpointer)handleElementAdded, this);
-				g_value_reset(&eitem);
-				break;
-			}
-			case GST_ITERATOR_RESYNC: gst_iterator_resync(eit); break;
-			default: edone = true; break;
-		}
-	}
-	g_value_unset(&eitem);
-	gst_iterator_free(eit);
-
-	gint n_text = 0;
-	g_object_get(m_gst_playbin, "n-text", &n_text, NULL);
-	for (gint i = 0; i < n_text; i++)
-	{
-		GstPad *pad = NULL;
-		g_signal_emit_by_name(m_gst_playbin, "get-text-pad", i, &pad);
-		if (pad)
-		{
-			g_signal_handlers_disconnect_by_func(pad, (gpointer)gstTextpadHasCAPS, this);
-			gst_object_unref(pad);
-		}
-	}
-}
-
-RESULT eServiceMP3::stop()
-{
-	m_passthrough_fix_timer->stop();
-	m_dash_recover_timer->stop();
-	/* A switch still waiting on the pipeline to settle - a fresh pipeline
-	 * session starts its own settling from scratch. */
-	m_audio_switch_deferred = -1;
-	m_audio_switch_flush_phase = AudioSwitchFlushNone;
-	m_audio_switch_flush_resuming = false;
-	m_subtitle_switch_deferred = false;
-	/* A restarted pipeline (see start()/forceAudioReset()) can bring the
-	 * decoder-time register back to an arbitrary/stale value unrelated to
-	 * this baseline, so don't carry it across a stop() - re-arm the one-time
-	 * startup correction for the next start() same as a fresh instance. */
-	m_position_baseline_valid = false;
-	m_position_correction_enabled = true;
-	m_position_baseline_provisional = -1;
-	m_position_baseline_first_seen_us = 0;
-	if (!m_gst_playbin || m_state == stStopped || !m_ref)
+/**
+ * @brief Stops the MP3 service.
+ *
+ * This function stops the GStreamer playbin element, sets its state to NULL,
+ * and cleans up any resources associated with the service. It also saves the
+ * cuesheet if it was loaded and resets various member variables related to
+ * playback state.
+ *
+ * @return RESULT Returns 0 on success, or an error code if the service fails to stop.
+ */
+RESULT eServiceMP3::stop() {
+	invalidateCCProbe();
+	m_cc_sync_timer->stop();
+	if (m_dvbiAvailabilityTimer)
+		m_dvbiAvailabilityTimer->stop();
+	if (!m_gst_playbin || m_state == stStopped)
 		return -1;
 
 	eDebug("[eServiceMP3] stop %s", m_ref.path.c_str());
 	m_state = stStopped;
+#ifdef DREAMNEXTGEN
+	windStop();
+#endif
 
 	GstStateChangeReturn ret;
 	GstState state, pending;
-	/* Non-blocking state query, for logging only. */
-	ret = gst_element_get_state(m_gst_playbin, &state, &pending, 0);
-	eDebug("[eServiceMP3] stop state:%s pending:%s ret:%s",
-		gst_element_state_get_name(state),
-		gst_element_state_get_name(pending),
-		gst_element_state_change_return_get_name(ret));
-
-	stopHDAudioAuxPipeline(m_gst_playbin, false);
-	disconnectAsyncSignalHandlers();
-
-	/* See stopWorker()'s comment: hand the actual (potentially blocking)
-	 * teardown off to a worker thread instead of doing it here, plus a
-	 * watchdog thread that just logs if it's taking unexpectedly long -
-	 * see stopWatchdog()'s comment for why that's a thread and not a timer. */
-	gst_object_ref(m_gst_playbin);
-	g_atomic_int_inc(&s_mp3_stop_workers);
-	StopWatchdog *watchdog = new StopWatchdog{0, 2};
-	GThread *worker = g_thread_new("mp3stop", stopWorker, new StopWorkerArgs{m_gst_playbin, watchdog, videoSink != NULL && m_pip_decoder < 0 /* a PiP must never blank the primary decoder */});
-	g_thread_unref(worker);
-	GThread *watchdogThread = g_thread_new("mp3stopwd", stopWatchdog, watchdog);
-	g_thread_unref(watchdogThread);
-
-#ifdef HAS_SOFTWARE_HDR_DETECTION
-	/* stopHDRProbe() itself deliberately never calls the blocking
-	 * gst_pad_remove_probe() - see its own comment - which is correct and
-	 * necessary for its OTHER call sites (startHDRProbe() restarting mid
-	 * playback, checkHDRProbe() finishing classification), where "this"
-	 * stays alive regardless of how long the probe takes to actually detach.
-	 * stop() is different: now that GST_STATE_NULL runs on a worker thread
-	 * (see stopWorker()), this object can be destroyed shortly after
-	 * returning from here, and hdrProbeCallback firing into an already-freed
-	 * "this" is exactly what caused a real crash (glibc robust-mutex
-	 * assertion / heap corruption). So only here, remove the probe for real
-	 * before doing anything else - gst_pad_remove_probe() blocks until any
-	 * in-flight invocation finishes (worst case one buffer copy, low
-	 * milliseconds - nowhere near the multi-second class of block
-	 * stopWorker() exists to avoid), which is the only way to *guarantee*
-	 * hdrProbeCallback can never fire again from here on. */
-	if (m_hdr_probe_pad && m_hdr_probe_id)
-	{
-		gst_pad_remove_probe(m_hdr_probe_pad, m_hdr_probe_id);
-		m_hdr_probe_id = 0;
-	}
-	/* Now safe to call as usual - the flag/trylock dance is redundant at this
-	 * point (nothing can be mid-callback anymore) but harmless, and this
-	 * still does the rest of the cleanup (timer, es/snap buffers, pad ref). */
-	stopHDRProbe();
-#endif
-
-	saveCuesheet();
+	/* make sure that last state change was successfull */
+	ret = gst_element_get_state(m_gst_playbin, &state, &pending, 5 * GST_SECOND);
+	eDebug("[eServiceMP3] stop state:%s pending:%s ret:%s", gst_element_state_get_name(state),
+		   gst_element_state_get_name(pending), gst_element_state_change_return_get_name(ret));
+	ret = gst_element_set_state(m_gst_playbin, GST_STATE_NULL);
+	if (ret != GST_STATE_CHANGE_SUCCESS)
+		eDebug("[eServiceMP3] stop GST_STATE_NULL failure");
+	if (!m_sourceinfo.is_streaming && m_cuesheet_loaded)
+		saveCuesheet();
+	m_subtitles_paused = false;
 	m_nownext_timer->stop();
+	/* make sure that media is stopped before proceeding further */
+	ret = gst_element_get_state(m_gst_playbin, &state, &pending, 5 * GST_SECOND);
+	eDebug("[eServiceMP3] **** TO NULL state:%s pending:%s ret:%s ****", gst_element_state_get_name(state),
+		   gst_element_state_get_name(pending), gst_element_state_change_return_get_name(ret));
+	removeCCProbe();
 
 	return 0;
 }
 
-RESULT eServiceMP3::pause(ePtr<iPauseableService> &ptr)
+void eServiceMP3::checkDVBIAvailability()
 {
-	ptr=this;
+	int available = eDVBIFallback::availability(m_ref);
+	if (available <= 0)
+	{
+		m_dvbiAvailabilityTimer->stop();
+		if (available < 0)
+			m_event((iPlayableService*)this, evTuneFailed);
+	}
+}
+
+/**
+ * @brief Handles the timing for playback position updates.
+ *
+ * This function is called periodically to update the playback position of the
+ * media being played. It increments the last seek count and triggers an event
+ * to update the service's information.
+ */
+void eServiceMP3::playPositionTiming() {
+	// eDebug("[eServiceMP3] ***** USE IOCTL POSITION ******");
+	if (m_last_seek_count >= 1) {
+		if (m_last_seek_count == 19)
+			m_last_seek_count = 0;
+		else
+			m_last_seek_count++;
+	}
+}
+
+/**
+ * @brief Pauses the MP3 service.
+ *
+ * This function pauses the playback of the media being played by the service.
+ * It sets the state to PAUSED and starts a timer to synchronize subtitles if
+ * applicable. If the service is already paused, it does nothing.
+ *
+ * @param[out] ptr A pointer to an iPauseableService interface that can be used to pause the service.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to pause.
+ */
+RESULT eServiceMP3::pause(ePtr<iPauseableService>& ptr) {
+	ptr = this;
+	eDebug("[eServiceMP3] pause(ePtr<iPauseableService> &ptr)");
 	return 0;
 }
 
-RESULT eServiceMP3::setSlowMotion(int ratio)
-{
+/**
+ * @brief Sets the slow motion playback ratio.
+ *
+ * This function sets the playback speed to a slow motion ratio. If the ratio is
+ * zero, it returns immediately without changing the playback speed. Otherwise,
+ * it calls `trickSeek` with the inverse of the ratio to achieve slow motion.
+ *
+ * @param[in] ratio The slow motion ratio (1.0 for normal speed, >1.0 for slow motion).
+ * @return RESULT Returns 0 on success, or an error code if the service fails to set slow motion.
+ */
+RESULT eServiceMP3::setSlowMotion(int ratio) {
 	if (!ratio)
 		return 0;
-	eDebug("[eServiceMP3] setSlowMotion ratio=%f",1.0/(gdouble)ratio);
-	return trickSeek(1.0/(gdouble)ratio);
+	eDebug("[eServiceMP3] setSlowMotion ratio=%.1f", 1.0 / (gdouble)ratio);
+	return trickSeek(1.0 / (gdouble)ratio);
 }
 
-RESULT eServiceMP3::setFastForward(int ratio)
-{
-	eDebug("[eServiceMP3] setFastForward ratio=%i",ratio);
+/**
+ * @brief Sets the fast forward playback ratio.
+ *
+ * This function sets the playback speed to a fast forward ratio. If the ratio is
+ * zero, it returns immediately without changing the playback speed. Otherwise,
+ * it calls `trickSeek` with the specified ratio to achieve fast forward.
+ *
+ * @param[in] ratio The fast forward ratio (1.0 for normal speed, >1.0 for fast forward).
+ * @return RESULT Returns 0 on success, or an error code if the service fails to set fast forward.
+ */
+RESULT eServiceMP3::setFastForward(int ratio) {
+	eDebug("[eServiceMP3] setFastForward ratio=%.1f", (gdouble)ratio);
+#ifdef DREAMNEXTGEN
+	if (m_state != stRunning || !ratio || !canWind())
+		return -1;
+	/* files wind forward by rate, dvbvideosink scales the PTS; a rate seek
+	 * blocks an adaptive demuxer and many demuxers cannot play backwards,
+	 * those wind by key frame seeks */
+	if (ratio > 0 && !m_is_adaptive_stream && !m_sourceinfo.is_hls) {
+		windStop();
+		return trickSeek(ratio);
+	}
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	pts_t start;
+	if (m_wind_ratio)
+		start = windTarget(now_ms); /* a new speed winds on from here */
+	else if (getPlayPosition(start) < 0)
+		return -1;
+	m_wind_start = start;
+	m_wind_start_ms = now_ms;
+	m_wind_ratio = ratio;
+	/* the sink writes nothing while paused, the picture plays on between
+	 * the seeks */
+	if (m_paused) {
+		m_to_paused = false;
+		gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+	}
+	m_wind_timer->start(0, true);
+	return 0;
+#else
 	return trickSeek(ratio);
+#endif
 }
 
-		// iPausableService
-RESULT eServiceMP3::pause()
-{
+#ifdef DREAMNEXTGEN
+bool eServiceMP3::canWind() {
+	if (!m_gst_playbin || m_is_live)
+		return false;
+	/* a live playlist prerolls like a file but has no length to wind in */
+	gboolean seekable = FALSE;
+	gint64 duration = 0;
+	GstQuery* query = gst_query_new_seeking(GST_FORMAT_TIME);
+	if (gst_element_query(m_gst_playbin, query))
+		gst_query_parse_seeking(query, NULL, &seekable, NULL, NULL);
+	gst_query_unref(query);
+	return seekable && gst_element_query_duration(m_gst_playbin, GST_FORMAT_TIME, &duration) && duration > 0;
+}
+
+pts_t eServiceMP3::windTarget(int64_t now_ms) {
+	pts_t target = m_wind_start + (pts_t)m_wind_ratio * (now_ms - m_wind_start_ms) * 90;
+	pts_t length = 0;
+	if (target < 0)
+		target = 0;
+	/* hold short of the end, an EOS would end the playback */
+	if (getLength(length) == 0 && length > 90000 && target > length - 90000)
+		target = length - 90000;
+	return target;
+}
+
+static unsigned int windVideoPts() {
+	unsigned int vpts = 0;
+	FILE* f = fopen("/sys/class/tsync/pts_video", "r");
+	if (f) {
+		if (fscanf(f, "%x", &vpts) != 1)
+			vpts = 0;
+		fclose(f);
+	}
+	return vpts;
+}
+
+void eServiceMP3::windTick() {
+	if (!m_wind_ratio || !m_gst_playbin)
+		return;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	/* the next seek waits for the picture of the last one, a seek before
+	 * would flush it unseen and a network source would pile them up */
+	if (m_wind_seek_ms && now_ms - m_wind_seek_ms < 2000 && windVideoPts() == m_wind_vpts) {
+		m_wind_timer->start(50, true);
+		return;
+	}
+	pts_t target = windTarget(now_ms);
+	if (target != m_last_seek_pos) {
+		m_wind_seek_ms = now_ms;
+		m_wind_vpts = windVideoPts();
+		m_last_seek_pos = target;
+		gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME,
+						 (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_TRICKMODE | GST_SEEK_FLAG_TRICKMODE_NO_AUDIO),
+						 GST_SEEK_TYPE_SET, (gint64)(target * 11111LL), GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+	}
+	m_wind_timer->start(400, true);
+}
+
+void eServiceMP3::windStop() {
+	if (!m_wind_ratio)
+		return;
+	m_wind_timer->stop();
+	m_wind_ratio = 0;
+	m_wind_seek_ms = 0;
+	/* back to a plain segment with sound at the last target */
+	if (m_state == stRunning)
+		gst_element_seek(m_gst_playbin, 1.0, GST_FORMAT_TIME, (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+						 GST_SEEK_TYPE_SET, (gint64)(m_last_seek_pos * 11111LL), GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+}
+#endif
+
+// iPausableService
+
+/**
+ * @brief Pauses the MP3 service.
+ *
+ * This function pauses the playback of the media being played by the service.
+ * It sets the state to PAUSED and starts a timer to synchronize subtitles if
+ * applicable. If the service is already paused, it does nothing.
+ *
+ * @return RESULT Returns 0 on success, or an error code if the service fails to pause.
+ */
+RESULT eServiceMP3::pause() {
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
-    // OPENATV_FULLPORT_1: local files must not execute trickSeek's blocking
-    // gst_element_get_state(1s) and audio-track recovery on the UI thread.
-    if (!m_sourceinfo.is_streaming && !m_is_live && m_sourceinfo.is_video)
-    {
-        m_currentTrickRatio = 0.0;
-        eDebug("[OPENATV_FULLPORT_1] PAUSE queued");
-        gst_element_call_async(m_gst_playbin, openatv_port_set_pipeline_state,
-                               GINT_TO_POINTER(GST_STATE_PAUSED), NULL);
-        return 0;
-    }
+	m_subtitles_paused = true;
+	m_cc_sync_timer->stop();
+	{
+		std::lock_guard<std::mutex> lock(m_cc_queue_mutex);
+		m_cc_track.hide();
+		m_cc_video.hide();
+	}
+	m_subtitle_sync_timer->start(1, true);
 	eDebug("[eServiceMP3] pause");
-	trickSeek(0.0);
+#ifdef DREAMNEXTGEN
+	windStop();
+#endif
+	if (!m_paused)
+		trickSeek(0.0);
+	else
+		eDebug("[eServiceMP3] Already Paused no need to pause");
 
 	return 0;
 }
 
-RESULT eServiceMP3::unpause()
-{
+/**
+ * @brief Unpauses the MP3 service.
+ *
+ * This function resumes playback of the media being played by the service.
+ * It sets the state to RUNNING and starts a timer to synchronize subtitles if
+ * applicable. If the service is not paused, it does nothing.
+ *
+ * @return RESULT Returns 0 on success, or an error code if the service fails to unpause.
+ */
+RESULT eServiceMP3::unpause() {
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
-    // OPENATV_FULLPORT_1: direct resume from PAUSED; no keyframe seek.
-    if (!m_sourceinfo.is_streaming && !m_is_live && m_sourceinfo.is_video)
-    {
-        m_currentTrickRatio = 1.0;
-        m_prev_decoder_time = -1;
-        m_decoder_time_valid_state = 0;
-        eDebug("[OPENATV_FULLPORT_1] RESUME queued");
-        gst_element_call_async(m_gst_playbin, openatv_port_set_pipeline_state,
-                               GINT_TO_POINTER(GST_STATE_PLAYING), NULL);
-        return 0;
-    }
+	m_subtitles_paused = false;
+	if (m_cc_available || m_cc_enabled)
+		m_cc_sync_timer->start(100, true);
+	m_decoder_time_valid_state = 0;
+	m_subtitle_sync_timer->start(1, true);
+#ifdef DREAMNEXTGEN
+	windStop();
+#endif
 	/* no need to unpase if we are not paused already */
-	if (m_currentTrickRatio == 1.0 && !m_paused)
-	{
+	if (m_currentTrickRatio == 1.0 && !m_paused && !m_to_paused) {
 		eDebug("[eServiceMP3] trickSeek no need to unpause!");
 		return 0;
 	}
@@ -3144,15 +2122,34 @@ RESULT eServiceMP3::unpause()
 	return 0;
 }
 
-	/* iSeekableService */
-RESULT eServiceMP3::seek(ePtr<iSeekableService> &ptr)
-{
+// iSeekableService
+
+/**
+ * @brief Seeks to a specific position in the media.
+ *
+ * This function seeks to a specific position in the media being played by the
+ * service. It updates the last seek position and calls `seekToImpl` to perform
+ * the actual seek operation.
+ *
+ * @param[out] ptr A pointer to an iSeekableService interface that can be used to seek in the service.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to seek.
+ */
+RESULT eServiceMP3::seek(ePtr<iSeekableService>& ptr) {
 	ptr = this;
 	return 0;
 }
 
-RESULT eServiceMP3::getLength(pts_t &pts)
-{
+/**
+ * @brief Gets the current playback position in the media.
+ *
+ * This function retrieves the current playback position in the media being played
+ * by the service. It queries the GStreamer playbin for the current position and
+ * returns it in PTS format.
+ *
+ * @param[out] pts The current playback position in PTS format.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to get the position.
+ */
+RESULT eServiceMP3::getLength(pts_t& pts) {
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
@@ -3160,269 +2157,435 @@ RESULT eServiceMP3::getLength(pts_t &pts)
 	gint64 len;
 	if (!gst_element_query_duration(m_gst_playbin, fmt, &len))
 		return -1;
-		/* len is in nanoseconds. we have 90 000 pts per second. */
+	/* len is in nanoseconds. we have 90 000 pts per second. */
 
 	pts = len / 11111LL;
+	m_media_lenght = pts;
 	return 0;
 }
 
-RESULT eServiceMP3::seekToImpl(pts_t to, bool accurate)
-{
-		/* convert pts to nanoseconds */
-    // OPENATV_FULLPORT_1: local playback should resume at the requested frame,
-    // rather than at an earlier keyframe. Network/trickplay behavior unchanged.
-    if (!m_is_live && !m_sourceinfo.is_streaming && m_sourceinfo.is_video &&
-        m_currentTrickRatio == 1.0)
-        accurate = true;
-	m_last_seek_pos = to * 11111LL;
-	if (!gst_element_seek (m_gst_playbin, m_currentTrickRatio, GST_FORMAT_TIME,
-		(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | (accurate ? GST_SEEK_FLAG_ACCURATE : GST_SEEK_FLAG_KEY_UNIT)),
-		GST_SEEK_TYPE_SET, m_last_seek_pos,
-		GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE))
-	{
+/**
+ * @brief Seeks to a specific position in the media.
+ *
+ * This function seeks to a specific position in the media being played by the
+ * service. It converts the PTS to nanoseconds and calls `gst_element_seek` to
+ * perform the seek operation. If the seek is successful, it updates the last
+ * seek position and triggers an event to update the service's information.
+ *
+ * @param[in] to The position to seek to in PTS format.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to seek.
+ */
+RESULT eServiceMP3::seekToImpl(pts_t to) {
+	// eDebug("[eServiceMP3] seekToImpl pts_t to %" G_GINT64_FORMAT, (gint64)to);
+	/* convert pts to nanoseconds */
+	m_last_seek_pos = to;
+	m_base_mpegts = -1;  // Reset when seeking to avoid stale base
+
+	// a flushing seek before preroll stalls playback, apply it on ASYNC_DONE
+	if (!m_prerolled) {
+		eDebug("[eServiceMP3] seekTo %lld deferred until preroll", (long long)to);
+		m_pending_seek_pos = to;
+		m_seeking_or_paused = false;
+		return 0;
+	}
+
+	/* 200ms gate against seek-spam: stacked FLUSH seeks deadlock the
+	 * main thread. UI position is updated before the gate. */
+	struct timespec tsk; clock_gettime(CLOCK_MONOTONIC, &tsk);
+	int64_t now_ms_k = (int64_t)tsk.tv_sec * 1000 + tsk.tv_nsec / 1000000;
+	if (now_ms_k - m_last_trickseek_ms < 200) {
+		eDebug("[eServiceMP3] seekToImpl throttled (%dms since last gst seek)",
+		       (int)(now_ms_k - m_last_trickseek_ms));
+		return 0;
+	}
+	m_last_trickseek_ms = now_ms_k;
+	/* Clear before seek: fresh buffers can arrive before gst_element_seek returns. */
+	flushClosedCaptions();
+	if (!gst_element_seek(m_gst_playbin, m_currentTrickRatio, GST_FORMAT_TIME,
+						  (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), GST_SEEK_TYPE_SET,
+						  (gint64)(m_last_seek_pos * 11111LL), GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE)) {
 		eDebug("[eServiceMP3] seekTo failed");
 		return -1;
 	}
-
-	/* A seek just happened: from here on the sink/pipeline itself reports
-	 * position correctly (this is what makes a manual seek "fix" the
-	 * display today), so getPlayPosition()'s one-time startup correction is
-	 * no longer needed - permanently disable it rather than recomputing a
-	 * new baseline, so it never touches an already-correct reading again.
-	 *
-	 * But only if that startup correction had actually finished capturing a
-	 * baseline by the time this seek happened - otherwise there was nothing
-	 * working to replace: an automatic seek can happen very early (e.g. an
-	 * auto/forced "resume playback" seek firing ~1s after start, before the
-	 * confirm window above has necessarily elapsed), and disabling
-	 * correction here unconditionally would leave getPlayPosition()
-	 * permanently returning the raw, uncorrected reading for the rest of
-	 * the session - silently reintroducing the exact bug this correction
-	 * exists to fix, with no further seek left to "fix the display" the way
-	 * the comment above describes for the normal case. In that situation,
-	 * leave correction enabled and let it capture its baseline from
-	 * whatever raw readings come after this seek instead - discard any
-	 * in-progress (pre-seek) candidate first, since the position just
-	 * jumped and that candidate is no longer a reading of the same
-	 * starting point. */
-	if (m_position_baseline_valid)
-		m_position_correction_enabled = false;
-	else
-		m_position_baseline_provisional = -1;
-
-	if (getHDAudioAuxState(m_gst_playbin))
-		seekHDAudioAuxPersistent(m_gst_playbin, m_last_seek_pos);
-
-	if (m_paused)
-	{
+	/* The seek flushes, so everything queued arrives again from the new position.
+	   Buffers already handed over are pre-flush, queued pages carry show times for
+	   the old position, and cached PGS objects would be reused by a display set
+	   that does not start a new epoch. */
+	m_subtitle_generation++;
+	m_dvb_subtitle_sync_timer->stop();
+	m_dvb_subtitle_pages.clear();
+	m_pgs_subtitle_parser->reset();
+	if (m_paused || m_to_paused) {
+		m_last_seek_count = 0;
 		m_event((iPlayableService*)this, evUpdatedInfo);
 	}
-
+	// eDebug("[eServiceMP3] seekToImpl DONE position %" G_GINT64_FORMAT, (gint64)m_last_seek_pos);
+	if (!m_paused) {
+		if (!m_to_paused) {
+			m_seeking_or_paused = false;
+			m_last_seek_count = 1;
+			// seek before the first getPlayPosition(), position would stay frozen
+			if (!m_play_position_timer->isActive())
+				m_play_position_timer->start(50, false);
+		}
+	}
 	return 0;
 }
 
-RESULT eServiceMP3::seekTo(pts_t to)
-{
-	RESULT ret = -1;
+/**
+ * @brief Applies a seek held back until preroll and sends evResumed.
+ */
+void eServiceMP3::applyPendingSeek() {
+	m_prerolled = true;
+	if (m_pending_seek_pos >= 0) {
+		pts_t pos = m_pending_seek_pos;
+		m_pending_seek_pos = -1;
+		if (m_is_live) {
+			eDebug("[eServiceMP3] dropping deferred seek to %lld, source is live", (long long)pos);
+		} else if (pos == 0) {
+			// already at 0, and it runs MPEG-TS into EOS
+			eDebug("[eServiceMP3] dropping deferred seek to 0, already there");
+		} else {
+			eDebug("[eServiceMP3] performing deferred seek to %lld", (long long)pos);
+			seekTo(pos);
+		}
+	}
+	if (m_resume_pending) {
+		m_resume_pending = false;
+		m_event((iPlayableService*)this, evResumed);
+	}
+}
 
-	if (m_gst_playbin)
-	{
+/**
+ * @brief Seeks to a specific position in the media.
+ *
+ * This function seeks to a specific position in the media being played by the
+ * service. It updates the last seek position and calls `seekToImpl` to perform
+ * the actual seek operation. If the service is not running, it returns an error.
+ *
+ * @param[in] to The position to seek to in PTS format.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to seek.
+ */
+RESULT eServiceMP3::seekTo(pts_t to) {
+	RESULT ret = -1;
+	// eDebug("[eServiceMP3] seekTo pts_t to %" G_GINT64_FORMAT, (gint64)to);
+	if (m_gst_playbin) {
 		m_prev_decoder_time = -1;
 		m_decoder_time_valid_state = 0;
+		m_seeking_or_paused = true;
 		ret = seekToImpl(to);
 	}
 
 	return ret;
 }
 
-
-RESULT eServiceMP3::trickSeek(gdouble ratio)
-{
+/**
+ * @brief Performs a trick seek operation.
+ *
+ * This function performs a trick seek operation, which can be used to change
+ * the playback speed or pause the playback. It handles different cases based on
+ * the provided ratio and updates the playback state accordingly.
+ *
+ * @param[in] ratio The trick seek ratio (1.0 for normal speed, >1.0 for fast forward, <1.0 for slow motion).
+ * @return RESULT Returns 0 on success, or an error code if the service fails to perform the trick seek.
+ */
+RESULT eServiceMP3::trickSeek(gdouble ratio) {
 	if (!m_gst_playbin)
 		return -1;
+	// eDebug("[eServiceMP3] trickSeek %.1f", ratio);
+
+	/* 500ms gate against FF/SlowMotion ratio spam. ratio 0.0 (pause)
+	 * and 1.0 (resume) always pass — they are state transitions. */
+	bool is_trick_ratio = !(ratio > -0.01 && ratio < 0.01)
+	                     && (ratio < 0.99 || ratio > 1.01);
+	if (is_trick_ratio) {
+		struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+		int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+		if (now_ms - m_last_trickseek_ms < 500) {
+			eDebug("[eServiceMP3] trickSeek throttled (%dms since last, ratio=%.1f)",
+			       (int)(now_ms - m_last_trickseek_ms), ratio);
+			return 0;
+		}
+		m_last_trickseek_ms = now_ms;
+	}
 	GstState state, pending;
-	if (ratio > -0.01 && ratio < 0.01)
-	{
+	GstStateChangeReturn ret;
+	int pos_ret = -1;
+	pts_t pts;
+
+	if (ratio > -0.01 && ratio < 0.01) {
+		// m_last_seek_count = 0;
+		pos_ret = getPlayPosition(pts);
+		m_to_paused = true;
 		gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
-		setHDAudioAuxState(m_gst_playbin, GST_STATE_PAUSED);
+		// m_paused = true;
+#ifdef DREAMNEXTGEN
+		/* the sinks pause in place at once; the state completes with the
+		 * next buffer the unsynced video sink gets, a seek would jump */
+		return 0;
+#else
+		if (pos_ret >= 0)
+			seekTo(pts);
+#endif
 		/* pipeline sometimes block due to audio track issue off gstreamer.
 		If the pipeline is blocked up on pending state change to paused ,
-        this issue is solved be just reselecting the current audio track.*/
-		gst_element_get_state(m_gst_playbin, &state, &pending, 1 * GST_SECOND);
-		if (state == GST_STATE_PLAYING && pending == GST_STATE_PAUSED)
-		{
+		this issue is solved by seek to playposition*/
+		ret = gst_element_get_state(m_gst_playbin, &state, &pending, 3LL * GST_SECOND);
+		if (state == GST_STATE_PLAYING && pending == GST_STATE_PAUSED) {
 			m_clear_buffers = true;
 			if (m_currentAudioStream >= 0)
 				selectAudioStream(m_currentAudioStream, true);
 			else
 				selectAudioStream(0, true);
 			m_clear_buffers = false;
+
+			if (pos_ret >= 0) {
+				eDebug("[eServiceMP3] blocked pipeline we need to flush playposition in pts at last pos before paused "
+					   "is %" G_GINT64_FORMAT,
+					   (gint64)pts);
+				seekTo(pts);
+
+			} else if (getPlayPosition(pts) >= 0) {
+				eDebug("[eServiceMP3] blocked pipeline we need to flush playposition in pts at paused is "
+					   "%" G_GINT64_FORMAT,
+					   (gint64)pts);
+				seekTo(pts);
+			}
 		}
+		// m_last_seek_count = 0;
 		return 0;
 	}
 
 	bool unpause = (m_currentTrickRatio == 1.0 && ratio == 1.0);
-	if (unpause)
-	{
-		GstElement *source = NULL;
-		GstElementFactory *factory = NULL;
-		const gchar *name = NULL;
-		g_object_get (G_OBJECT (m_gst_playbin), "source", &source, NULL);
-		if (!source)
-		{
+	if (unpause) {
+		GstElement* source = NULL;
+		GstElementFactory* factory = NULL;
+		const gchar* name = NULL;
+		/* the DASH pipeline has no playbin source; a seek in a live
+		 * manifest breaks dashdemux, it resumes where it paused */
+		if (m_is_dash_pipeline)
+			goto resume;
+		g_object_get(m_gst_playbin, "source", &source, NULL);
+		if (!source) {
 			eDebugNoNewLineStart("[eServiceMP3] trickSeek - cannot get source");
 			goto seek_unpause;
 		}
 		factory = gst_element_get_factory(source);
 		g_object_unref(source);
-		if (!factory)
-		{
+		if (!factory) {
 			eDebugNoNewLineStart("[eServiceMP3] trickSeek - cannot get source factory");
 			goto seek_unpause;
 		}
 		name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
-		if (!name)
-		{
+		if (!name) {
 			eDebugNoNewLineStart("[eServiceMP3] trickSeek - cannot get source name");
 			goto seek_unpause;
 		}
 		/*
 		 * We know that filesrc and souphttpsrc will not timeout after long pause
 		 * If there are other sources which will not timeout, add them here
-		*/
-		if (!strcmp(name, "filesrc") || !strcmp(name, "souphttpsrc"))
-		{
-			GstStateChangeReturn ret;
-			/* make sure that last state change was successfull */
-			ret = gst_element_get_state(m_gst_playbin, &state, &pending, 0);
-			if (ret == GST_STATE_CHANGE_SUCCESS)
-			{
-				gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-				ret = gst_element_get_state(m_gst_playbin, &state, &pending, 0);
-				if (ret == GST_STATE_CHANGE_SUCCESS)
-				{
-					setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
-					return 0;
-				}
-			}
-			eDebugNoNewLineStart("[eServiceMP3] trickSeek - invalid state, state:%s pending:%s ret:%s",
-				gst_element_state_get_name(state),
-				gst_element_state_get_name(pending),
-				gst_element_state_change_return_get_name(ret));
-		}
-		else
-		{
+		 */
+		if (!strcmp(name, "filesrc") || !strcmp(name, "souphttpsrc")) {
+		resume:
+			/* previous state was already ok if we come here just give all elements time to unpause */
+			m_to_paused = false;
+			gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+			ret = gst_element_get_state(m_gst_playbin, &state, &pending, 2 * GST_SECOND);
+			m_seeking_or_paused = false;
+			m_last_seek_count = 0;
+			eDebug("[eServiceMP3] unpause state:%s pending:%s ret:%s", gst_element_state_get_name(state),
+				   gst_element_state_get_name(pending), gst_element_state_change_return_get_name(ret));
+			return 0;
+		} else {
 			eDebugNoNewLineStart("[eServiceMP3] trickSeek - source '%s' is not supported", name);
 		}
-seek_unpause:
-		eDebugNoNewLine(", doing seeking unpause\n");
+	seek_unpause:
+		eDebug(", doing seeking unpause\n");
 	}
 
 	m_currentTrickRatio = ratio;
 
 	bool validposition = false;
 	gint64 pos = 0;
-	pts_t pts;
-	if (getRawPlayPosition(pts) >= 0)
-	{
+#ifdef DREAMNEXTGEN
+	/* wind on from the picture on screen, the last seek may be long ago */
+	if (getPlayPosition(pts) >= 0) {
+		validposition = true;
+		pos = pts * 11111LL;
+	} else
+#endif
+	if (m_last_seek_pos > 0) {
+		validposition = true;
+		pos = m_last_seek_pos * 11111LL;
+	} else if (getPlayPosition(pts) >= 0) {
 		validposition = true;
 		pos = pts * 11111LL;
 	}
 
-	gst_element_get_state(m_gst_playbin, &state, &pending, 1 * GST_SECOND);
-	if (state != GST_STATE_PLAYING)
+	ret = gst_element_get_state(m_gst_playbin, &state, &pending, 2 * GST_SECOND);
+	if (state != GST_STATE_PLAYING) {
+		eDebug("[eServiceMP3] set unpause or change playrate when gst was state %s pending %s change return %s",
+			   gst_element_state_get_name(state), gst_element_state_get_name(pending),
+			   gst_element_state_change_return_get_name(ret));
 		gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+		m_seeking_or_paused = false;
+		m_last_seek_count = 0;
+		m_to_paused = false;
+	}
 
-	if (validposition)
-	{
-		if (ratio >= 0.0)
-		{
-			gst_element_seek(m_gst_playbin, ratio, GST_FORMAT_TIME, (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_SKIP), GST_SEEK_TYPE_SET, pos, GST_SEEK_TYPE_SET, -1);
+	if (validposition) {
+		GstSeekFlags flags = (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_TRICKMODE | GST_SEEK_FLAG_TRICKMODE_NO_AUDIO);
+#ifdef DREAMNEXTGEN
+		if (ratio == 1.0) {
+			/* back to normal play with sound */
+			flags = (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT);
+		} else {
+			/* the decoder takes every frame up to about 60 per second, beyond
+			 * and backwards it gets the key frames only */
+			int fps = m_framerate > 1000 ? m_framerate / 1000 : 25;
+			if (ratio < 0.0 || ratio * fps > 60.0)
+				flags = (GstSeekFlags)(flags | GST_SEEK_FLAG_TRICKMODE_KEY_UNITS);
 		}
-		else
-		{
+#endif
+		if (ratio >= 0.0) {
+			gst_element_seek(m_gst_playbin, ratio, GST_FORMAT_TIME, flags, GST_SEEK_TYPE_SET, pos, GST_SEEK_TYPE_SET, -1);
+		} else {
 			/* note that most elements will not support negative speed */
-			gst_element_seek(m_gst_playbin, ratio, GST_FORMAT_TIME, (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_SKIP), GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_SET, pos);
+			gst_element_seek(m_gst_playbin, ratio, GST_FORMAT_TIME, flags, GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_SET, pos);
 		}
 	}
 
-	setHDAudioAuxState(m_gst_playbin, ratio == 1.0 ? GST_STATE_PLAYING : GST_STATE_PAUSED);
 	m_prev_decoder_time = -1;
 	m_decoder_time_valid_state = 0;
 	return 0;
 }
 
-
-RESULT eServiceMP3::seekRelative(int direction, pts_t to)
-{
+/**
+ * @brief Seeks relative to the current playback position.
+ *
+ * This function seeks relative to the current playback position in the media
+ * being played by the service. It updates the last seek position and calls
+ * `seekTo` to perform the actual seek operation.
+ *
+ * @param[in] direction The direction to seek (positive for forward, negative for backward).
+ * @param[in] to The amount to seek in PTS format.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to seek.
+ */
+RESULT eServiceMP3::seekRelative(int direction, pts_t to) {
 	if (!m_gst_playbin)
 		return -1;
 
-	pts_t ppos;
-	if (getRawPlayPosition(ppos) < 0) return -1;
-	ppos += to * direction;
-
-	if (ppos < 0)
-		ppos = 0;
-
-	int res = seekTo(ppos);
-
-	// Do double seek to same position so to overcome problem with seeking backward and passthrough on for some boxes
-	if (res > -1 && !getHDAudioAuxState(m_gst_playbin))
-		seekTo(ppos);
-
-	return res;
+	// eDebug("[eServiceMP3]  seekRelative direction %d, pts_t to %" G_GINT64_FORMAT, direction, (gint64)to);
+	pts_t ppos = 0;
+	// m_seeking_or_paused = true;
+	if (direction > 0) {
+		if (getPlayPosition(ppos) < 0)
+			return -1;
+		ppos += to;
+		m_seeking_or_paused = true;
+		return seekTo(ppos);
+	} else {
+		if (getPlayPosition(ppos) < 0)
+			return -1;
+		ppos -= to;
+		if (ppos < 0)
+			ppos = 0;
+		m_seeking_or_paused = true;
+		return seekTo(ppos);
+	}
 }
 
-gint eServiceMP3::match_sinktype(const GValue *velement, const gchar *type)
-{
-	GstElement *element = GST_ELEMENT_CAST(g_value_get_object(velement));
+/**
+ * @brief Matches the sink type of a GStreamer element.
+ *
+ * This function checks if the type of a GStreamer element matches a specified
+ * type string. It is used to determine if the element is compatible with the
+ * expected sink type for audio or video playback.
+ *
+ * @param[in] velement A GValue containing the GStreamer element to check.
+ * @param[in] type The expected type string to match against.
+ * @return gint Returns 0 if the types match, or a non-zero value if they do not match.
+ */
+gint eServiceMP3::match_sinktype(const GValue* velement, const gchar* type) {
+	GstElement* element = GST_ELEMENT_CAST(g_value_get_object(velement));
 	return strcmp(g_type_name(G_OBJECT_TYPE(element)), type);
 }
 
-/* Raw reading, in the same coordinate space gst_element_seek()'s absolute
- * GST_SEEK_TYPE_SET expects. trickSeek()/seekRelative()/clearBuffers() all
- * feed this value straight back into a seek, so they must keep using this
- * (not the corrected getPlayPosition() below) or every relative seek and
- * trick-play would land off by whatever the display correction is. */
-RESULT eServiceMP3::getRawPlayPosition(pts_t &pts)
-{
-	gint64 pos;
-	pts = 0;
+/**
+ * @brief Gets the current playback position in the media.
+ *
+ * This function retrieves the current playback position in the media being played
+ * by the service. It queries the GStreamer playbin for the current position and
+ * returns it in PTS format. It also handles special cases for live streams and
+ * paused states.
+ *
+ * @param[out] pts The current playback position in PTS format.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to get the position.
+ */
+RESULT eServiceMP3::getPlayPosition(pts_t& pts) {
+	gint64 pos = 0;
 
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
-
+	// allow only one ioctl call per second
+	// in case of seek procedure , the position
+	// is updated by the seektoImpl function.
+	// eDebug("[eServiceMP3] getPlayPosition m_last_seek_count = %d", m_last_seek_count);
+	if (m_last_seek_count <= 0) {
+		// eDebug("[eServiceMP3] ** START USE LAST SEEK TIMER");
+		if (m_last_seek_count == -10) {
+			eDebug("[eServiceMP3] ** START USE LAST SEEK TIMER");
+			m_play_position_timer->start(50, false);
+			m_last_seek_count = 0;
+		} else {
+			if (m_paused) {
+				pts = m_last_seek_pos;
+				m_last_seek_count = 0;
+				return 0;
+			} else
+				m_last_seek_count = 1;
+		}
+	} else {
+		if (m_paused || m_seeking_or_paused) {
+			m_last_seek_count = 0;
+			pts = m_last_seek_pos;
+		} else {
+			if (m_last_seek_count >= 1)
+				pts = m_last_seek_pos + ((m_last_seek_count - 1) * 4500);
+			else
+				pts = m_last_seek_pos;
+		}
+		return 0;
+	}
+	// todo :Check if amlogic stb's are always using gstreamer < 1
+	// if not this procedure needs to be altered.
+	// if ((dvb_audiosink || dvb_videosink) && !m_paused && !m_seeking_or_paused && !m_sourceinfo.is_hls)
 	bool got_decoder_time = false;
-	if ((audioSink || videoSink) && !m_paused)
-	{
-		if (m_sourceinfo.is_audio && videoSink) {
-			eTrace("[eServiceMP3] getRawPlayPosition: emitting get-decoder-time on audioSink (is_audio branch)");
-			g_signal_emit_by_name(audioSink, "get-decoder-time", &pos);
-			eTrace("[eServiceMP3] getRawPlayPosition: get-decoder-time (audioSink) returned pos=%lld", (long long)pos);
-			if (GST_CLOCK_TIME_IS_VALID(pos))
+	if ((dvb_audiosink || dvb_videosink) && !m_paused && !m_seeking_or_paused) {
+		// eDebug("[eServiceMP3] getPlayPosition Check dvb_audiosink or dvb_videosink");
+		if (m_sourceinfo.is_audio && dvb_audiosink) {
+			if (g_signal_lookup("get-decoder-time", G_OBJECT_TYPE(dvb_audiosink)))
+				g_signal_emit_by_name(dvb_audiosink, "get-decoder-time", &pos);
+			/* Some audio decoders keep reporting zero during playback. Use the
+			 * synchronized playbin position instead of resetting the cache to zero. */
+			if (GST_CLOCK_TIME_IS_VALID(pos) && pos > 0)
 				got_decoder_time = true;
 		} else if (!m_sourceinfo.is_audio) {
 			/* most stb's work better when pts is taken by audio but some video must be taken cause
 			 * audio is 0 or invalid */
 			/* avoid taking the audio play position if audio sink is in state NULL */
-			if (audioSink) {
-				eTrace("[eServiceMP3] getRawPlayPosition: emitting get-decoder-time on audioSink");
-				g_signal_emit_by_name(audioSink, "get-decoder-time", &pos);
-				eTrace("[eServiceMP3] getRawPlayPosition: get-decoder-time (audioSink) returned pos=%lld", (long long)pos);
-				if (!GST_CLOCK_TIME_IS_VALID(pos) && videoSink)
-				{
-					eTrace("[eServiceMP3] getRawPlayPosition: emitting get-decoder-time on videoSink");
-					g_signal_emit_by_name(videoSink, "get-decoder-time", &pos);
-					eTrace("[eServiceMP3] getRawPlayPosition: get-decoder-time (videoSink) returned pos=%lld", (long long)pos);
-				}
-				if (GST_CLOCK_TIME_IS_VALID(pos))
+			if (!m_audiosink_not_running && dvb_audiosink) {
+				if (g_signal_lookup("get-decoder-time", G_OBJECT_TYPE(dvb_audiosink)))
+				g_signal_emit_by_name(dvb_audiosink, "get-decoder-time", &pos);
+				if (!GST_CLOCK_TIME_IS_VALID(pos) && dvb_videosink)
+					if (g_signal_lookup("get-decoder-time", G_OBJECT_TYPE(dvb_videosink)))
+				g_signal_emit_by_name(dvb_videosink, "get-decoder-time", &pos);
+				if (GST_CLOCK_TIME_IS_VALID(pos) && pos > 0)
 					got_decoder_time = true;
-			} else if (videoSink) {
-				eTrace("[eServiceMP3] getRawPlayPosition: emitting get-decoder-time on videoSink (no audioSink)");
-				g_signal_emit_by_name(videoSink, "get-decoder-time", &pos);
-				eTrace("[eServiceMP3] getRawPlayPosition: get-decoder-time (videoSink) returned pos=%lld", (long long)pos);
-				if (GST_CLOCK_TIME_IS_VALID(pos))
+			} else if (dvb_videosink) {
+				if (g_signal_lookup("get-decoder-time", G_OBJECT_TYPE(dvb_videosink)))
+				g_signal_emit_by_name(dvb_videosink, "get-decoder-time", &pos);
+				if (GST_CLOCK_TIME_IS_VALID(pos) && pos > 0)
 				got_decoder_time = true;
 			}
 		}
@@ -3433,857 +2596,265 @@ RESULT eServiceMP3::getRawPlayPosition(pts_t &pts)
 		* exist but get-decoder-time returns invalid values (e.g. MP4 playback on
 		* some chipsets like HiSilicon), or when no dvb sinks are available at all. */
 		GstFormat fmt = GST_FORMAT_TIME;
-		eTrace("[eServiceMP3] getRawPlayPosition: calling gst_element_query_position");
-		gboolean qp_ok = gst_element_query_position(m_gst_playbin, fmt, &pos);
-		eTrace("[eServiceMP3] getRawPlayPosition: gst_element_query_position returned %d, pos=%lld", qp_ok, (long long)pos);
-		if (!qp_ok)
-		{
-			eTrace("[eServiceMP3] gst_element_query_position failed in getPlayPosition");
-			return -1;
+		if (!gst_element_query_position(m_gst_playbin, fmt, &pos)) {
+			// eDebug("[eServiceMP3] gst_element_query_position failed in getPlayPosition");
+			if (m_last_seek_pos > 0) {
+				pts = m_last_seek_pos;
+				m_last_seek_count = 0;
+				return 0;
+			} else
+				return -1;
 		}
 	}
 
 	/* pos is in nanoseconds. we have 90 000 pts per second. */
-	pts = pos / 11111LL;
+	m_last_seek_pos = pos / 11111LL;
+	pts = m_last_seek_pos;
+	// eDebug("[eServiceMP3] current play pts = %" G_GINT64_FORMAT, pts);
 	return 0;
 }
 
-/* Public/display-facing position (iSeekableService, exposed to the UI/OSD).
+/**
+ * @brief Gets the current decoder time for live streams.
  *
- * On some chipsets/streams, get-decoder-time reads the DVB sink's raw
- * hardware decoder-time register, which is not guaranteed to be zero-based
- * at the start of playback (e.g. a stale value from a previous playback
- * session, or a stream whose PTS domain doesn't start at 0) - even though
- * actual playback already starts at the real beginning of the stream. A
- * manual seek reliably "fixes" the displayed position - not by making this
- * correction recompute itself, but because the sink itself starts reporting
- * correctly once a real seek has happened. So this correction only ever
- * applies once, before that first real seek: it captures a baseline and
- * applies it until seekToImpl() runs for the first time, at which point it
- * is permanently disabled and getPlayPosition() reverts to returning the
- * (by then trustworthy) raw value unchanged - it must NOT keep recomputing
- * a new baseline after every seek.
+ * This function retrieves the current decoder time for live streams. It emits
+ * a signal to the dvb_videosink to get the decoder time and converts it from
+ * nanoseconds to 90kHz PTS format.
  *
- * The baseline itself is not just latched onto the very first raw reading:
- * network streams in particular can take a while to buffer/preroll, during
- * which get-decoder-time/gst_element_query_position() may return a
- * transient, unrepresentative value (e.g. stuck at 0, or some other
- * not-yet-locked reading) before the decoder clock genuinely starts
- * advancing, or may briefly jitter backwards before it locks - latching
- * onto one of those would bake in a wrong baseline for the rest of this
- * correction's lifetime. So this waits to see the raw reading hold (not go
- * backwards) across a short real-time window before trusting it, only then
- * capturing it as the baseline. Until confirmed, this reports 0 rather than
- * a baseline computed from an unconfirmed reading.
- *
- * The candidate for that baseline is not necessarily first captured here
- * either: gstBusCall()'s GST_STATE_CHANGE_PAUSED_TO_PLAYING handling seeds
- * it as soon as the pipeline first reaches PLAYING, rather than leaving the
- * very first sample to whichever Python UI timer happens to call
- * getPlayPosition() first. A network/HLS source in particular can sit
- * PAUSED filling its prefill buffer for a few real seconds before that
- * transition fires (see the GST_MESSAGE_BUFFERING handling further down),
- * during which the decoder can already race ahead of real-time on the
- * queued data - if nothing polled position until after that point, the
- * first call here would otherwise mistake that already-elapsed offset for
- * "time zero" and the display would visibly start several seconds in. This
- * function still seeds its own candidate the same way on its own first
- * call, as a fallback for any service type/path that does not go through
- * that state-change handling.
- *
- * That confirmation window is real wall-clock time (g_get_monotonic_time()),
- * not a number of getPlayPosition() calls: this is polled independently by
- * several UI timers (position display, subtitle renderer, timeshift, ...)
- * all sharing this same state, so a call-count gate's real-time cost is
- * unpredictable - depending on how those pollers happen to interleave, or
- * how coarsely the underlying decoder-time/position query updates, it can
- * end up spanning several real seconds. Every one of those seconds would
- * then be baked into m_position_baseline as a permanent offset - visibly,
- * playback appearing to "start" several seconds in rather than at 0. Using
- * a small, fixed real-time bound avoids that regardless of polling pattern.
- * The baseline itself is the reading from when the candidate was first
- * seen, not from when confirmation completed a short time later, so the
- * (bounded, small) confirmation delay itself is not baked in either.
- *
- * getRawPlayPosition() itself is left untouched - trickSeek()/
- * seekRelative()/clearBuffers() depend on its value being in the same
- * coordinate space gst_element_seek() expects, so the correction below is
- * applied only here, at the point the position is actually reported. */
-RESULT eServiceMP3::getPlayPosition(pts_t &pts)
-{
-
-    // OPENATV_FULLPORT_1: avoid an artificial startup baseline for local files.
-    // PTS is GStreamer's media timeline (the same domain as subtitle buffers).
-    if (m_gst_playbin && m_state == stRunning && !m_is_live &&
-        !m_sourceinfo.is_streaming && m_sourceinfo.is_video)
-    {
-        gint64 video_ns = GST_CLOCK_TIME_NONE;
-        if (gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &video_ns) &&
-            video_ns >= 0 && GST_CLOCK_TIME_IS_VALID((GstClockTime)video_ns))
-        {
-            pts = (pts_t)gst_util_uint64_scale((guint64)video_ns, 90000, GST_SECOND);
-            return 0;
-        }
-        // If a saved-position seek is still pending, don't display a bogus 0.
-        if (m_pending_start_position > 0)
-        {
-            pts = m_pending_start_position;
-            return 0;
-        }
-    }
-	pts_t raw;
-	RESULT res = getRawPlayPosition(raw);
-	if (res < 0)
-		return res;
-
-	if (!m_position_correction_enabled)
-	{
-		pts = raw;
-		return 0;
+ * @return int64_t Returns the current decoder time in 90kHz PTS format, or -1 if not valid.
+ */
+int64_t eServiceMP3::getLiveDecoderTime() {
+	gint64 pos = 0;
+	if (dvb_videosink) {
+		if (g_signal_lookup("get-decoder-time", G_OBJECT_TYPE(dvb_videosink)))
+				g_signal_emit_by_name(dvb_videosink, "get-decoder-time", &pos);
+		if (GST_CLOCK_TIME_IS_VALID(pos) && pos > 0) {
+			// Convert from nanoseconds back to 90kHz
+			return pos / 11111;
+		}
 	}
-
-	if (!m_position_baseline_valid)
-	{
-		static const gint64 confirm_window_us = 300 * 1000; /* 300ms */
-		/*
-		 * How much faster than real time the raw reading is still allowed to
-		 * advance during the confirm window before this treats it as "still
-		 * catching up" rather than genuinely settled. Not 1x: a network
-		 * source in particular can legitimately decode a short burst of
-		 * already-buffered/queued data faster than real time even once
-		 * essentially caught up, and false-restarting on every such blip
-		 * would mean the window never actually elapses. 3x is loose enough
-		 * to tolerate that while still catching the multi-second-per-300ms
-		 * bursts that come from genuinely still buffering/prerolling.
-		 */
-		static const gint64 max_advance_multiple = 3;
-		gint64 now = g_get_monotonic_time();
-
-		/* No candidate yet, or the reading has gone backwards since the
-		 * candidate was captured (still prerolling, or a jittery/
-		 * not-yet-locked clock) - (re)start the candidate from this
-		 * reading, timestamped now. */
-		if (m_position_baseline_provisional < 0 || raw < m_position_baseline_provisional)
-		{
-			m_position_baseline_provisional = raw;
-			m_position_baseline_first_seen_us = now;
-			pts = 0;
-			return 0;
-		}
-
-		gint64 elapsed_us = now - m_position_baseline_first_seen_us;
-		/* raw and m_position_baseline_provisional are both 90kHz pts units
-		 * (see getRawPlayPosition()); convert their difference to the same
-		 * microsecond scale as elapsed_us for the comparison below. */
-		gint64 advance_us = (raw - m_position_baseline_provisional) * 1000000LL / 90000LL;
-
-		/* The reading never went backwards, but it's still advancing much
-		 * faster than real time - e.g. still burst-decoding buffered/queued
-		 * data on a network source. Left alone, the candidate captured at
-		 * the start of this window is already stale by the time the window
-		 * elapses and gets confirmed below: playback has since raced ahead
-		 * of it, so the confirmed baseline ends up short of where decoding
-		 * actually was at that moment, and every position report for the
-		 * rest of the session comes out permanently offset by however much
-		 * extra distance was covered during this one window (confirmed on
-		 * device: a multi-second offset on stream startup, e.g. "starts at
-		 * 4 seconds" instead of 0). Restart the candidate from this newer,
-		 * still-advancing reading instead of letting a stale one confirm -
-		 * same treatment as an outright backward jump above. */
-		if (elapsed_us > 0 && advance_us > elapsed_us * max_advance_multiple)
-		{
-			m_position_baseline_provisional = raw;
-			m_position_baseline_first_seen_us = now;
-			pts = 0;
-			return 0;
-		}
-
-		if (elapsed_us < confirm_window_us)
-		{
-			pts = 0;
-			return 0;
-		}
-
-		/* Confirmed: the reading has neither gone backwards nor raced ahead
-		 * of real time for a full confirm_window_us stretch, so it is
-		 * trustworthy. Use the candidate as first captured, not "raw" here -
-		 * the time spent confirming must not itself become part of the
-		 * baseline. */
-		m_position_baseline = m_position_baseline_provisional;
-		m_position_baseline_valid = true;
-	}
-
-	pts = raw - m_position_baseline;
-	if (pts < 0)
-		pts = 0;
-	return 0;
-}
-
-RESULT eServiceMP3::setTrickmode(int trick)
-{
-		/* trickmode is not yet supported by our dvbmediasinks. */
 	return -1;
 }
 
-RESULT eServiceMP3::isCurrentlySeekable()
-{
+/**
+ * @brief Sets the trick mode for the service.
+ *
+ * This function sets the trick mode for the service, which can be used to
+ * change the playback speed or pause the playback. It currently does not support
+ * trick modes and returns an error.
+ *
+ * @param[in] trick The trick mode to set (not supported).
+ * @return RESULT Returns -1 indicating that trick modes are not supported.
+ */
+RESULT eServiceMP3::setTrickmode(int trick) {
+	/* trickmode is not yet supported by our dvbmediasinks. */
+	return -1;
+}
+
+/**
+ * @brief Checks if the service is currently seekable.
+ *
+ * This function checks if the service is currently seekable. It returns 0 if
+ * the service is not seekable, or a positive value if it is seekable. If the
+ * service is live, it is assumed to be not seekable.
+ *
+ * @return RESULT Returns 0 if not seekable, or a positive value if seekable.
+ */
+RESULT eServiceMP3::isCurrentlySeekable() {
 	int ret = 3; /* just assume that seeking and fast/slow winding are possible */
 
 	if (!m_gst_playbin)
 		return 0;
 
+	if (m_is_live) // Assume to be not seekable if we are live
+		return 0;
+#ifdef DREAMNEXTGEN
+	/* 4: winds at every speed and backwards itself, InfoBarSeek needs no jumps; with jumps on, it jumps from 8x and backwards */
+	if (m_state == stRunning && m_prerolled)
+		return canWind() ? (eConfigManager::getConfigBoolValue("config.seek.withjumps", true) ? 3 : 7) : 0;
+#endif
+
 	return ret;
 }
 
-#ifdef HAS_SOFTWARE_HDR_DETECTION
-static int caps_hdr_value(GstCaps *caps)
-{
-	/* -1 = no colorimetry field, 0 = SDR, 1 = HDR10, 2 = HLG, 3 = generic HDR */
-	if (!caps) return -1;
-	int res = -1;
-	guint n = gst_caps_get_size(caps);
-	for (guint i = 0; i < n; i++)
-	{
-		GstStructure *str = gst_caps_get_structure(caps, i);
-		if (!str) continue;
-		const gchar *col = gst_structure_get_string(str, "colorimetry");
-		if (col)
-		{
-			if (res < 0) res = 0;
-			if (g_strrstr(col, "bt2100-pq") || g_strrstr(col, "smpte2084")) return 1;
-			if (g_strrstr(col, "bt2100-hlg") || g_strrstr(col, "arib-std-b67")) return 2;
-			/* BT.2020 traditional gamma — plain HDR (driver gamma=1, TC=14/15) */
-			if (g_strrstr(col, "bt2020-10") || g_strrstr(col, "bt2020-12")) { if (res < 3) res = 3; }
-		}
-		if (gst_structure_has_field(str, "mastering-display-info") ||
-		    gst_structure_has_field(str, "content-light-level"))
-			if (res < 1) res = 1;
-	}
-	return res;
-}
-
-/* Extract parameter-set NAL units from the HEVCDecoderConfigurationRecord
- * (hvcC, ISO 14496-15 §8.3.3) stored in GStreamer codec_data cap.
- * For MP4/MKV files with stream-format=hvc1/hev1, the SPS (and VPS/PPS) live
- * here rather than in the regular buffer stream, so the bitstream probe would
- * never see the SPS — and therefore miss HLG whose only indicator is
- * transfer_characteristics=18 in the SPS VUI. */
-static void preingest_hevc_codec_data(GstCaps *caps, std::vector<uint8_t> &out)
-{
-	if (!caps || gst_caps_get_size(caps) == 0) return;
-	GstStructure *str = gst_caps_get_structure(caps, 0);
-	if (!str) return;
-	const GValue *cdval = gst_structure_get_value(str, "codec_data");
-	if (!cdval) return;
-	GstBuffer *cdbuf = gst_value_get_buffer(cdval);
-	if (!cdbuf) return;
-	GstMapInfo map;
-	if (!gst_buffer_map(cdbuf, &map, GST_MAP_READ)) return;
-	const uint8_t *d = map.data;
-	gsize sz = map.size;
-	/* Fixed hvcC header is 22 bytes; byte 22 = numOfArrays */
-	static const uint8_t sc[4] = {0, 0, 0, 1};
-	if (sz > 22)
-	{
-		uint8_t numArrays = d[22];
-		gsize pos = 23;
-		for (uint8_t a = 0; a < numArrays && pos + 3 <= sz; a++)
-		{
-			pos++;  /* array_completeness(1) | reserved(1) | nal_unit_type(6) */
-			uint16_t numNalus = ((uint16_t)d[pos] << 8) | d[pos + 1];
-			pos += 2;
-			for (uint16_t n = 0; n < numNalus && pos + 2 <= sz; n++)
-			{
-				uint16_t naluLen = ((uint16_t)d[pos] << 8) | d[pos + 1];
-				pos += 2;
-				if (pos + naluLen > sz) break;
-				out.insert(out.end(), sc, sc + 4);
-				out.insert(out.end(), d + pos, d + pos + naluLen);
-				pos += naluLen;
-			}
-		}
-	}
-	gst_buffer_unmap(cdbuf, &map);
-}
-
-
-
-GstPadProbeReturn eServiceMP3::hdrProbeCallback(GstPad*, GstPadProbeInfo *info, gpointer user_data)
-{
-	eServiceMP3 *self = static_cast<eServiceMP3*>(user_data);
-	GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
-	if (!buf) return GST_PAD_PROBE_OK;
-
-	/* Atomic pre-check before any buffer mapping or mutex: stopHDRProbe()
-	 * sets m_hdr_probe_active to 0 via g_atomic_int_set() WITHOUT acquiring
-	 * the mutex, so this check is always safe and avoids the cost of
-	 * gst_buffer_map + mutex acquisition when we are already stopping. */
-	if (!g_atomic_int_get(&self->m_hdr_probe_active))
-		return GST_PAD_PROBE_REMOVE;
-
-	GstMapInfo map;
-	if (!gst_buffer_map(buf, &map, GST_MAP_READ))
-		return GST_PAD_PROBE_OK;  /* DMA/opaque buffer — skip silently */
-
-	g_mutex_lock(&self->m_hdr_probe_mutex);
-	if (!g_atomic_int_get(&self->m_hdr_probe_active))
-	{
-		/* Double-check under mutex in case stopHDRProbe() ran between the
-		 * atomic pre-check above and acquiring the mutex. */
-		g_mutex_unlock(&self->m_hdr_probe_mutex);
-		gst_buffer_unmap(buf, &map);
-		return GST_PAD_PROBE_REMOVE;
-	}
-	if (self->m_hdr_probe_es.size() < (8 * 1024 * 1024))
-	{
-		const uint8_t *d = map.data;
-		gsize sz = map.size;
-		/* Detect Annex-B (00 00 01 or 00 00 00 01 start codes) vs
-		 * length-prefixed hvc1/hev1 (4-byte big-endian NAL length).
-		 * Convert length-prefixed to Annex-B so HevcHDR::classify works
-		 * regardless of what stream-format the downstream sink negotiated. */
-		bool annexb = sz >= 3 && d[0] == 0 && d[1] == 0 &&
-		              (d[2] == 1 || (sz >= 4 && d[2] == 0 && d[3] == 1));
-		if (annexb)
-		{
-			self->m_hdr_probe_es.insert(self->m_hdr_probe_es.end(), d, d + sz);
-		}
-		else
-		{
-			/* Length-prefixed: convert each NAL unit to Annex-B */
-			static const uint8_t sc[4] = {0, 0, 0, 1};
-			gsize pos = 0;
-			while (pos + 4 <= sz)
-			{
-				uint32_t nlen = ((uint32_t)d[pos] << 24) | ((uint32_t)d[pos+1] << 16)
-				              | ((uint32_t)d[pos+2] << 8) | d[pos+3];
-				pos += 4;
-				if (nlen == 0 || pos + nlen > sz) break;
-				self->m_hdr_probe_es.insert(self->m_hdr_probe_es.end(), sc, sc + 4);
-				self->m_hdr_probe_es.insert(self->m_hdr_probe_es.end(), d + pos, d + pos + nlen);
-				pos += nlen;
-			}
-		}
-	}
-	g_mutex_unlock(&self->m_hdr_probe_mutex);
-
-	gst_buffer_unmap(buf, &map);
-	return GST_PAD_PROBE_OK;
-}
-
-void eServiceMP3::startHDRProbe()
-{
-	/* Guard against stale GStreamer bus messages delivered after stop() */
-	if (m_state != stRunning || !m_gst_playbin) return;
-	stopHDRProbe();
-
-	/* Find the first src pad in the pipeline that outputs video/x-h265.
-	 * Search by caps rather than by element name — STB pipelines often do not
-	 * include a standard h265parse element and use proprietary HEVC decoders.
-	 * Demuxer src pads are encountered first and always carry CPU-accessible
-	 * buffers (unlike hardware decoder sink/src pads which may be DMA-only). */
-	GstPad *hevc_pad = NULL;
-	GstIterator *eit = gst_bin_iterate_recurse(GST_BIN(m_gst_playbin));
-	GValue eitem = G_VALUE_INIT;
-	bool edone = false;
-	while (!edone)
-	{
-		switch (gst_iterator_next(eit, &eitem))
-		{
-			case GST_ITERATOR_OK:
-			{
-				GstElement *el = GST_ELEMENT(g_value_get_object(&eitem));
-				if (el)
-				{
-					GstIterator *pit = gst_element_iterate_src_pads(el);
-					GValue pitem = G_VALUE_INIT;
-					bool pdone = false;
-					while (!pdone)
-					{
-						switch (gst_iterator_next(pit, &pitem))
-						{
-							case GST_ITERATOR_OK:
-							{
-								GstPad *pad = GST_PAD(g_value_get_object(&pitem));
-								GstCaps *caps = gst_pad_get_current_caps(pad);
-								if (caps)
-								{
-									for (guint i = 0; i < gst_caps_get_size(caps) && !hevc_pad; i++)
-									{
-										const gchar *sname = gst_structure_get_name(
-											gst_caps_get_structure(caps, i));
-										if (sname && g_str_has_prefix(sname, "video/x-h265"))
-										{
-											hevc_pad = GST_PAD(gst_object_ref(pad));
-											pdone = edone = true;
-										}
-									}
-									gst_caps_unref(caps);
-								}
-								g_value_reset(&pitem);
-								break;
-							}
-							case GST_ITERATOR_RESYNC: gst_iterator_resync(pit); break;
-							default: pdone = true; break;
-						}
-					}
-					g_value_unset(&pitem);
-					gst_iterator_free(pit);
-				}
-				g_value_reset(&eitem);
-				break;
-			}
-			case GST_ITERATOR_RESYNC: gst_iterator_resync(eit); break;
-			default: edone = true; break;
-		}
-	}
-	g_value_unset(&eitem);
-	gst_iterator_free(eit);
-
-	if (!hevc_pad)
-	{
-		eDebug("[eServiceMP3] HDR probe: no HEVC src pad found in pipeline");
-		return;
-	}
-
-	/* Fast path: check if the HEVC pad caps already carry colorimetry.
-	 * updateHDRFromVideoPad() only checked the playbin video pad and static
-	 * "src" pads.  Demuxer dynamic pads (video_0 etc.) are found here first.
-	 * For MKV/MP4, the demuxer maps ColourTransferCharacteristics / the colr
-	 * box directly into pad-caps colorimetry — the same data ffprobe reads. */
-	{
-		GstCaps *caps = gst_pad_get_current_caps(hevc_pad);
-		if (caps)
-		{
-			int hdrFromCaps = caps_hdr_value(caps);
-			gst_caps_unref(caps);
-			if (hdrFromCaps > 0)
-			{
-				eDebug("[eServiceMP3] HDR probe: result %d from HEVC pad colorimetry", hdrFromCaps);
-				gst_object_unref(hevc_pad);
-				if (hdrFromCaps != m_hdr_type)
-				{
-					m_hdr_type = hdrFromCaps;
-					m_event((iPlayableService*)this, evUpdatedInfo);
-				}
-				return;
-			}
-		}
-	}
-
-	g_mutex_lock(&m_hdr_probe_mutex);
-	m_hdr_probe_es.clear();
-	m_hdr_probe_es.reserve(512 * 1024);
-	/* Pre-populate from hvcC codec_data so the SPS is visible to classify()
-	 * even for hvc1/hev1 streams where parameter sets are not in-band. */
-	{
-		GstCaps *caps = gst_pad_get_current_caps(hevc_pad);
-		if (caps) { preingest_hevc_codec_data(caps, m_hdr_probe_es); gst_caps_unref(caps); }
-	}
-	m_hdr_probe_last_classify = 0;
-	m_hdr_probe_first_sps_at = 0;
-	g_atomic_int_set(&m_hdr_probe_active, 1);
-	g_mutex_unlock(&m_hdr_probe_mutex);
-
-	m_hdr_probe_id = gst_pad_add_probe(hevc_pad, GST_PAD_PROBE_TYPE_BUFFER,
-	                                    hdrProbeCallback, this, NULL);
-	m_hdr_probe_pad = hevc_pad; /* takes ownership of ref */
-
-	m_hdr_probe_timer = eTimer::create(eApp);
-	CONNECT(m_hdr_probe_timer->timeout, eServiceMP3::checkHDRProbe);
-	m_hdr_probe_timer->start(200, false);
-	eDebug("[eServiceMP3] HDR probe: started on HEVC src pad");
-}
-
-void eServiceMP3::stopHDRProbe()
-{
-	if (m_hdr_probe_timer) { m_hdr_probe_timer->stop(); m_hdr_probe_timer = 0; }
-
-	/* Set the active flag atomically WITHOUT acquiring m_hdr_probe_mutex.
-	 * This is the key fix for the UI lockup on H.265 channel zapping:
-	 *  - gst_element_set_state(NULL) can return GST_STATE_CHANGE_ASYNC,
-	 *    meaning the streaming thread is still running hdrProbeCallback.
-	 *  - hdrProbeCallback holds m_hdr_probe_mutex while copying H.265 I-frame
-	 *    data (can be 500KB-2MB per frame), which could block the main thread
-	 *    for a significant time if we call g_mutex_lock() here.
-	 *  - By using g_atomic_int_set(), we set inactive instantly without
-	 *    contending the mutex.  The probe callback's atomic pre-check sees the
-	 *    flag and returns GST_PAD_PROBE_REMOVE without touching the mutex at all.
-	 * m_hdr_probe_es cleanup: try a non-blocking lock; if the probe is mid-copy
-	 * skip the clear — the data is harmless and freed with the object. */
-	g_atomic_int_set(&m_hdr_probe_active, 0);
-	if (g_mutex_trylock(&m_hdr_probe_mutex))
-	{
-		std::vector<uint8_t>().swap(m_hdr_probe_es);
-		g_mutex_unlock(&m_hdr_probe_mutex);
-	}
-	std::vector<uint8_t>().swap(m_hdr_probe_snap); /* main-thread only, no lock needed */
-
-	/* Release our pad ref; GStreamer holds its own ref until the probe is removed. */
-	m_hdr_probe_id = 0;
-	if (m_hdr_probe_pad) { gst_object_unref(m_hdr_probe_pad); m_hdr_probe_pad = NULL; }
-}
-
-void eServiceMP3::checkHDRProbe()
-{
-	/* Swap out new data under lock in O(1), then append to the main-thread
-	 * accumulator and classify entirely outside the lock.  This keeps the
-	 * mutex hold-time to a pointer swap rather than an O(N) copy that would
-	 * stall the streaming thread (hdrProbeCallback) for the copy duration. */
-	std::vector<uint8_t> batch;
-	g_mutex_lock(&m_hdr_probe_mutex);
-	batch.swap(m_hdr_probe_es);                    /* O(1) */
-	m_hdr_probe_es.reserve(64 * 1024);             /* pre-allocate for next batch */
-	g_mutex_unlock(&m_hdr_probe_mutex);
-
-	if (batch.empty()) return;
-
-	m_hdr_probe_snap.insert(m_hdr_probe_snap.end(), batch.begin(), batch.end());
-
-	/* Only re-classify every 64KB of new data */
-	if (m_hdr_probe_snap.size() - m_hdr_probe_last_classify < (64 * 1024) &&
-	    m_hdr_probe_snap.size() < (8 * 1024 * 1024))
-		return;
-	m_hdr_probe_last_classify = m_hdr_probe_snap.size();
-
-	bool sawSPS = false;
-	int result = HevcHDR::classify(m_hdr_probe_snap.data(), (int)m_hdr_probe_snap.size(), &sawSPS);
-
-	if (result == HevcHDR::HDR_HDR10 || result == HevcHDR::HDR_HLG || result == HevcHDR::HDR_GENERIC)
-	{
-		int newHdrType = (result == HevcHDR::HDR_HDR10) ? 1 :
-		                 (result == HevcHDR::HDR_HLG)   ? 2 : 3;
-		eDebug("[eServiceMP3] HDR probe: result %d from bitstream", newHdrType);
-		stopHDRProbe();
-		if (newHdrType != m_hdr_type)
-		{
-			m_hdr_type = newHdrType;
-			m_event((iPlayableService*)this, evUpdatedInfo);
-		}
-		return;
-	}
-
-	if (sawSPS)
-	{
-		if (!m_hdr_probe_first_sps_at) m_hdr_probe_first_sps_at = m_hdr_probe_snap.size();
-		if (m_hdr_probe_snap.size() - m_hdr_probe_first_sps_at >= (768 * 1024))
-		{
-			/* Read enough past first SPS without finding HDR -> SDR */
-			stopHDRProbe();
-			return;
-		}
-	}
-
-	if (m_hdr_probe_snap.size() >= (8 * 1024 * 1024))
-		stopHDRProbe();
-}
-
-/* -------------------------------------------------------------------------- */
-
-void eServiceMP3::updateHDRFromVideoPad()
-{
-	if (!m_gst_playbin || m_state != stRunning)
-		return;
-
-	int hdr = -1;
-
-	/* primary: playbin video pad (pre-sink, carries parsed caps with native video) */
-	GstPad *pad = 0;
-	g_signal_emit_by_name(m_gst_playbin, "get-video-pad", 0, &pad);
-	if (pad)
-	{
-		GstCaps *caps = gst_pad_get_current_caps(pad);
-		if (caps) { hdr = caps_hdr_value(caps); gst_caps_unref(caps); }
-		gst_object_unref(pad);
-	}
-
-	/* fallback: search pipeline for ANY src pad exposing colorimetry.
-	 * Demuxers (matroskademux, qtdemux) expose video on dynamic src pads
-	 * named "video_0" etc., NOT on a static pad named "src".  Iterating
-	 * all src pads (as startHDRProbe does) finds the pad that carries
-	 * ColourTransferCharacteristics / colr-box colorimetry from the container
-	 * header — the same data source that ffprobe reads. */
-	if (hdr < 0)
-	{
-		GstIterator *eit = gst_bin_iterate_recurse(GST_BIN(m_gst_playbin));
-		GValue eitem = G_VALUE_INIT;
-		bool edone = false;
-		while (!edone)
-		{
-			switch (gst_iterator_next(eit, &eitem))
-			{
-				case GST_ITERATOR_OK:
-				{
-					GstElement *el = GST_ELEMENT(g_value_get_object(&eitem));
-					if (el)
-					{
-						GstIterator *pit = gst_element_iterate_src_pads(el);
-						GValue pitem = G_VALUE_INIT;
-						bool pdone = false;
-						while (!pdone)
-						{
-							switch (gst_iterator_next(pit, &pitem))
-							{
-								case GST_ITERATOR_OK:
-								{
-									GstPad *sp = GST_PAD(g_value_get_object(&pitem));
-									GstCaps *c = gst_pad_get_current_caps(sp);
-									if (c) { int v = caps_hdr_value(c); gst_caps_unref(c);
-										if (v >= 0) { hdr = v; if (v > 0) pdone = edone = true; }
-									}
-									g_value_reset(&pitem);
-									break;
-								}
-								case GST_ITERATOR_RESYNC: gst_iterator_resync(pit); break;
-								default: pdone = true; break;
-							}
-						}
-						g_value_unset(&pitem);
-						gst_iterator_free(pit);
-					}
-					g_value_reset(&eitem);
-					break;
-				}
-				case GST_ITERATOR_RESYNC: gst_iterator_resync(eit); break;
-				default: edone = true; break;
-			}
-		}
-		g_value_unset(&eitem);
-		gst_iterator_free(eit);
-	}
-
-	eDebug("[eServiceMP3] HDR probe: result %d from video pad colorimetry", hdr);
-
-	/* Only update m_hdr_type when caps give a positive result.
-	 * Do NOT reset a previously probed HDR result just because
-	 * caps lack colorimetry (e.g. older STB GStreamer builds). */
-	if (hdr > 0 && hdr != m_hdr_type)
-	{
-		m_hdr_type = hdr;
-		m_event((iPlayableService*)this, evUpdatedInfo);
-	}
-}
-#endif /* HAS_SOFTWARE_HDR_DETECTION */
-
-/* Count the compressed bytes entering playbin's video/audio stream selectors so the
- * bitrate viewer has something to show for servicemp3 (there is no demux to tap). */
-void eServiceMP3::installBitrateProbes(int n_video, int n_audio)
-{
-	auto install = [](GstPad *pad, byteCounterPtr &counter) -> bool
-	{
-		if (g_object_get_qdata(G_OBJECT(pad), byteCounterProbeQuark()))
-			return false;
-		g_object_set_qdata(G_OBJECT(pad), byteCounterProbeQuark(), GUINT_TO_POINTER(1));
-		counter = std::make_shared<std::atomic<guint64> >(0);
-		ByteCounterProbeData *data = new ByteCounterProbeData{counter};
-		gst_pad_add_probe(pad, (GstPadProbeType)(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
-			byteCounterProbe, data, freeByteCounterProbeData);
-		return true;
-	};
-
-	if (n_video > 0)
-	{
-		GstPad *pad = NULL;
-		g_signal_emit_by_name(m_gst_playbin, "get-video-pad", 0, &pad);
-		if (pad)
-		{
-			if (install(pad, m_video_byte_counter))
-				m_br_last_video_bytes = 0;
-			gst_object_unref(pad);
-		}
-	}
-	if ((int)m_audio_byte_counters.size() < n_audio)
-		m_audio_byte_counters.resize(n_audio);
-	for (int i = 0; i < n_audio; i++)
-	{
-		GstPad *pad = NULL;
-		g_signal_emit_by_name(m_gst_playbin, "get-audio-pad", i, &pad);
-		if (!pad)
-			continue;
-		if (install(pad, m_audio_byte_counters[i]) && i == m_br_audio_idx)
-			m_br_last_audio_bytes = 0;
-		gst_object_unref(pad);
-	}
-}
-
-void eServiceMP3::updateLiveBitrate()
-{
-	const gint64 now = g_get_monotonic_time();
-	/* streams (IPTV mpegts) can add their audio pads after async-done, so (re)install lazily;
-	 * pads that already have a probe are skipped */
-	if (m_gst_playbin)
-	{
-		gint n_video = 0, n_audio = 0;
-		g_object_get(m_gst_playbin, "n-video", &n_video, "n-audio", &n_audio, NULL);
-		installBitrateProbes(n_video, n_audio);
-	}
-	const int audio_idx = m_currentAudioStream >= 0 ? m_currentAudioStream : 0;
-	if (audio_idx != m_br_audio_idx)
-	{
-		m_br_audio_idx = audio_idx;
-		m_br_last_audio_bytes = 0;
-		m_br_last_us = 0;
-		m_br_audio_kbps = 0;
-	}
-	const guint64 vbytes = m_video_byte_counter ? m_video_byte_counter->load(std::memory_order_relaxed) : 0;
-	const guint64 abytes = (audio_idx >= 0 && audio_idx < (int)m_audio_byte_counters.size() && m_audio_byte_counters[audio_idx]) ?
-		m_audio_byte_counters[audio_idx]->load(std::memory_order_relaxed) : 0;
-	if (!m_br_last_us)
-	{
-		m_br_last_us = now;
-		m_br_last_video_bytes = vbytes;
-		m_br_last_audio_bytes = abytes;
-		return;
-	}
-	const gint64 delta_us = now - m_br_last_us;
-	if (delta_us < 500000)
-		return;
-	/* bytes * 8 / 1000 / (us / 1e6) == bytes * 8000 / us */
-	m_br_video_kbps = vbytes >= m_br_last_video_bytes ? (int)((vbytes - m_br_last_video_bytes) * 8000 / delta_us) : 0;
-	m_br_audio_kbps = abytes >= m_br_last_audio_bytes ? (int)((abytes - m_br_last_audio_bytes) * 8000 / delta_us) : 0;
-	m_br_last_us = now;
-	m_br_last_video_bytes = vbytes;
-	m_br_last_audio_bytes = abytes;
-}
-
-RESULT eServiceMP3::info(ePtr<iServiceInformation>&i)
-{
+/**
+ * @brief Provides information about the service.
+ *
+ * This function provides information about the service, including its type,
+ * name, and other metadata. It sets the provided pointer to the current service
+ * instance.
+ *
+ * @param[out] i A pointer to an iServiceInformation interface that will hold the service information.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to provide information.
+ */
+RESULT eServiceMP3::info(ePtr<iServiceInformation>& i) {
 	i = this;
 	return 0;
 }
 
-RESULT eServiceMP3::getName(std::string &name)
-{
+/**
+ * @brief Gets the name of the service.
+ *
+ * This function retrieves the name of the service. If the service has a title
+ * tag, it uses that; otherwise, it extracts the name from the service reference
+ * path. It returns 0 on success.
+ *
+ * @param[out] name A reference to a string that will hold the service name.
+ * @return RESULT Returns 0 on success, or an error code if the service fails to get the name.
+ */
+RESULT eServiceMP3::getName(std::string& name) {
 	std::string title = m_ref.getName();
-	if (title.empty())
-	{
+	if (title.empty()) {
 		name = m_ref.path;
 		size_t n = name.rfind('/');
 		if (n != std::string::npos)
 			name = name.substr(n + 1);
-	}
-	else
+	} else
 		name = title;
-
-	m_prov = m_ref.prov;
-
 	return 0;
 }
 
-RESULT eServiceMP3::getEvent(ePtr<eServiceEvent> &evt, int nownext)
-{
+/**
+ * @brief Gets the current event associated with the service.
+ *
+ * This function retrieves the current event associated with the service. It
+ * checks if the event is available and returns it through the provided pointer.
+ * If no event is available, it returns an error code.
+ *
+ * @param[out] evt A pointer to an eServiceEvent that will hold the current event.
+ * @param[in] nownext If true, retrieves the next event; otherwise, retrieves the current event.
+ * @return RESULT Returns 0 on success, or -1 if no event is available.
+ */
+RESULT eServiceMP3::getEvent(ePtr<eServiceEvent>& evt, int nownext) {
 	evt = nownext ? m_event_next : m_event_now;
 	if (!evt)
 		return -1;
 	return 0;
 }
 
-int eServiceMP3::getInfo(int w)
-{
-	const gchar *tag = 0;
-
-	switch (w)
-	{
-	case sServiceref: return m_ref;
-	case sVideoHeight: return m_height;
-	case sVideoWidth: return m_width;
-	case sFrameRate: return m_framerate;
-	case sProgressive: return m_progressive;
-	case sGamma: return m_gamma;
-	case sHDRType: return m_hdr_type;
-	case sAspect: return m_aspect;
-	case sTagTitle:
-	case sTagArtist:
-	case sTagAlbum:
-	case sTagTitleSortname:
-	case sTagArtistSortname:
-	case sTagAlbumSortname:
-	case sTagDate:
-	case sTagComposer:
-	case sTagGenre:
-	case sTagComment:
-	case sTagExtendedComment:
-	case sTagLocation:
-	case sTagHomepage:
-	case sTagDescription:
-	case sTagVersion:
-	case sTagISRC:
-	case sTagOrganization:
-	case sTagCopyright:
-	case sTagCopyrightURI:
-	case sTagContact:
-	case sTagLicense:
-	case sTagLicenseURI:
-	case sTagCodec:
-	case sTagAudioCodec:
-	case sTagVideoCodec:
-	case sTagEncoder:
-	case sTagLanguageCode:
-	case sTagKeywords:
-	case sTagChannelMode:
-	case sUser+12:
-		return resIsString;
-	case sTagTrackGain:
-	case sTagTrackPeak:
-	case sTagAlbumGain:
-	case sTagAlbumPeak:
-	case sTagReferenceLevel:
-	case sTagBeatsPerMinute:
-	case sTagImage:
-	case sTagPreviewImage:
-	case sTagAttachment:
-		return resIsPyObject;
-	case sTagTrackNumber:
-		tag = GST_TAG_TRACK_NUMBER;
-		break;
-	case sTagTrackCount:
-		tag = GST_TAG_TRACK_COUNT;
-		break;
-	case sTagAlbumVolumeNumber:
-		tag = GST_TAG_ALBUM_VOLUME_NUMBER;
-		break;
-	case sTagAlbumVolumeCount:
-		tag = GST_TAG_ALBUM_VOLUME_COUNT;
-		break;
-	case sTagBitrate:
-		tag = GST_TAG_BITRATE;
-		break;
-	case sTagNominalBitrate:
-		tag = GST_TAG_NOMINAL_BITRATE;
-		break;
-	case sTagMinimumBitrate:
-		tag = GST_TAG_MINIMUM_BITRATE;
-		break;
-	case sTagMaximumBitrate:
-		tag = GST_TAG_MAXIMUM_BITRATE;
-		break;
-	case sTagSerial:
-		tag = GST_TAG_SERIAL;
-		break;
-	case sTagEncoderVersion:
-		tag = GST_TAG_ENCODER_VERSION;
-		break;
-	case sTagCRC:
-		tag = "has-crc";
-		break;
-	case sBuffer: return m_bufferInfo.bufferPercent;
-	case sVideoBitrate:
-		updateLiveBitrate();
-		return m_video_byte_counter ? m_br_video_kbps : -1;
-	case sAudioBitrate:
-		updateLiveBitrate();
-		return m_audio_byte_counters.empty() ? -1 : m_br_audio_kbps;
-	case sVideoType:
-	{
-		if (!videoSink) return -1;
-		guint64 v = -1;
-		g_signal_emit_by_name(videoSink, "get-video-codec", &v);
-		return (int) v;
-		break;
+/**
+ * @brief Gets information about the service.
+ *
+ * This function retrieves various pieces of information about the service,
+ * such as video height, width, frame rate, aspect ratio, and more. It returns
+ * the requested information based on the provided parameter.
+ *
+ * @param[in] w The type of information to retrieve.
+ * @return int Returns the requested information or a specific result code.
+ */
+int eServiceMP3::getInfo(int w) {
+	const gchar* tag = 0;
+	if (const auto *hbbtv = eDVBIFallback::applications(m_ref)) {
+		switch (w) {
+			case sTSID: return hbbtv->tsid;
+			case sONID: return hbbtv->onid;
+			case sSID: if (hbbtv->sid) return hbbtv->sid; break;
+			default: break;
+		}
 	}
-	case sSID: return m_ref.getData(1);
-	default:
-		return resNA;
+
+	switch (w) {
+		case sVideoHeight:
+			return m_height;
+		case sVideoWidth:
+			return m_width;
+		case sFrameRate:
+			return m_framerate;
+		case sProgressive:
+			return m_progressive;
+		case sGamma:
+			return m_gamma;
+		case sAspect:
+			return m_aspect;
+		case sServiceref:
+		case sTagTitle:
+		case sTagArtist:
+		case sTagAlbum:
+		case sTagTitleSortname:
+		case sTagArtistSortname:
+		case sTagAlbumSortname:
+		case sTagDate:
+		case sTagComposer:
+		case sTagGenre:
+		case sTagComment:
+		case sTagExtendedComment:
+		case sTagLocation:
+		case sTagHomepage:
+		case sTagDescription:
+		case sTagVersion:
+		case sTagISRC:
+		case sTagOrganization:
+		case sTagCopyright:
+		case sTagCopyrightURI:
+		case sTagContact:
+		case sTagLicense:
+		case sTagLicenseURI:
+		case sTagCodec:
+		case sTagAudioCodec:
+		case sTagVideoCodec:
+		case sTagEncoder:
+		case sTagLanguageCode:
+		case sTagKeywords:
+		case sTagChannelMode:
+		case sUser + 12:
+			return resIsString;
+		case sTagTrackGain:
+		case sTagTrackPeak:
+		case sTagAlbumGain:
+		case sTagAlbumPeak:
+		case sTagReferenceLevel:
+		case sTagBeatsPerMinute:
+		case sTagImage:
+		case sTagPreviewImage:
+		case sTagAttachment:
+			return resIsPyObject;
+		case sTagTrackNumber:
+			tag = GST_TAG_TRACK_NUMBER;
+			break;
+		case sTagTrackCount:
+			tag = GST_TAG_TRACK_COUNT;
+			break;
+		case sTagAlbumVolumeNumber:
+			tag = GST_TAG_ALBUM_VOLUME_NUMBER;
+			break;
+		case sTagAlbumVolumeCount:
+			tag = GST_TAG_ALBUM_VOLUME_COUNT;
+			break;
+		case sTagBitrate:
+			tag = GST_TAG_BITRATE;
+			break;
+		case sTagNominalBitrate:
+			tag = GST_TAG_NOMINAL_BITRATE;
+			break;
+		case sTagMinimumBitrate:
+			tag = GST_TAG_MINIMUM_BITRATE;
+			break;
+		case sTagMaximumBitrate:
+			tag = GST_TAG_MAXIMUM_BITRATE;
+			break;
+		case sTagSerial:
+			tag = GST_TAG_SERIAL;
+			break;
+		case sTagEncoderVersion:
+			tag = GST_TAG_ENCODER_VERSION;
+			break;
+		case sTagCRC:
+			tag = "has-crc";
+			break;
+		case sBuffer:
+			return m_bufferInfo.bufferPercent;
+		case sVideoType: {
+			if (!dvb_videosink)
+				return -1;
+			guint64 v = -1;
+			if (g_signal_lookup("get-video-codec", G_OBJECT_TYPE(dvb_videosink)))
+				g_signal_emit_by_name(dvb_videosink, "get-video-codec", &v);
+			return (int)v;
+		}
+		case sSID:
+			return m_ref.getData(1);
+		default:
+			return resNA;
 	}
 
 	if (!m_stream_tags || !tag)
@@ -4291,168 +2862,160 @@ int eServiceMP3::getInfo(int w)
 
 	guint value;
 	if (gst_tag_list_get_uint(m_stream_tags, tag, &value))
-		return (int) value;
+		return (int)value;
 
 	return 0;
 }
 
-std::string eServiceMP3::getInfoString(int w)
-{
-	switch (w)
-	{
-	case sProvider:
-	{
-		if (m_sourceinfo.is_streaming) {
-			if (m_prov.empty()) {
+/**
+ * @brief Gets a string representation of the service information.
+ *
+ * This function retrieves a string representation of the service information
+ * based on the provided parameter. It handles various cases, including streaming
+ * services, video information, and metadata tags.
+ *
+ * @param[in] w The type of information to retrieve as a string.
+ * @return std::string Returns the requested information as a string.
+ */
+std::string eServiceMP3::getInfoString(int w) {
+	if (m_sourceinfo.is_streaming) {
+		switch (w) {
+			case sProvider:
 				return "IPTV";
-			} else {
-				return m_prov;
+			case sServiceref: {
+				return m_ref.toString();
 			}
+			default:
+				break;
 		}
-		return "FILE";
-	}
-	case sServiceref:
-		return m_ref.toString();
-	default:
-		break;
 	}
 
-	if (w == sVideoInfo)
-	{
+	if (w == sVideoInfo) {
 		char buff[100];
-		snprintf(buff, sizeof(buff), "%d|%d|%d|%d|%d|%d",
-				m_width,
-				m_height,
-				m_framerate,
-				m_progressive,
-				m_aspect,
-				m_gamma
-				);
+		snprintf(buff, sizeof(buff), "%d|%d|%d|%d|%d|%d", m_width, m_height, m_framerate, m_progressive, m_aspect,
+				 m_gamma);
 		std::string videoInfo = buff;
 		return videoInfo;
 	}
 
-	if ( !m_stream_tags && w < sUser && w > 26 )
+	if (!m_stream_tags && w < sUser && w > 26)
 		return "";
-	const gchar *tag = 0;
-	switch (w)
-	{
-	case sTagTitle:
-		tag = GST_TAG_TITLE;
-		break;
-	case sTagArtist:
-		tag = GST_TAG_ARTIST;
-		break;
-	case sTagAlbum:
-		tag = GST_TAG_ALBUM;
-		break;
-	case sTagTitleSortname:
-		tag = GST_TAG_TITLE_SORTNAME;
-		break;
-	case sTagArtistSortname:
-		tag = GST_TAG_ARTIST_SORTNAME;
-		break;
-	case sTagAlbumSortname:
-		tag = GST_TAG_ALBUM_SORTNAME;
-		break;
-	case sTagDate:
-		GDate *date;
-		GstDateTime *date_time;
-		if (gst_tag_list_get_date(m_stream_tags, GST_TAG_DATE, &date))
-		{
-			gchar res[5];
-			snprintf(res, sizeof(res), "%06d", g_date_get_year(date));
-			g_date_free(date);
-			return (std::string)res;
-		}
-		else if (gst_tag_list_get_date_time(m_stream_tags, GST_TAG_DATE_TIME, &date_time))
-		{
-			if (gst_date_time_has_year(date_time))
-			{
+	const gchar* tag = 0;
+	switch (w) {
+		case sTagTitle:
+			tag = GST_TAG_TITLE;
+			break;
+		case sTagArtist:
+			tag = GST_TAG_ARTIST;
+			break;
+		case sTagAlbum:
+			tag = GST_TAG_ALBUM;
+			break;
+		case sTagTitleSortname:
+			tag = GST_TAG_TITLE_SORTNAME;
+			break;
+		case sTagArtistSortname:
+			tag = GST_TAG_ARTIST_SORTNAME;
+			break;
+		case sTagAlbumSortname:
+			tag = GST_TAG_ALBUM_SORTNAME;
+			break;
+		case sTagDate:
+			GDate* date;
+			GstDateTime* date_time;
+			if (gst_tag_list_get_date(m_stream_tags, GST_TAG_DATE, &date)) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
 				gchar res[5];
-				snprintf(res, sizeof(res), "%06d", gst_date_time_get_year(date_time));
-				gst_date_time_unref(date_time);
+				snprintf(res, sizeof(res), "%04d", g_date_get_year(date));
+#pragma GCC diagnostic pop
+				g_date_free(date);
 				return (std::string)res;
+			} else if (gst_tag_list_get_date_time(m_stream_tags, GST_TAG_DATE_TIME, &date_time)) {
+				if (gst_date_time_has_year(date_time)) {
+					gchar res[5];
+					snprintf(res, sizeof(res), "%04d", gst_date_time_get_year(date_time));
+					gst_date_time_unref(date_time);
+					return (std::string)res;
+				}
+				gst_date_time_unref(date_time);
 			}
-			gst_date_time_unref(date_time);
-		}
-		break;
-	case sTagComposer:
-		tag = GST_TAG_COMPOSER;
-		break;
-	case sTagGenre:
-		tag = GST_TAG_GENRE;
-		break;
-	case sTagComment:
-		tag = GST_TAG_COMMENT;
-		break;
-	case sTagExtendedComment:
-		tag = GST_TAG_EXTENDED_COMMENT;
-		break;
-	case sTagLocation:
-		tag = GST_TAG_LOCATION;
-		break;
-	case sTagHomepage:
-		tag = GST_TAG_HOMEPAGE;
-		break;
-	case sTagDescription:
-		tag = GST_TAG_DESCRIPTION;
-		break;
-	case sTagVersion:
-		tag = GST_TAG_VERSION;
-		break;
-	case sTagISRC:
-		tag = GST_TAG_ISRC;
-		break;
-	case sTagOrganization:
-		tag = GST_TAG_ORGANIZATION;
-		break;
-	case sTagCopyright:
-		tag = GST_TAG_COPYRIGHT;
-		break;
-	case sTagCopyrightURI:
-		tag = GST_TAG_COPYRIGHT_URI;
-		break;
-	case sTagContact:
-		tag = GST_TAG_CONTACT;
-		break;
-	case sTagLicense:
-		tag = GST_TAG_LICENSE;
-		break;
-	case sTagLicenseURI:
-		tag = GST_TAG_LICENSE_URI;
-		break;
-	case sTagCodec:
-		tag = GST_TAG_CODEC;
-		break;
-	case sTagAudioCodec:
-		tag = GST_TAG_AUDIO_CODEC;
-		break;
-	case sTagVideoCodec:
-		tag = GST_TAG_VIDEO_CODEC;
-		break;
-	case sTagEncoder:
-		tag = GST_TAG_ENCODER;
-		break;
-	case sTagLanguageCode:
-		tag = GST_TAG_LANGUAGE_CODE;
-		break;
-	case sTagKeywords:
-		tag = GST_TAG_KEYWORDS;
-		break;
-	case sTagChannelMode:
-		tag = "channel-mode";
-		break;
-	case sUser+12:
-		return m_errorInfo.error_message;
-	default:
-		return "";
+			break;
+		case sTagComposer:
+			tag = GST_TAG_COMPOSER;
+			break;
+		case sTagGenre:
+			tag = GST_TAG_GENRE;
+			break;
+		case sTagComment:
+			tag = GST_TAG_COMMENT;
+			break;
+		case sTagExtendedComment:
+			tag = GST_TAG_EXTENDED_COMMENT;
+			break;
+		case sTagLocation:
+			tag = GST_TAG_LOCATION;
+			break;
+		case sTagHomepage:
+			tag = GST_TAG_HOMEPAGE;
+			break;
+		case sTagDescription:
+			tag = GST_TAG_DESCRIPTION;
+			break;
+		case sTagVersion:
+			tag = GST_TAG_VERSION;
+			break;
+		case sTagISRC:
+			tag = GST_TAG_ISRC;
+			break;
+		case sTagOrganization:
+			tag = GST_TAG_ORGANIZATION;
+			break;
+		case sTagCopyright:
+			tag = GST_TAG_COPYRIGHT;
+			break;
+		case sTagCopyrightURI:
+			tag = GST_TAG_COPYRIGHT_URI;
+			break;
+		case sTagContact:
+			tag = GST_TAG_CONTACT;
+			break;
+		case sTagLicense:
+			tag = GST_TAG_LICENSE;
+			break;
+		case sTagLicenseURI:
+			tag = GST_TAG_LICENSE_URI;
+			break;
+		case sTagCodec:
+			tag = GST_TAG_CODEC;
+			break;
+		case sTagAudioCodec:
+			tag = GST_TAG_AUDIO_CODEC;
+			break;
+		case sTagVideoCodec:
+			tag = GST_TAG_VIDEO_CODEC;
+			break;
+		case sTagEncoder:
+			tag = GST_TAG_ENCODER;
+			break;
+		case sTagLanguageCode:
+			tag = GST_TAG_LANGUAGE_CODE;
+			break;
+		case sTagKeywords:
+			tag = GST_TAG_KEYWORDS;
+			break;
+		case sTagChannelMode:
+			tag = "channel-mode";
+			break;
+		case sUser + 12:
+			return m_errorInfo.error_message;
+		default:
+			return "";
 	}
-	if ( !tag )
+	if (!tag)
 		return "";
-	gchar *value = NULL;
-	if (m_stream_tags && gst_tag_list_get_string(m_stream_tags, tag, &value))
-	{
+	gchar* value = NULL;
+	if (m_stream_tags && gst_tag_list_get_string(m_stream_tags, tag, &value)) {
 		std::string res = value;
 		g_free(value);
 		return res;
@@ -4460,14 +3023,39 @@ std::string eServiceMP3::getInfoString(int w)
 	return "";
 }
 
-ePtr<iServiceInfoContainer> eServiceMP3::getInfoObject(int w)
-{
-	eServiceMP3InfoContainer *container = new eServiceMP3InfoContainer;
+/**
+ * @brief Gets an information object for the specified tag.
+ *
+ * This function retrieves an information object for the specified tag. It creates
+ * an instance of eServiceMP3InfoContainer and populates it with the relevant data
+ * from the stream tags. The type of data retrieved depends on the specified tag.
+ *
+ * @param[in] w The tag for which to retrieve the information object.
+ * @return ePtr<iServiceInfoContainer> Returns a pointer to the information container.
+ */
+void eServiceMP3::getAITApplications(std::map<int, std::string>& aitlist) {
+	if (const auto *hbbtv = eDVBIFallback::applications(m_ref))
+		for (const auto &app : hbbtv->applications)
+			aitlist[app.m_AppId] = app.m_HbbTVUrl;
+}
+
+PyObject *eServiceMP3::getHbbTVApplications() {
+	PyObject *result = PyList_New(0);
+	if (const auto *hbbtv = eDVBIFallback::applications(m_ref))
+		for (const auto &app : hbbtv->applications) {
+			PyObject *entry = Py_BuildValue("isskii", app.m_ControlCode, app.m_ApplicationName.c_str(), app.m_HbbTVUrl.c_str(), static_cast<unsigned long>(static_cast<uint32_t>(app.m_OrgId)), app.m_AppId, app.m_ProfileCode);
+			PyList_Append(result, entry);
+			Py_DECREF(entry);
+		}
+	return result;
+}
+
+ePtr<iServiceInfoContainer> eServiceMP3::getInfoObject(int w) {
+	eServiceMP3InfoContainer* container = new eServiceMP3InfoContainer;
 	ePtr<iServiceInfoContainer> retval = container;
-	const gchar *tag = 0;
+	const gchar* tag = 0;
 	bool isBuffer = false;
-	switch (w)
-	{
+	switch (w) {
 		case sTagTrackGain:
 			tag = GST_TAG_TRACK_GAIN;
 			break;
@@ -4502,20 +3090,15 @@ ePtr<iServiceInfoContainer> eServiceMP3::getInfoObject(int w)
 			break;
 	}
 
-	if (m_stream_tags && tag)
-	{
-		if (isBuffer)
-		{
-			const GValue *gv_buffer = gst_tag_list_get_value_index(m_stream_tags, tag, 0);
-			if ( gv_buffer )
-			{
-				GstBuffer *buffer;
-				buffer = gst_value_get_buffer (gv_buffer);
+	if (m_stream_tags && tag) {
+		if (isBuffer) {
+			const GValue* gv_buffer = gst_tag_list_get_value_index(m_stream_tags, tag, 0);
+			if (gv_buffer) {
+				GstBuffer* buffer;
+				buffer = gst_value_get_buffer(gv_buffer);
 				container->setBuffer(buffer);
 			}
-		}
-		else
-		{
+		} else {
 			gdouble value = 0.0;
 			gst_tag_list_get_double(m_stream_tags, tag, &value);
 			container->setDouble(value);
@@ -4524,98 +3107,187 @@ ePtr<iServiceInfoContainer> eServiceMP3::getInfoObject(int w)
 	return retval;
 }
 
-RESULT eServiceMP3::audioChannel(ePtr<iAudioChannelSelection> &ptr)
-{
+RESULT eServiceMP3::audioChannel(ePtr<iAudioChannelSelection>& ptr) {
+	GstElement* sink = getAudioChannelSink();
+	if (!sink) {
+		ptr = nullptr;
+		return -1;
+	}
+	gst_object_unref(sink);
 	ptr = this;
 	return 0;
 }
 
-RESULT eServiceMP3::audioTracks(ePtr<iAudioTrackSelection> &ptr)
-{
+RESULT eServiceMP3::audioTracks(ePtr<iAudioTrackSelection>& ptr) {
 	ptr = this;
 	return 0;
 }
 
-RESULT eServiceMP3::cueSheet(ePtr<iCueSheet> &ptr)
-{
+RESULT eServiceMP3::cueSheet(ePtr<iCueSheet>& ptr) {
 	ptr = this;
 	return 0;
 }
 
-RESULT eServiceMP3::subtitle(ePtr<iSubtitleOutput> &ptr)
-{
+RESULT eServiceMP3::subtitle(ePtr<iSubtitleOutput>& ptr) {
 	ptr = this;
 	return 0;
 }
 
-RESULT eServiceMP3::audioDelay(ePtr<iAudioDelay> &ptr)
-{
+RESULT eServiceMP3::audioDelay(ePtr<iAudioDelay>& ptr) {
 	ptr = this;
 	return 0;
 }
 
-int eServiceMP3::getNumberOfTracks()
-{
- 	return m_audioStreams.size();
+/**
+ * @brief Gets the number of audio tracks available in the service.
+ *
+ * This function retrieves the number of audio tracks available in the service.
+ * It checks the size of the `m_audioStreams` vector, which holds information about
+ * the audio streams, and returns the count.
+ *
+ * @return int Returns the number of audio tracks available in the service.
+ */
+int eServiceMP3::getNumberOfTracks() {
+	return m_audioStreams.size();
 }
 
-int eServiceMP3::getCurrentTrack()
-{
-	if (m_currentAudioStream == -1)
-		g_object_get (G_OBJECT (m_gst_playbin), "current-audio", &m_currentAudioStream, NULL);
+/**
+ * @brief Gets the current audio track index.
+ *
+ * This function retrieves the current audio track index from the GStreamer playbin.
+ * The saved preference is not necessarily the track currently selected by playbin.
+ *
+ * @return int Returns the index of the current audio track, or -1 if no audio stream is set.
+ */
+int eServiceMP3::getCurrentTrack() {
+	if (m_is_dash_pipeline)
+		return m_currentAudioStream >= 0 ? m_currentAudioStream : 0;
+	if (m_gst_playbin)
+		g_object_get(m_gst_playbin, "current-audio", &m_currentAudioStream, NULL);
 	return m_currentAudioStream;
 }
 
-RESULT eServiceMP3::selectTrack(unsigned int i)
-{
+/**
+ * @brief Selects the specified audio track.
+ *
+ * This function selects the specified audio track by its index. It checks if the
+ * current audio stream is already set to the specified index and returns early if so.
+ * Otherwise, it clears the buffers and calls `selectAudioStream` to perform the selection.
+ *
+ * @param[in] i The index of the audio track to select.
+ * @return RESULT Returns 0 on success, or an error code if the selection fails.
+ */
+RESULT eServiceMP3::selectTrack(unsigned int i) {
+	if (i >= m_audioStreams.size())
+		return -1;
+	m_initialAudioSelection = false;
+	m_audio_switch_deferred = -1;
+	m_currentAudioStream = getCurrentTrack();
+	if (m_currentAudioStream == (int)i) {
+		setCacheEntry(true, i);
+		return 0;
+	}
+	eDebug("[eServiceMP3 selectTrack %d", i);
+
 	m_clear_buffers = true;
 	int result = selectAudioStream(i);
-	/* The DASH selector path intentionally never flushes the pipeline. */
-	if (m_sourceinfo.is_dash)
-		m_clear_buffers = false;
+	// AudioSelection saves the cache immediately, even when switching is deferred.
+	if (!result && m_audio_switch_deferred >= 0)
+		setCacheEntry(true, i);
 	return result;
 }
 
-void eServiceMP3::clearBuffers(bool force)
-{
-	if ((!m_initial_start || !m_clear_buffers) && !force) return;
-
-	/* Live streams cannot seek back; flushing would stall playback, so skip. */
-	if (m_is_live && !force)
-	{
-		eDebug ("[eServiceMP3] Clear Buffers skipped (live stream)");
+/**
+ * @brief Applies a deferred audio stream switch once the pipeline settled.
+ *
+ * A flushing seek on a source that cannot seek may leave the pipeline short
+ * of the PAUSED->PLAYING transition the deferred switch waits for. Switch
+ * without the flush after two seconds.
+ */
+void eServiceMP3::retryAudioSwitch() {
+	if (m_audio_switch_deferred < 0)
+		return;
+	if (++m_audio_switch_retries < 8) {
+		if (pipelineSettledInPlaying(m_gst_playbin)) {
+			m_audio_switch_retrying = true;
+			applyAudioSelection();
+			m_audio_switch_retrying = false;
+		} else
+			m_audio_switch_timer->start(250, true);
 		return;
 	}
+	int i = m_audio_switch_deferred;
+	m_audio_switch_deferred = -1;
+	if (selectAudioStream(i, true, false) == 0) {
+		eDebug("[eServiceMP3] switched to audio stream %d without a flush, the pipeline did not settle", i);
+		setCacheEntry(true, i);
+	}
+}
 
-	eDebug ("[eServiceMP3] Clear Buffers!");
+void eServiceMP3::applyAudioSelection() {
+	if (m_is_dash_pipeline || m_audioStreams.empty() || !pipelineSettledInPlaying(m_gst_playbin))
+		return;
+	if (m_audio_switch_deferred >= 0) {
+		selectTrack(m_audio_switch_deferred);
+		return;
+	}
+	if (!m_initialAudioSelection)
+		return;
 
+	int wanted = m_initialAudioStream;
+	if (wanted < 0 || wanted >= (int)m_audioStreams.size()) {
+		wanted = getCurrentTrack();
+		if (wanted < 0 || wanted >= (int)m_audioStreams.size())
+			wanted = 0;
+		const std::string languages[] = {eConfigManager::getConfigValue("config.autolanguage.audio_autoselect1"), eConfigManager::getConfigValue("config.autolanguage.audio_autoselect2"),
+			eConfigManager::getConfigValue("config.autolanguage.audio_autoselect3"), eConfigManager::getConfigValue("config.autolanguage.audio_autoselect4")};
+		int best = 4;
+		for (unsigned int i = 0; i < m_audioStreams.size(); ++i) {
+			const std::string& language = m_audioStreams[i].language_code;
+			if (language.empty())
+				continue;
+			for (int priority = 0; priority < best; ++priority) {
+				if (!languages[priority].empty() && languages[priority].find(language) != std::string::npos) {
+					wanted = i;
+					best = priority;
+					break;
+				}
+			}
+		}
+	}
+	// Apply only after discovery and PLAYING, whichever arrives last. A seek or
+	// pause/resume must not restore the startup preference over a manual choice.
+	m_initialAudioSelection = false;
+	if (getCurrentTrack() != wanted)
+		// Startup selection does not need a flushing seek. Non-seekable streams
+		// would otherwise restart the pipeline and lose the selected track again.
+		selectAudioStream(wanted, true, false);
+}
+
+/**
+ * @brief Clears the audio and video buffers.
+ *
+ * This function clears the audio and video buffers by seeking to a position
+ * that is slightly before the current playback position. It is called when
+ * the service is started or when the buffers need to be cleared.
+ *
+ * @param[in] force If true, forces the clearing of buffers even if not initially started.
+ */
+void eServiceMP3::clearBuffers(bool force) {
 	bool validposition = false;
 	pts_t ppos = 0;
-	eDebug("[eServiceMP3] clearBuffers: calling getRawPlayPosition");
-	int rawpos_res = getRawPlayPosition(ppos);
-	eDebug("[eServiceMP3] clearBuffers: getRawPlayPosition returned %d, ppos=%lld", rawpos_res, (long long)ppos);
-	if (rawpos_res >= 0)
-	{
+	if (getPlayPosition(ppos) >= 0) {
 		validposition = true;
-		ppos -= 90; /* seek back ~1ms instead of 1s for faster audio switch */
+		ppos -= 90000;
 		if (ppos < 0)
 			ppos = 0;
 	}
-	if (validposition)
-	{
-		/* flush - accurate, not seekTo()'s usual key-unit, so this doesn't
-		 * snap to the nearest keyframe; see flushNearCurrentPosition()'s
-		 * header comment in the .h for why that matters here. Calls
-		 * seekToImpl() directly (bypassing the public seekTo()) only to
-		 * pass accurate=true; the two resets below are what seekTo() would
-		 * otherwise have done for us. */
-		m_prev_decoder_time = -1;
-		m_decoder_time_valid_state = 0;
-		eDebug("[eServiceMP3] clearBuffers: calling seekToImpl(%lld, accurate)", (long long)ppos);
-		int res = seekToImpl(ppos, true);
-		eDebug("[eServiceMP3] clearBuffers: seekToImpl returned %d", res);
-		if (res == -1)
-		{
+	if (validposition) {
+		/* flush */
+		int res = seekTo(ppos);
+		if (res == -1) {
+			m_initialAudioStream = getCurrentTrack();
+			m_initialAudioSelection = true;
 			m_clear_buffers = false;
 			m_send_ev_start = false;
 			stop();
@@ -4625,1039 +3297,528 @@ void eServiceMP3::clearBuffers(bool force)
 	}
 }
 
-namespace {
-
-struct DeferredFlushCtx
-{
-	gdouble rate;
-	gint64 position_ns;
-};
-
-/*
- * Runs on a GStreamer pool thread - see flushNearCurrentPosition()'s own
- * comment in the .h for why gst_element_seek() must never be called
- * directly on the E2 main thread here: confirmed on device to block for
- * several seconds (a hard UI freeze, since this is normally reached from a
- * key-press handler) when it races the text/audio selector's own
- * active-pad switch issued moments earlier by applySubtitleStreamSwitch()/
- * selectAudioStream() - a thread blocked in the (sync=TRUE) subtitle sink's
- * clock wait holds a lock this seek's FLUSH_START also needs, and only that
- * FLUSH_START would normally release it. Dispatching the call itself here
- * keeps that stall off the UI thread; the switch still completes once the
- * pool thread's call returns; ctx is freed by the GDestroyNotify passed to
- * gst_element_call_async().
+/**
+ * @brief Selects the specified audio stream.
+ *
+ * This function selects the specified audio stream by its index. It checks if the
+ * current audio stream is already set to the specified index and returns early if so.
+ * If the selection is successful, it clears the buffers and sets the cache entry.
+ *
+ * @param[in] i The index of the audio stream to select.
+ * @param[in] skipAudioFix If true, skips the audio fix logic.
+ * @param[in] remember If true, saves a successful manual selection.
+ * @return int Returns 0 on success, or -1 if the selection fails.
  */
-void doDeferredFlush(GstElement *pipeline, gpointer user_data)
-{
-	DeferredFlushCtx *ctx = (DeferredFlushCtx *)user_data;
-	/*
-	 * GST_SEEK_FLAG_KEY_UNIT, not ACCURATE: confirmed on device that
-	 * ACCURATE here left subtitle timing permanently skewed for the rest
-	 * of the session after any actual track-to-track switch (see
-	 * flushNearCurrentPosition()'s own comment in the .h) - almost
-	 * certainly this hardware's decoder-time reporting disagreeing with
-	 * itself across an accurate seek in some way pushSubtitles()'s raw-PTS
-	 * comparison then inherits permanently. Unlike doAudioSwitchFlushSeek()
-	 * (which deliberately avoids KEY_UNIT to stop a keyframe snap from
-	 * visibly jumping the video), avoiding that jump was never a
-	 * requirement here - only avoiding the hang/freeze subtitle switching
-	 * used to cause, which this still does regardless of which seek flag
-	 * is used.
-	 */
-	if (!gst_element_seek(pipeline, ctx->rate, GST_FORMAT_TIME,
-		(GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-		GST_SEEK_TYPE_SET, ctx->position_ns,
-		GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE))
-		eDebug("[eServiceMP3] doDeferredFlush: seek failed");
-}
-
-} // namespace
-
-/* See flushNearCurrentPosition()'s own header comment in the .h. */
-bool eServiceMP3::flushNearCurrentPosition()
-{
-	if (!m_gst_playbin)
-		return false;
-	pts_t ppos = 0;
-	if (getRawPlayPosition(ppos) < 0)
-		return false;
-	ppos -= 90; /* seek back ~1ms - enough to force a genuine reposition
-	             * (and so a real re-read/re-emit at this point) without
-	             * perceptibly moving playback. */
-	if (ppos < 0)
-		ppos = 0;
-	m_prev_decoder_time = -1;
-	m_decoder_time_valid_state = 0;
-
-	DeferredFlushCtx *ctx = g_new(DeferredFlushCtx, 1);
-	ctx->rate = m_currentTrickRatio;
-	ctx->position_ns = ppos * 11111LL; /* pts -> ns, same conversion seekToImpl() uses */
-	gst_element_call_async(m_gst_playbin, doDeferredFlush, ctx, (GDestroyNotify)g_free);
-	return true;
-}
-
-/* See m_audio_switch_flush_phase's own header comment in the .h. */
-void eServiceMP3::beginAudioSwitchPauseFlush()
-{
-	/* !m_initial_start: the very first (automatic, startup) audio-track
-	 * selection, still within the same GST_STATE_CHANGE_PAUSED_TO_PLAYING
-	 * handling that's about to seed the position-baseline candidate a few
-	 * lines below this call, at the exact moment the pipeline first reaches
-	 * PLAYING (see its own comment there). There is nothing stale to flush
-	 * away yet anyway - nothing has played before this first selection -
-	 * so skip the whole pause/seek/resume dance here and leave the plain
-	 * "current-audio" set above as the only action, exactly like
-	 * clearBuffers() (its "!m_initial_start" check) already did for this
-	 * same call site before this mechanism existed. Without this guard the
-	 * pause/seek/resume cycle instead runs microseconds after the pipeline
-	 * first reaches PLAYING, racing that baseline seeding and corrupting it
-	 * for the rest of the session - confirmed on device: on a fresh start
-	 * (no "&e2startoffset=" resume - see tryApplyPendingStartOffset(),
-	 * whose own seek is what naturally fires next in that case and so
-	 * masked this) position-baseline correction stopped applying at all. */
-	if (!m_gst_playbin || m_is_live || !m_initial_start)
-		return;
-
-	m_audio_switch_flush_resume = !m_paused;
-
-	if (m_paused)
-	{
-		/* Already paused (by the user): GStreamer won't fire a new
-		 * PLAYING_TO_PAUSED transition for a state it's already in (see
-		 * gstBusCall()'s "old_state == new_state" filter), so the
-		 * WaitPaused phase below would never get triggered from here.
-		 * Nothing to wait for - go straight to the seek. */
-		m_audio_switch_flush_phase = AudioSwitchFlushWaitSeek;
-		doAudioSwitchFlushSeek();
-		return;
+int eServiceMP3::selectAudioStream(int i, bool skipAudioFix, bool remember) {
+	if (m_is_dash_pipeline) {
+		/* Single-track DASH pipeline; any non-zero index = unsupported. */
+		m_currentAudioStream = 0;
+		return i == 0 ? 0 : -1;
 	}
-
-	eDebug("[eServiceMP3] beginAudioSwitchPauseFlush: pausing for flush");
-	m_audio_switch_flush_phase = AudioSwitchFlushWaitPaused;
-	gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
-}
-
-/* See m_audio_switch_flush_phase's own header comment in the .h. */
-void eServiceMP3::doAudioSwitchFlushSeek()
-{
-	pts_t ppos = 0;
-	if (getRawPlayPosition(ppos) < 0)
-	{
-		eDebug("[eServiceMP3] doAudioSwitchFlushSeek: no valid position, aborting pause-flush");
-		m_audio_switch_flush_phase = AudioSwitchFlushNone;
-		if (m_audio_switch_flush_resume)
-		{
-			/* See m_audio_switch_flush_resuming's own comment in the .h -
-			 * without this, the PLAYING transition below would fall through
-			 * to gstBusCall()'s unconditional selectAudioStream(m_currentAudioStream)
-			 * re-apply, which would just retry this same sequence forever. */
-			m_audio_switch_flush_resuming = true;
-			gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-		}
-		return;
-	}
-	m_prev_decoder_time = -1;
-	m_decoder_time_valid_state = 0;
-	eDebug("[eServiceMP3] doAudioSwitchFlushSeek: seeking to %lld (accurate)", (long long)ppos);
-	/* Safe to call synchronously here (unlike flushNearCurrentPosition()'s
-	 * subtitle-switch equivalent - see its own comment): the pipeline is
-	 * confirmed PAUSED at this point, so there is no streaming thread
-	 * blocked in a sink's clock wait (that only happens with a running
-	 * clock, i.e. in PLAYING) for this seek's FLUSH_START to race. */
-	if (seekToImpl(ppos, true) == -1)
-	{
-		/*
-		 * Seek rejected outright (confirmed on device: some sources report
-		 * m_is_live == false yet still reject an in-place seek exactly like
-		 * a genuinely live/unseekable one would) - the pipeline is left
-		 * PAUSED here with no seek in flight, so no GST_MESSAGE_ASYNC_DONE
-		 * will ever arrive to resume it via m_audio_switch_flush_resume:
-		 * left alone this is a permanently frozen/silent pipeline (confirmed
-		 * on device). Same recovery every other seek-rejected case in this
-		 * class already falls back to: restart the whole service instead of
-		 * leaving it stuck on a switch that never actually took effect.
-		 */
-		eDebug("[eServiceMP3] doAudioSwitchFlushSeek: seek rejected, restarting service to resync");
-		m_audio_switch_flush_phase = AudioSwitchFlushNone;
-		m_clear_buffers = false;
-		m_send_ev_start = false;
-		stop();
-		m_state = stIdle;
-		start();
-		return;
-	}
-	/* GST_MESSAGE_ASYNC_DONE (gstBusCall()) resumes PLAYING - if
-	 * m_audio_switch_flush_resume - once this seek's preroll completes. */
-}
-
-namespace {
-
-/*
- * True only when the pipeline is fully settled in PLAYING - no state change
- * of any kind in flight. Non-blocking (timeout 0): a query, never a wait.
- * selectAudioStream() defers its switch here instead of ever attempting it
- * against an unsettled pipeline, since setting "current-audio" pushes a
- * GST_EVENT_RECONFIGURE upstream synchronously (see
- * gst_input_selector_set_active_pad() in GStreamer's own source), and doing
- * that while some upstream element is itself mid state change is untested
- * territory this class would rather not risk.
- */
-bool pipelineSettledInPlaying(GstElement *pipeline)
-{
-	if (!pipeline)
-		return false;
-	GstState state = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
-	gst_element_get_state(pipeline, &state, &pending, 0);
-	return state == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING;
-}
-
-} // namespace
-
-/* See applySubtitleStreamSwitch()'s own header comment in the .h. */
-void eServiceMP3::applySubtitleStreamSwitch()
-{
-    // OPENATV_FULLPORT_1: text pad selection is deferred until PLAYING by
-    // enableSubtitles() / gstBusCall(), as in the recovered OpenATV source.
-    if (!m_gst_playbin || m_currentSubtitleStream < 0) return;
-    g_object_set(G_OBJECT(m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
-
-    // The input selector may only stage its active-pad switch until the next
-    // subtitle cue. Force a harmless downstream custom event in a worker.
-    GstPad *textPad = NULL;
-    if (g_signal_lookup("get-text-pad", G_OBJECT_TYPE(m_gst_playbin)))
-        g_signal_emit_by_name(m_gst_playbin, "get-text-pad", m_currentSubtitleStream, &textPad);
-    if (textPad)
-    {
-        GstElement *selector = gst_pad_get_parent_element(textPad);
-        if (selector)
-        {
-            gst_element_call_async(selector, openatv_port_force_selector_commit,
-                                   textPad, (GDestroyNotify)gst_object_unref);
-            gst_object_unref(selector);
-        }
-        else
-            gst_object_unref(textPad);
-    }
-    m_subtitle_switch_needs_flush = false;
-    eDebug("[OPENATV_FULLPORT_1] subtitle selector track=%d generation=%d",
-           m_currentSubtitleStream, m_subtitle_generation.load());
-}
-
-int eServiceMP3::selectAudioStream(int i, bool skipAudioFix)
-{
-	/* A PiP is video-only. Setting "current-audio" makes playbin select an audio
-	 * stream and build an audio chain regardless of the cleared AUDIO flag: it
-	 * autoplugs dvbaudiosink, whose start()/stop() open and flush the shared
-	 * audio0 device - killing the MAIN service's audio. Never touch it. */
-	if (m_pip_decoder >= 0)
-		return 0;
-
-	/* Validate index against our own track list to avoid relying solely on
-	 * an immediate g_object_get readback which can return a stale value when
-	 * GStreamer is in a transitional state. */
-	if (hdAudioAuxRetryBlocked(m_gst_playbin))
-		setHDAudioAuxRetryBlocked(m_gst_playbin, false);
-
-	if (i < 0 || i >= (int)m_audioStreams.size())
-	{
-		eDebug ("[eServiceMP3] selectAudioStream: index %d out of range (n=%d)", i, (int)m_audioStreams.size());
+	if (i < 0 || i >= (int)m_audioStreams.size()) {
+		// eDebug("[eServiceMP3] selectAudioStream: index %d out of range (n=%d)", i, (int)m_audioStreams.size());
 		return -1;
 	}
-
-	/*
-	 * Whether this actually changes which track is selected, captured before
-	 * anything below can touch m_currentAudioStream. gstBusCall()'s
-	 * GST_STATE_CHANGE_PAUSED_TO_PLAYING handling unconditionally re-applies
-	 * m_currentAudioStream after *any* PAUSED->PLAYING transition, including
-	 * one that had nothing to do with an actual audio switch - a subtitle
-	 * switch's own flushNearCurrentPosition() seek, for instance, can itself
-	 * produce such a transition (confirmed on device), which lands right
-	 * back here. There is no stale old-track data to clear when the track
-	 * never changed, so below this skips the flush/passthrough-reset work
-	 * for a same-track call - without that guard it's not just redundant,
-	 * it chains into a whole extra pause/seek/resume cycle every time
-	 * ("double flushing" on every subtitle switch, confirmed on device).
-	 * The defensive current-audio re-set/readback right below is still done
-	 * either way - cheap, and guards against GStreamer's own selection
-	 * having drifted independently of this bookkeeping.
-	 */
-	const bool isActualAudioSwitch = (i != m_currentAudioStream);
-
-	/*
-	 * Setting "current-audio" while a streaming thread is stuck inside a
-	 * sink (mid pause, buffering, or re-preroll after a seek - i.e.
-	 * whenever the pipeline isn't settled in PLAYING) only records a
-	 * pending selector switch that hasn't committed yet, and can deadlock
-	 * the pipeline - confirmed on device, and fixed independently upstream
-	 * in openatv/enigma2#3913 ("servicemp3: fix audio track switch stall
-	 * and subtitle switch deadlock"). Defer the whole switch instead of
-	 * ever attempting it against an unsettled pipeline; gstBusCall()'s
-	 * GST_STATE_CHANGE_PAUSED_TO_PLAYING handling retries it the moment the
-	 * pipeline next settles. skipAudioFix callers (trickSeek()'s stuck-pipeline
-	 * recovery, forceAudioReset()) are internal recovery paths that must
-	 * still act immediately, not queue behind this.
-	 */
-	if (!skipAudioFix && i != m_currentAudioStream && !pipelineSettledInPlaying(m_gst_playbin))
-	{
-		eDebug("[eServiceMP3] selectAudioStream: pipeline not settled in PLAYING, deferring switch to stream %d", i);
+	/* Same input-selector pending commit as with subtitles (see
+	   applySubtitleStreamSwitch()): while the audio sink holds a streaming thread
+	   (pause, buffering, re-preroll after a seek), the flushing seek in
+	   clearBuffers() would deadlock on the audio selector. Applied on the next
+	   PAUSED->PLAYING transition instead. */
+	if (!skipAudioFix && i != m_currentAudioStream && !pipelineSettledInPlaying(m_gst_playbin)) {
+		GstState state = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
+		gst_element_get_state(m_gst_playbin, &state, &pending, 0);
+		eDebug("[eServiceMP3] pipeline %s, pending %s: deferring the switch to audio stream %d",
+			gst_element_state_get_name(state), gst_element_state_get_name(pending), i);
 		m_audio_switch_deferred = i;
+		if (!m_audio_switch_retrying)
+			m_audio_switch_retries = 0;
+		m_audio_switch_timer->start(250, true);
 		return 0;
 	}
 	if (!skipAudioFix)
 		m_audio_switch_deferred = -1;
-
-	const HDAudioAuxMode aux_mode = !m_sourceinfo.is_streaming ?
-		hdAudioAuxModeForCodec(m_audioStreams[i].codec) : hdAuxNone;
-	HDAudioAuxState *active_aux = getHDAudioAuxState(m_gst_playbin);
-	const bool native_eac3_to_aux = !active_aux && aux_mode == hdAuxAC3 &&
-		m_currentAudioStream >= 0 && m_currentAudioStream < (int)m_audioStreams.size() &&
-		m_audioStreams[m_currentAudioStream].type == atEAC3;
-
-	if (aux_mode != hdAuxNone || active_aux)
-	{
-		setHDAudioAuxReconfiguring(m_gst_playbin, true);
-		GstState main_state = GST_STATE_NULL, main_pending = GST_STATE_VOID_PENDING;
-		gst_element_get_state(m_gst_playbin, &main_state, &main_pending, 0);
-		const bool resume_main = main_state == GST_STATE_PLAYING || main_pending == GST_STATE_PLAYING;
-		if (resume_main)
-		{
-			gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
-			gst_element_get_state(m_gst_playbin, &main_state, &main_pending, 1 * GST_SECOND);
-		}
-
-		gint64 position_ns = -1;
-		gst_element_query_position(m_gst_playbin, GST_FORMAT_TIME, &position_ns);
-		/* VOB DTS startup: GStreamer reports the demuxer pre-roll PTS here.
-		 * Treat the initial position as zero so the HD-audio auxiliary AC3
-		 * pipeline takes its startup path instead of seeking to the pre-roll. */
-		if (!m_initial_start && m_audioStreams[i].codec.compare(0, 3, "DTS") == 0)
-		{
-			size_t end = m_ref.path.find_first_of("?#");
-			if (end == std::string::npos)
-				end = m_ref.path.size();
-			size_t dot = m_ref.path.rfind('.', end);
-			if (dot != std::string::npos && dot + 1 < end &&
-				!strcasecmp(m_ref.path.substr(dot, end - dot).c_str(), ".vob"))
-				position_ns = 0;
-		}
-		guint restore_flags = 0;
-		GstElement *main_audio_sink = NULL;
-		if (active_aux)
-		{
-			restore_flags = active_aux->mainFlags;
-			if (active_aux->mainAudioSink)
-				main_audio_sink = GST_ELEMENT(gst_object_ref(active_aux->mainAudioSink));
-		}
-		else
-		{
-			g_object_get(G_OBJECT(m_gst_playbin), "flags", &restore_flags, NULL);
-			if (aux_mode != hdAuxNone)
-				main_audio_sink = quiesceHDAudioMainSink(m_gst_playbin);
-		}
-
-		if (active_aux)
-			stopHDAudioAuxPipeline(m_gst_playbin, false);
-
-		if (aux_mode != hdAuxNone)
-		{
-			bool prepared = false;
-			if (!main_audio_sink)
-			{
-				setHDAudioAuxRetryBlocked(m_gst_playbin, true);
-				g_object_set(G_OBJECT(m_gst_playbin), "flags", restore_flags, NULL);
-				if (resume_main)
-					gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-			}
-			else
-			{
-				const guint video_only_flags = restore_flags & ~GST_PLAY_FLAG_AUDIO;
-				g_object_set(G_OBJECT(m_gst_playbin), "flags", video_only_flags, NULL);
-				g_object_set(G_OBJECT(m_gst_playbin), "current-audio", i, NULL);
-
-				GError *uri_error = NULL;
-				gchar *uri = g_filename_to_uri(m_ref.path.c_str(), NULL, &uri_error);
-				prepared = uri && prepareHDAudioAuxPipeline(m_gst_playbin, uri, i,
-					aux_mode, m_audioStreams[i].channels, restore_flags, position_ns, main_audio_sink);
-				if (uri_error) g_error_free(uri_error);
-				g_free(uri);
-
-				if (!prepared)
-				{
-					setHDAudioAuxRetryBlocked(m_gst_playbin, true);
-					restoreHDAudioMainSink(m_gst_playbin, main_audio_sink, restore_flags);
-					if (resume_main)
-						gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-				}
-				else
-				{
-					setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
-					if (!positionHDAudioAuxAfterStart(m_gst_playbin, position_ns))
-					{
-						setHDAudioAuxRetryBlocked(m_gst_playbin, true);
-						stopHDAudioAuxPipeline(m_gst_playbin, true);
-						prepared = false;
-					}
-					else if (!resume_main)
-					{
-						setHDAudioAuxState(m_gst_playbin, GST_STATE_PAUSED);
-						if (!active_aux && !m_initial_start &&
-							m_pending_start_position < 0 &&
-							m_audioStreams[i].codec.compare(0, 3, "DTS") == 0 &&
-							isDTSStartupSkipbackContainer(m_ref.path))
-						{
-							m_pending_start_position = -2;
-						}
-						/* Cold start: the main pipeline was not yet PLAYING (or
-						 * pending PLAYING) when this aux setup ran, so the
-						 * resume_main branch below - the only other place this
-						 * timer gets armed - never runs. That's a pure timing
-						 * accident, not a sign the anti-freeze reset isn't
-						 * needed: a fresh TrueHD/DTS-to-AC3 handoff can still
-						 * leave the hardware audio passthrough/HDMI format in
-						 * a state that freezes video on first frames, exactly
-						 * as it can when reconfiguring an already-playing
-						 * pipeline. Arm it here too so the fix isn't silently
-						 * skipped depending on exactly when GStreamer happens
-						 * to reach PLAYING relative to this call.
-						 * clearBuffers() (forceAudioReset()'s job) already
-						 * tolerates firing before a valid play position
-						 * exists - it's a no-op in that case - so this is
-						 * safe even if PLAYING hasn't been reached yet when
-						 * the timer fires. */
-						m_passthrough_fix_timer->stop();
-						m_passthrough_fix_timer->start(300, true);
-					}
-
-					if (resume_main)
-					{
-						gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-						if (!active_aux && !m_initial_start &&
-							m_pending_start_position < 0 &&
-							m_audioStreams[i].codec.compare(0, 3, "DTS") == 0 &&
-							isDTSStartupSkipbackContainer(m_ref.path))
-						{
-							m_pending_start_position = -2;
-						}
-						if (position_ns < 500 * GST_MSECOND || native_eac3_to_aux)
-						{
-							m_passthrough_fix_timer->stop();
-							m_passthrough_fix_timer->start(300, true);
-						}
-					}
-				}
-				gst_object_unref(main_audio_sink);
-			}
-
-			if (prepared)
-			{
-				setHDAudioAuxReconfiguring(m_gst_playbin, false);
-				m_currentAudioStream = i;
-				if (!skipAudioFix)
-				{
-					m_event((iPlayableService*)this, evUpdatedInfo);
-					setCacheEntry(true, i);
-				}
-				return 0;
-			}
-		}
-		else
-		{
-			restoreHDAudioMainSink(m_gst_playbin, main_audio_sink, restore_flags);
-			g_object_set(G_OBJECT(m_gst_playbin), "current-audio", i, NULL);
-			if (main_audio_sink)
-				gst_object_unref(main_audio_sink);
-			if (resume_main)
-				gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
-		}
-		setHDAudioAuxReconfiguring(m_gst_playbin, false);
-	}
-
 	int current_audio;
-	g_object_set (G_OBJECT (m_gst_playbin), "current-audio", i, NULL);
-	g_object_get (G_OBJECT (m_gst_playbin), "current-audio", &current_audio, NULL);
-	if (current_audio != i)
-	{
-		/* GStreamer may be in a transitional state and hasn't applied the
-		 * property yet. Since we validated the index ourselves, trust the set. */
-		eDebug ("[eServiceMP3] selectAudioStream: readback returned %d (expected %d), trusting range-validated set", current_audio, i);
-		current_audio = i;
-	}
-	if ( current_audio == i )
-	{
-		if (!skipAudioFix)
-		{
-			eDebug ("[eServiceMP3] switched to audio stream %i", current_audio);
-			m_currentAudioStream = i;
-			m_event((iPlayableService*)this, evUpdatedInfo);
-			setCacheEntry(true, i);
-			if (isActualAudioSwitch)
-			{
-				/* DASH exposes audio and video as separate tracks.  Switching
-				 * current-audio is sufficient; the legacy seek/restart below
-				 * reinitialises adaptive demux and can reset the selected video
-				 * representation (or stall a live MPD permanently).  Let playbin's
-				 * stream selector finish naturally without flushing the video. */
-				if (m_sourceinfo.is_dash)
-				{
-					eDebug("[eServiceMP3] DASH audio switch to %d: preserving video and avoiding seek/restart", i);
-					m_clear_buffers = false;
-					return 0;
-				}
-				/*
-				 * beginAudioSwitchPauseFlush() is a no-op for a live source
-				 * (see its own m_is_live guard) - its pause/wait-for-PAUSED/
-				 * accurate-seek/resume state machine assumes a source that's
-				 * always seekable, which a genuinely live broadcast is not.
-				 * isCurrentlySeekable() is otherwise still a stub that always
-				 * reports "seekable" (see its own comment), so m_is_live is
-				 * the only real non-seekable signal this class has.
-				 *
-				 * Some "live" sources (a timeshift/catchup-capable IPTV
-				 * service, confirmed in the wild - see
-				 * tryApplyPendingStartOffset()'s own comment on the same
-				 * distinction) can still accept a seek even though m_is_live
-				 * is set, so try a small backward flushing keyframe seek
-				 * first - cheap, and just forces a genuine reposition to cut
-				 * over to the new track instead of waiting for whatever the
-				 * old track already queued (our own queue, plus
-				 * dvbaudiosink's hardware ring buffer) to drain on its own.
-				 * Only fall back to restarting the whole service - visibly
-				 * disruptive, and confirmed on device to occasionally leave
-				 * tracks re-enumerated in a different order or the pipeline
-				 * silent/frozen after a fresh cold reselection - when that
-				 * seek is flat-out rejected, i.e. genuinely not seekable.
-				 */
-				if (m_is_live)
-				{
-					pts_t ppos = 0;
-					int seek_res = -1;
-					if (getRawPlayPosition(ppos) >= 0)
-					{
-						ppos -= 9000; /* seek back ~100ms, same margin
-						               * clearBuffers() used for a live audio
-						               * switch before it started skipping
-						               * live sources outright */
-						if (ppos < 0)
-							ppos = 0;
-						seek_res = seekTo(ppos);
-					}
-
-					if (seek_res == -1)
-					{
-						eDebug("[eServiceMP3] selectAudioStream: live source, flushing keyframe seek unavailable/rejected, restarting service for audio-track switch");
-						m_clear_buffers = false;
-						m_send_ev_start = false;
-						stop();
-						m_state = stIdle;
-						start();
-					}
-					return 0;
-				}
-				beginAudioSwitchPauseFlush();
-			}
+	g_object_set(m_gst_playbin, "current-audio", i, NULL);
+	g_object_get(m_gst_playbin, "current-audio", &current_audio, NULL);
+	if (current_audio == i) {
+		m_currentAudioStream = i;
+		if (!skipAudioFix) {
+			eDebug("[eServiceMP3] switched to audio stream %d", current_audio);
+			/* the flushing seek drops the queued audio of the previous stream; a
+			   source that cannot seek restarts at a wrong position after it */
+			GstQuery* query = gst_query_new_seeking(GST_FORMAT_TIME);
+			gboolean seekable = FALSE;
+			if (gst_element_query(m_gst_playbin, query))
+				gst_query_parse_seeking(query, NULL, &seekable, NULL, NULL);
+			gst_query_unref(query);
+			if (seekable)
+				clearBuffers();
+			else
+				eDebug("[eServiceMP3] the source cannot seek, the queued audio plays out");
+			if (remember)
+				setCacheEntry(true, i);
 		}
+		return 0;
+	}
+	if (!skipAudioFix) {
+		/* playbin may refuse the switch while the flush of the previous one is still running */
+		eDebug("[eServiceMP3] current-audio stays %d, retrying the switch to audio stream %d", current_audio, i);
+		m_audio_switch_deferred = i;
+		if (!m_audio_switch_retrying)
+			m_audio_switch_retries = 0;
+		m_audio_switch_timer->start(250, true);
 		return 0;
 	}
 	return -1;
 }
 
-int eServiceMP3::getCurrentChannel()
-{
-	return STEREO;
+GstElement* eServiceMP3::getAudioChannelSink() {
+	if (!m_gst_playbin)
+		return nullptr;
+	GstElement* sink = nullptr;
+	if (m_is_dash_pipeline)
+		sink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "dashaudiosink");
+	else
+		g_object_get(m_gst_playbin, "audio-sink", &sink, NULL);
+	if (sink && (!g_signal_lookup("set-audio-channel", G_OBJECT_TYPE(sink)) ||
+		!g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "audio-channel"))) {
+		gst_object_unref(sink);
+		sink = nullptr;
+	}
+	return sink; // Caller owns the reference; never use another service's global sink.
 }
 
-RESULT eServiceMP3::selectChannel(int i)
-{
-	eDebug("[eServiceMP3] selectChannel(%i)",i);
-	return 0;
+int eServiceMP3::getCurrentChannel() {
+	gint channel = STEREO;
+	GstElement* sink = getAudioChannelSink();
+	if (sink) {
+		g_object_get(sink, "audio-channel", &channel, NULL);
+		gst_object_unref(sink);
+	}
+	return channel;
 }
 
-RESULT eServiceMP3::getTrackInfo(struct iAudioTrackInfo &info, unsigned int i)
-{
-	if (i >= m_audioStreams.size())
-	{
+RESULT eServiceMP3::selectChannel(int i) {
+	if (i != LEFT && i != STEREO && i != RIGHT)
+		return -1;
+	GstElement* sink = getAudioChannelSink();
+	if (!sink)
+		return -1;
+	gboolean selected = FALSE;
+	g_signal_emit_by_name(sink, "set-audio-channel", i, &selected);
+	gst_object_unref(sink);
+	if (!selected)
+		eDebug("[eServiceMP3] selectChannel(%d) failed", i);
+	return selected ? 0 : -1;
+}
+
+/**
+ * @brief Gets information about the specified audio track.
+ *
+ * This function retrieves information about the specified audio track, including
+ * its description and language. It uses a map of replacements to format the
+ * codec description and sets the language code accordingly.
+ *
+ * @param[out] info A reference to an iAudioTrackInfo structure that will hold the track information.
+ * @param[in] i The index of the audio track to retrieve information for.
+ * @return RESULT Returns 0 on success, or -2 if the index is out of bounds.
+ */
+RESULT eServiceMP3::getTrackInfo(struct iAudioTrackInfo& info, unsigned int i) {
+	if (i >= m_audioStreams.size()) {
 		return -2;
 	}
 
-	info.m_description = m_audioStreams[i].codec;
-	info.m_channels = m_audioStreams[i].channels;
+	std::string desc = m_audioStreams[i].codec;
 
-	if (info.m_language.empty())
-	{
-		info.m_language = m_audioStreams[i].language_code;
+	std::map<std::string, std::string> audioReplacements = {
+		{"AC-3", "AC3"},	 {"EAC3", "AC3+"},	  {"EAC-3", "AC3+"},	{"E-AC3", "AC3+"},
+		{"E-AC-3", "AC3+"},	 {"-1 ", ""},		  {"-2 AAC", "AAC"},	{"-4 AAC", "AAC"},
+		{"4-AAC", "HE-AAC"}, {"(ATSC A/52)", ""}, {"(ATSC A/52B)", ""}, {"MPEG", ""},
+		{"Layer", ""},		 {" 2 ", ""},		  {"(MP2)", "AAC"},		{"audio", ""}};
+
+	if (!desc.empty()) {
+		for (auto const& x : audioReplacements) {
+			std::string s = x.first;
+			if (desc.length() >= s.length()) {
+				size_t loc = desc.find(s);
+				if (loc != std::string::npos) {
+					desc.replace(loc, s.length(), x.second);
+				}
+			}
+		}
 	}
+
+	info.m_description = desc;
+
+	info.m_language = m_audioStreams[i].language_code;
+
+	if (!m_audioStreams[i].title.empty()) {
+		if (!info.m_language.empty())
+			info.m_language += "/";
+		info.m_language += m_audioStreams[i].title;
+	}
+
+	// eDebug("[eServiceMP3] getTrackInfo (%d) - m_description=%s m_language=%s", i, info.m_description.c_str(),
+	// info.m_language.c_str());
 
 	return 0;
 }
 
-subtype_t getSubtitleType(GstPad* pad, gchar *g_codec=NULL)
-{
+/**
+ * @brief Gets the subtitle type based on the pad and codec.
+ *
+ * This function determines the subtitle type based on the GStreamer pad and
+ * an optional codec string. It checks the current or allowed caps of the pad
+ * and matches them against known subtitle types.
+ *
+ * @param[in] pad The GStreamer pad to check for subtitle type.
+ * @param[in] g_codec An optional codec string to match against known subtitle types.
+ * @return subtype_t Returns the identified subtitle type, or stUnknown if not identified.
+ */
+subtype_t getSubtitleType(GstPad* pad, gchar* g_codec = nullptr, int* cc_payload_type = nullptr) {
 	subtype_t type = stUnknown;
 	GstCaps* caps = gst_pad_get_current_caps(pad);
-	if (!caps && !g_codec)
-	{
+	if (!caps && !g_codec) {
 		caps = gst_pad_get_allowed_caps(pad);
 	}
 
-	if (caps && !gst_caps_is_empty(caps))
-	{
+	if (caps && !gst_caps_is_empty(caps)) {
 		GstStructure* str = gst_caps_get_structure(caps, 0);
-		if (str)
-		{
-			const gchar *g_type = gst_structure_get_name(str);
-			eDebug("[eServiceMP3] getSubtitleType::subtitle probe caps type=%s", g_type ? g_type : "(null)");
-			if (g_type)
-			{
-				if ( !strcmp(g_type, "subpicture/x-dvd") )
+		if (str) {
+			const gchar* g_type = gst_structure_get_name(str);
+			// eDebug("[eServiceMP3] getSubtitleType::subtitle probe caps type=%s", g_type ? g_type : "(null)");
+			if (g_type) {
+				if (!strcmp(g_type, "subpicture/x-dvd"))
 					type = stVOB;
-				else if ( !strcmp(g_type, "subpicture/x-dvb") )
+				else if (!strcmp(g_type, "subpicture/x-dvb"))
 					type = stDVB;
-				else if ( !strcmp(g_type, "text/x-pango-markup") )
+				else if (!strcmp(g_type, "text/x-pango-markup"))
 					type = stSRT;
-				else if ( !strcmp(g_type, "text/plain") || !strcmp(g_type, "text/x-plain") || !strcmp(g_type, "text/x-raw") )
+				else if (!strcmp(g_type, "text/plain") || !strcmp(g_type, "text/x-plain") ||
+						 !strcmp(g_type, "text/x-raw"))
 					type = stPlainText;
-				else if ( !strcmp(g_type, "subpicture/x-pgs") )
+				else if (!strcmp(g_type, "subpicture/x-pgs"))
 					type = stPGS;
-				else
-					eDebug("[eServiceMP3] getSubtitleType::unsupported subtitle caps %s (%s)", g_type, g_codec ? g_codec : "(null)");
+				else if (!strcmp(g_type, "text/vtt") || !strcmp(g_type, "text/x-webvtt") ||
+						 !strcmp(g_type, "application/x-subtitle-vtt"))
+					type = stWebVTT;
+				else if (!strcmp(g_type, "closedcaption/x-cea-608") || !strcmp(g_type, "closedcaption/x-cea-708")) {
+					/* dedicated caption track (MP4 c608/c708), as opposed to the
+					 * captions embedded in the video stream */
+					bool is608 = !strcmp(g_type, "closedcaption/x-cea-608");
+					const gchar* g_format = gst_structure_get_string(str, "format");
+					int payload = is608 ? eCea608Decoder::PAYLOAD_CEA608_S334_1A : eCea608Decoder::PAYLOAD_CEA708_CDP;
+					if (g_format) {
+						if (is608) {
+							if (!strcmp(g_format, "raw"))
+								payload = eCea608Decoder::PAYLOAD_CEA608_RAW;
+							else if (!strcmp(g_format, "s334-1a"))
+								payload = eCea608Decoder::PAYLOAD_CEA608_S334_1A;
+						} else {
+							if (!strcmp(g_format, "cc_data"))
+								payload = eCea608Decoder::PAYLOAD_CEA708_RAW;
+							else if (!strcmp(g_format, "cdp"))
+								payload = eCea608Decoder::PAYLOAD_CEA708_CDP;
+						}
+					}
+					type = stCC;
+					if (cc_payload_type)
+						*cc_payload_type = payload;
+				} else
+					eDebug("[eServiceMP3] getSubtitleType::unsupported subtitle caps %s (%s)", g_type,
+						   g_codec ? g_codec : "(null)");
 			}
 		}
-	}
-	else if ( g_codec )
-	{
-		eDebug("[eServiceMP3] getSubtitleType::subtitle probe codec tag=%s", g_codec);
-		if ( !strcmp(g_codec, "VOB") )
+	} else if (g_codec) {
+		// eDebug("[eServiceMP3] getSubtitleType::subtitle probe codec tag=%s", g_codec);
+		if (!strcmp(g_codec, "VOB"))
 			type = stVOB;
-		else if ( !strcmp(g_codec, "SubStation Alpha") || !strcmp(g_codec, "SSA") )
+		else if (!strcmp(g_codec, "SubStation Alpha") || !strcmp(g_codec, "SSA"))
 			type = stSSA;
-		else if ( !strcmp(g_codec, "ASS") )
+		else if (!strcmp(g_codec, "ASS"))
 			type = stASS;
-		else if ( !strcmp(g_codec, "SRT") )
+		else if (!strcmp(g_codec, "SRT"))
 			type = stSRT;
-		else if ( !strcmp(g_codec, "UTF-8 plain text") )
+		else if (!strcmp(g_codec, "UTF-8 plain text"))
 			type = stPlainText;
 		else
 			eDebug("[eServiceMP3] getSubtitleType::unsupported subtitle codec %s", g_codec);
-	}
-	else
+	} else
 		eDebug("[eServiceMP3] getSubtitleType::unidentifiable subtitle stream!");
 
 	return type;
 }
 
-void eServiceMP3::gstBusCall(GstMessage *msg)
-{
+/**
+ * @brief Handles GStreamer bus messages.
+ *
+ * This function processes GStreamer bus messages and handles various message types,
+ * such as end-of-stream (EOS), state changes, and errors. It also manages the state
+ * transitions of the playbin and emits events based on the received messages.
+ *
+ * @param[in] msg The GStreamer message to process.
+ */
+void eServiceMP3::gstBusCall(GstMessage* msg) {
 	if (!msg)
 		return;
-	gchar *sourceName;
-	GstObject *source;
-	GstElement *subsink;
+	gchar* sourceName;
+	GstObject* source;
 	source = GST_MESSAGE_SRC(msg);
 	if (!GST_IS_OBJECT(source))
 		return;
 	sourceName = gst_object_get_name(source);
+	GstState state, pending, old_state, new_state;
+	GstStateChangeReturn ret;
+	GstStateChange transition;
 #if 0
-	gchar *string;
+	gchar *string = NULL;
 	if (gst_message_get_structure(msg))
 		string = gst_structure_to_string(gst_message_get_structure(msg));
 	else
 		string = g_strdup(GST_MESSAGE_TYPE_NAME(msg));
-	eDebug("[eServiceMP3] eTsRemoteSource::gst_message from %s: %s", sourceName, string);
-	g_free(string);
-#endif
-	switch (GST_MESSAGE_TYPE (msg))
+	if (string)
 	{
+		eDebug("[eServiceMP3] eTsRemoteSource::gst_message from %s: %s", sourceName, string);
+		g_free(string);
+	}
+#endif
+	switch (GST_MESSAGE_TYPE(msg)) {
 		case GST_MESSAGE_EOS:
+			eDebug("[eServiceMP3] ** EOS RECEIVED **");
 			m_event((iPlayableService*)this, evEOF);
 			break;
-		case GST_MESSAGE_STATE_CHANGED:
-		{
-			if(GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
+		case GST_MESSAGE_STATE_CHANGED: {
+			if (GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
 				break;
 
-			GstState old_state, new_state;
 			gst_message_parse_state_changed(msg, &old_state, &new_state, NULL);
 
-			if(old_state == new_state)
+			if (old_state == new_state)
 				break;
 
-			eDebug("[eServiceMP3] state transition %s -> %s", gst_element_state_get_name(old_state), gst_element_state_get_name(new_state));
+			std::string s_old_state(gst_element_state_get_name(old_state));
+			std::string s_new_state(gst_element_state_get_name(new_state));
+			eDebug("[eServiceMP3] ****STATE TRANSITION %s -> %s ****", s_old_state.c_str(), s_new_state.c_str());
 
-			GstStateChange transition = (GstStateChange)GST_STATE_TRANSITION(old_state, new_state);
+			if (m_gstdot) {
+				std::string s_graph_filename = "GStreamer-enigma2." + s_old_state + "_" + s_new_state;
+				GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(GST_BIN_CAST(m_gst_playbin), GST_DEBUG_GRAPH_SHOW_ALL,
+												  s_graph_filename.c_str());
+			}
 
-			switch(transition)
-			{
-				case GST_STATE_CHANGE_READY_TO_PAUSED:
-				{
+			transition = (GstStateChange)GST_STATE_TRANSITION(old_state, new_state);
+
+			switch (transition) {
+				case GST_STATE_CHANGE_NULL_TO_READY: {
+					m_first_paused = true;
+					m_event(this, evGstreamerStart);
+					if (m_send_ev_start)
+						m_event(this, evStart);
+					if (!m_is_live)
+						gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
+					ret = gst_element_get_state(m_gst_playbin, &state, &pending, 5LL * GST_SECOND);
+					eDebug("[eServiceMP3] PLAYBIN WITH BLOCK READY TO PAUSED state:%s pending:%s ret:%s",
+						   gst_element_state_get_name(state), gst_element_state_get_name(pending),
+						   gst_element_state_change_return_get_name(ret));
+					if (ret == GST_STATE_CHANGE_NO_PREROLL) {
+						gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+						m_is_live = true;
+					}
+					// live sources do not preroll
+					if (m_is_live && !m_prerolled)
+						applyPendingSeek();
+				} break;
+				case GST_STATE_CHANGE_READY_TO_PAUSED: {
 					m_state = stRunning;
-					if (m_start_events_deferred)
-						eDebug("[eServiceMP3] deferring evGstreamerStart/evStart until pending start offset is applied");
-					else
-						fireDeferredStartEvents();
-					GValue result = { 0, };
-					GstIterator *children;
-					subsink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "subtitle_sink");
-					if (subsink)
-					{
+					if (dvb_subsink) {
 						/*
 						 * FIX: Seems that subtitle sink have a delay of receiving subtitles buffer.
 						 * So we move ahead the PTS of the subtitle sink by 2 seconds.
 						 * Then we do aditional sync of subtitles if they arrive ahead of PTS
 						 */
-						g_object_set (G_OBJECT (subsink), "ts-offset", -2LL * GST_SECOND, NULL);
-						eDebug("[eServiceMP3] subsink properties set!");
-						gst_object_unref(subsink);
-					}
-					if (audioSink)
-					{
-						gst_object_unref(GST_OBJECT(audioSink));
-						audioSink = NULL;
-					}
-					if (videoSink)
-					{
-						gst_object_unref(GST_OBJECT(videoSink));
-						videoSink = NULL;
-					}
-					children = gst_bin_iterate_recurse(GST_BIN(m_gst_playbin));
-					if (gst_iterator_find_custom(children, (GCompareFunc)match_sinktype, &result, (gpointer)"GstDVBAudioSink"))
-					{
-						audioSink = GST_ELEMENT_CAST(g_value_dup_object(&result));
-						g_value_unset(&result);
-					}
-					gst_iterator_free(children);
-					children = gst_bin_iterate_recurse(GST_BIN(m_gst_playbin));
-					if (gst_iterator_find_custom(children, (GCompareFunc)match_sinktype, &result, (gpointer)"GstDVBVideoSink"))
-					{
-						videoSink = GST_ELEMENT_CAST(g_value_dup_object(&result));
-						g_value_unset(&result);
-					}
-					gst_iterator_free(children);
+						g_object_set(dvb_subsink, "ts-offset", -2LL * GST_SECOND, NULL);
 
-					/* if we are in preroll already do not check again the state */
-					if (!m_is_live)
-					{
-						m_is_live = (gst_element_get_state(m_gst_playbin, NULL, NULL, 0LL) == GST_STATE_CHANGE_NO_PREROLL);
+#ifdef GSTREAMER_SUBTITLE_SYNC_MODE_BUG
+						/*
+						 * HACK: disable sync mode for now, gstreamer suffers from a bug causing sparse streams to loose
+						 * sync, after pause/resume / skip see: https://bugzilla.gnome.org/show_bug.cgi?id=619434
+						 * Sideeffect of using sync=false is that we receive subtitle buffers (far) ahead of their
+						 * display time.
+						 * Not too far ahead for subtitles contained in the media container.
+						 * But for external srt files, we could receive all subtitles at once.
+						 * And not just once, but after each pause/resume / skip.
+						 * So as soon as gstreamer has been fixed to keep sync in sparse streams, sync needs to be
+						 * re-enabled.
+						 */
+						g_object_set(dvb_subsink, "sync", FALSE, NULL);
+#endif
+
+#if 0
+						/* we should not use ts-offset to sync with the decoder time, we have to do our own decoder timekeeping */
+						g_object_set (G_OBJECT (subsink), "ts-offset", -2LL * GST_SECOND, NULL);
+						/* late buffers probably will not occur very often */
+						g_object_set (G_OBJECT (subsink), "max-lateness", 0LL, NULL);
+						/* avoid prerolling (it might not be a good idea to preroll a sparse stream) */
+						g_object_set (G_OBJECT (subsink), "async", TRUE, NULL);
+#endif
+						// eDebug("[eServiceMP3] subsink properties set!");
 					}
 
 					setAC3Delay(ac3_delay);
 					setPCMDelay(pcm_delay);
-					if(!m_cuesheet_loaded) /* cuesheet CVR */
+					if (!m_sourceinfo.is_streaming && !m_cuesheet_loaded) /* cuesheet CVR */
 						loadCuesheet();
+					/* avoid position taking on audiosink when audiosink is not running */
+					ret = gst_element_get_state(dvb_audiosink, &state, &pending, 3 * GST_SECOND);
+					if (state == GST_STATE_NULL)
+						m_audiosink_not_running = true;
+					if (!m_is_live)
+						gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+					/* tempo debug */
+					/* wait on async state change complete for max 5 seconds */
+					ret = gst_element_get_state(m_gst_playbin, &state, &pending, 3 * GST_SECOND);
+					eDebug("[eServiceMP3] PLAYBIN WITH BLOCK PLAYSTART state:%s pending:%s ret:%s",
+						   gst_element_state_get_name(state), gst_element_state_get_name(pending),
+						   gst_element_state_change_return_get_name(ret));
+					if (!m_is_live && ret == GST_STATE_CHANGE_NO_PREROLL)
+						m_is_live = true;
+					if (m_is_live && !m_prerolled)
+						applyPendingSeek();
+					m_event((iPlayableService*)this, evGstreamerPlayStarted);
 					updateEpgCacheNowNext();
 
-					/* MOVIE_ALSA_V3_VIDEO: this OpenBH branch only discovers
-					 * GstDVBVideoSink. The selected Dreambox Amlogic sink
-					 * (movie_amlogic_video) is NOT that type, so videoSink is
-					 * NULL even during working local movie playback. Do not
-					 * open a second DVB still-picture decoder over the movie. */
-					bool has_movie_amlogic_video = false;
-					if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio)
-					{
-						GstElement *movie_video_sink = NULL;
-						g_object_get(G_OBJECT(m_gst_playbin), "video-sink", &movie_video_sink, NULL);
-						if (movie_video_sink)
-						{
-							has_movie_amlogic_video = !strcmp(GST_OBJECT_NAME(movie_video_sink), "movie_amlogic_video");
-							gst_object_unref(movie_video_sink); /* g_object_get returns a new ref */
-						}
-					}
-					if (m_pip_decoder < 0 && ((!videoSink && !has_movie_amlogic_video) || m_ref.getData(0) == 2)) // show radio pic
+					if (!dvb_videosink || m_ref.getData(0) == 2) // show radio pic
 					{
 						bool showRadioBackground = eConfigManager::getConfigBoolValue("config.misc.showradiopic", true);
-						std::string radio_pic = eConfigManager::getConfigValue(showRadioBackground ? "config.misc.radiopic" : "config.misc.blackradiopic");
+						std::string radio_pic = eConfigManager::getConfigValue(
+							showRadioBackground ? "config.misc.radiopic" : "config.misc.blackradiopic");
 						m_decoder = new eTSMPEGDecoder(NULL, 0);
 						m_decoder->showSinglePic(radio_pic.c_str());
 					}
 
-				}	break;
-				case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
-				{
+				} break;
+				case GST_STATE_CHANGE_PAUSED_TO_PLAYING: {
 					m_paused = false;
-
-					if (m_subtitle_switch_deferred && pipelineSettledInPlaying(m_gst_playbin))
-					{
-						/* An enableSubtitles() call had to defer this same way
-						 * - see its own comment. The audio-selector switch
-						 * below is independent of this text-selector one, so
-						 * this runs unconditionally rather than joining that
-						 * if/else-if chain. */
+					if (m_subtitle_switch_deferred && pipelineSettledInPlaying(m_gst_playbin)) {
 						m_subtitle_switch_deferred = false;
-						eDebug("[eServiceMP3] applying deferred subtitle switch to stream %d", m_currentSubtitleStream);
+						/* buffers of the previous track may still be queued in the pump */
+						m_subtitle_generation++;
+						// eDebug("[eServiceMP3] applying deferred subtitle switch");
 						applySubtitleStreamSwitch();
 					}
-
-					/* Consumed unconditionally, regardless of which branch of
-					 * the audio if/else-if chain below actually ends up
-					 * running: a switch deferred (m_audio_switch_deferred)
-					 * while this pause-flush was still resuming still takes
-					 * priority below, same as ever, but the flag must not be
-					 * left set for some later, unrelated PLAYING transition
-					 * to find - see its own comment in the .h. */
-					bool audio_switch_flush_was_resuming = m_audio_switch_flush_resuming;
-					m_audio_switch_flush_resuming = false;
-
-					if (hdAudioAuxRetryBlocked(m_gst_playbin))
-					{
-					}
-					else if (getHDAudioAuxState(m_gst_playbin))
-					{
-						setHDAudioAuxState(m_gst_playbin, GST_STATE_PLAYING);
-					}
-					else if (hdAudioAuxReconfiguring(m_gst_playbin))
-					{
-					}
-					else if (m_audio_switch_deferred >= 0)
-					{
-						/* A selectAudioStream() call had to defer this same
-						 * way - see its own comment. Re-run it now that the
-						 * pipeline just reached PLAYING; it re-checks
-						 * pipelineSettledInPlaying() itself (this message can
-						 * arrive with another state change already pending
-						 * right behind it), so this may defer again rather
-						 * than apply. */
-						int deferred_audio = m_audio_switch_deferred;
-						m_audio_switch_deferred = -1;
-						eDebug("[eServiceMP3] applying deferred audio switch to stream %d", deferred_audio);
-						selectAudioStream(deferred_audio);
-					}
-					else if (audio_switch_flush_was_resuming)
-					{
-						/* This PLAYING transition is beginAudioSwitchPauseFlush()'s
-						 * own resume, not a real pause/resume or startup -
-						 * current-audio is already exactly right (that's
-						 * what just got paused and seeked for); reselecting
-						 * it here would only restart the whole pause-flush-
-						 * resume sequence, forever. */
-					}
-					else if (m_currentAudioStream < 0)
-					{
-						int autoaudio = -1; // -1 = no configured-language match found; track 0 is a valid match and must not be confused with "nothing to select"
-						int autoaudio_level = 5;
-						std::string configvalue;
-						std::vector<std::string> autoaudio_languages;
-						configvalue = eConfigManager::getConfigValue("config.autolanguage.audio_autoselect1");
-						if (configvalue != "" && configvalue != "None")
-							autoaudio_languages.push_back(configvalue);
-						configvalue = eConfigManager::getConfigValue("config.autolanguage.audio_autoselect2");
-						if (configvalue != "" && configvalue != "None")
-							autoaudio_languages.push_back(configvalue);
-						configvalue = eConfigManager::getConfigValue("config.autolanguage.audio_autoselect3");
-						if (configvalue != "" && configvalue != "None")
-							autoaudio_languages.push_back(configvalue);
-						configvalue = eConfigManager::getConfigValue("config.autolanguage.audio_autoselect4");
-						if (configvalue != "" && configvalue != "None")
-							autoaudio_languages.push_back(configvalue);
-						for (unsigned int i = 0; i < m_audioStreams.size(); i++)
-						{
-							if (!m_audioStreams[i].language_code.empty())
-							{
-								int x = 1;
-								for (std::vector<std::string>::iterator it = autoaudio_languages.begin(); x < autoaudio_level && it != autoaudio_languages.end(); x++, it++)
-								{
-									if ((*it).find(m_audioStreams[i].language_code) != std::string::npos)
-									{
-										autoaudio = i;
-										autoaudio_level = x;
-										break;
-									}
-								}
-							}
-						}
-
-						/* Always select explicitly, even when no configured language
-						 * matched and we're falling back to track 0: selectAudioStream()
-						 * is what sets up TrueHD/DTS AC3 transcoding (hdAudioAuxModeForCodec)
-						 * and the passthrough-fix seek-back that prevents a video freeze
-						 * when that track first starts decoding. The previous `if (autoaudio)`
-						 * check treated index 0 as "nothing found" and skipped this call
-						 * whenever no language preference matched (or matched track 0
-						 * itself), silently leaving GStreamer's own default audio selection
-						 * in effect with none of the above ever engaging. */
-						selectAudioStream(autoaudio >= 0 ? autoaudio : 0);
-					}
-					else
-					{
-						selectAudioStream(m_currentAudioStream);
-					}
-					m_clear_buffers = false;
-
-					/* Applies a pending "&e2startoffset=" (see the constructor
-					 * and tryApplyPendingStartOffset()'s own comment) as soon as
-					 * the pipeline is first able to seek reliably, then fires
-					 * evResumed and whatever evStart/evGstreamerStart this
-					 * session held back for it - see fireDeferredStartEvents(). */
-					tryApplyPendingStartOffset();
-
-					if (!m_initial_start)
-					{
-						/* Seed the startup position-baseline candidate right here,
-						 * at the exact moment the pipeline first reaches PLAYING,
-						 * rather than leaving it to whenever some Python UI timer
-						 * happens to make its first getPlayPosition() call. On a
-						 * network/HLS source in particular, the pipeline can sit in
-						 * PAUSED filling its prefill buffer for a few real seconds
-						 * (see the GST_MESSAGE_BUFFERING handling below) before this
-						 * transition ever fires - by the time it does, the decoder
-						 * may already be several real seconds into decoding queued
-						 * data. If getPlayPosition() isn't polled again until after
-						 * that (OSD not up yet, a timer's startup delay, screen
-						 * construction order - all outside this class's control),
-						 * its first call would otherwise capture that already
-						 * elapsed offset as "time zero", and the position display
-						 * would visibly start several seconds in rather than at 0.
-						 * Sampling here instead ties the candidate to the pipeline's
-						 * own state, not to how promptly some poller reacts to it. */
-						pts_t seed_raw;
-						if (getRawPlayPosition(seed_raw) >= 0)
-						{
-							m_position_baseline_provisional = seed_raw;
-							m_position_baseline_first_seen_us = g_get_monotonic_time();
-						}
-						m_initial_start = true;
-					}
-
-					/* Audio-only content has no video-size report to hang
-					 * evFirstFrame off (see the eventSizeAvail/eventSizeChanged
-					 * handling in GST_MESSAGE_ELEMENT below, which fires it for
-					 * anything with a video sink) - there's no equivalent
-					 * per-frame signal from the audio sink, so fall back to
-					 * firing it here, once, the first time the pipeline
-					 * actually reaches PLAYING. */
-					if (!m_first_frame_fired && !videoSink)
-					{
-						m_first_frame_fired = true;
-						m_event((iPlayableService*)this, evFirstFrame);
-					}
-					m_event((iPlayableService*)this, evGstreamerPlayStarted);
-				}	break;
-				case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
-				{
+					applyAudioSelection();
+					if (!m_first_paused)
+						m_event((iPlayableService*)this, evGstreamerPlayStarted);
+					m_first_paused = false;
+				} break;
+				case GST_STATE_CHANGE_PLAYING_TO_PAUSED: {
 					m_paused = true;
-					if (m_audio_switch_flush_phase == AudioSwitchFlushWaitPaused)
-					{
-						/* beginAudioSwitchPauseFlush()'s own PAUSED request
-						 * just landed - run the seek step now that there's
-						 * no streaming thread left that could still be
-						 * blocked mid-PLAYING for it to race. */
-						m_audio_switch_flush_phase = AudioSwitchFlushWaitSeek;
-						doAudioSwitchFlushSeek();
-					}
-				}	break;
+				} break;
 				case GST_STATE_CHANGE_PAUSED_TO_READY:
-				{
-					if (audioSink)
-					{
-						gst_object_unref(GST_OBJECT(audioSink));
-						audioSink = NULL;
-					}
-					if (videoSink)
-					{
-						gst_object_unref(GST_OBJECT(videoSink));
-						videoSink = NULL;
-					}
-				}	break;
+				case GST_STATE_CHANGE_READY_TO_NULL:
+				case GST_STATE_CHANGE_NULL_TO_NULL:
+				case GST_STATE_CHANGE_READY_TO_READY:
+				case GST_STATE_CHANGE_PAUSED_TO_PAUSED:
+				case GST_STATE_CHANGE_PLAYING_TO_PLAYING:
+					break;
 			}
 			break;
 		}
-		case GST_MESSAGE_ERROR:
-		{
-			gchar *debug;
-			GError *err;
-			gst_message_parse_error (msg, &err, &debug);
-			g_free (debug);
-			eWarning("[eServiceMP3] Gstreamer error: %s (%i) from %s", err->message, err->code, sourceName );
-			if ( err->domain == GST_STREAM_ERROR )
+		case GST_MESSAGE_ERROR: {
+			gchar* debug;
+			GError* err;
+			gst_message_parse_error(msg, &err, &debug);
+			g_free(debug);
+			eWarning("Gstreamer error: %s (%i, %i) from %s", err->message, err->code, err->domain, sourceName);
+			if (eDVBIFallback::availability(m_ref))
 			{
-				if ( err->code == GST_STREAM_ERROR_CODEC_NOT_FOUND )
-				{
-					if ( g_strrstr(sourceName, "videosink") )
-						m_event((iPlayableService*)this, evUser+11);
-					else if ( g_strrstr(sourceName, "audiosink") )
-						m_event((iPlayableService*)this, evUser+10);
-				}
+				// Navigation defers teardown out of this callback. Only registered
+				// DVB-I services may advance through their bounded alternatives.
+				m_errorInfo.error_message = err->message;
+				g_error_free(err);
+				m_event((iPlayableService*)this, evTuneFailed);
+				break;
 			}
-			else if ( err->domain == GST_RESOURCE_ERROR )
-			{
-				if ( err->code == GST_RESOURCE_ERROR_OPEN_READ || err->code == GST_RESOURCE_ERROR_READ )
-				{
+			if (m_sourceinfo.is_streaming && !m_is_dash_pipeline && !m_is_adaptive_stream
+				&& m_state != stStopped && err->domain == GST_RESOURCE_ERROR
+				&& (err->code == GST_RESOURCE_ERROR_READ || err->code == GST_RESOURCE_ERROR_OPEN_READ
+					|| err->code == GST_RESOURCE_ERROR_SEEK)) {
+				// Notify Navigation before the existing stop/EOF handling. It may
+				// retry live TV, but must leave movie players and normal EOF alone.
+				GstElement* input = NULL;
+				g_object_get(m_gst_playbin, "source", &input, NULL);
+				GstElementFactory* factory = input ? gst_element_get_factory(input) : NULL;
+				const GstStructure* details = NULL;
+				guint status = 0;
+				gst_message_parse_error_details(msg, &details);
+				if (details)
+					gst_structure_get_uint(details, "http-status-code", &status);
+				bool retry = input && source == GST_OBJECT(input) && factory
+					&& !strcmp(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)), "souphttpsrc")
+					&& (status < 400 || status == 500 || status == 502 || status == 503 || status == 504);
+				if (input)
+					gst_object_unref(input);
+				if (retry)
+					m_event((iPlayableService*)this, evStreamError);
+			}
+			if (err->domain == GST_STREAM_ERROR) {
+				if (err->code == GST_STREAM_ERROR_CODEC_NOT_FOUND) {
+					if (g_strrstr(sourceName, "videosink"))
+						m_event((iPlayableService*)this, evUser + 11);
+					else if (g_strrstr(sourceName, "audiosink"))
+						m_event((iPlayableService*)this, evUser + 10);
+				}
+			} else if (err->domain == GST_RESOURCE_ERROR) {
+				if (err->code == GST_RESOURCE_ERROR_OPEN_READ || err->code == GST_RESOURCE_ERROR_READ) {
 					stop();
-				}
-			}
-			if ( m_sourceinfo.is_dash && m_state == stRunning && g_str_has_prefix(sourceName, "dashdemux")
-				&& (err->domain == GST_STREAM_ERROR || err->domain == GST_RESOURCE_ERROR) )
-			{
-				/* a burst of errors arrives at once, schedule just one restart */
-				if ( !m_dash_recover_timer->isActive() )
-				{
-					time_t now = time(NULL);
-					/* a restart that held for a minute counts as healthy again */
-					if ( now - m_dash_recover_last > 60 )
-						m_dash_recover_count = 0;
-					if ( m_dash_recover_count < 3 )
-					{
-						m_dash_recover_count++;
-						eDebug("[eServiceMP3] dash error, restarting pipeline in %d ms (attempt %d/3)", 1500 * m_dash_recover_count, m_dash_recover_count);
-						m_dash_recover_timer->start(1500 * m_dash_recover_count, true);
-					}
-					else
-						eWarning("[eServiceMP3] dash error, giving up after 3 restarts");
 				}
 			}
 			g_error_free(err);
 			break;
 		}
-		case GST_MESSAGE_WARNING:
-		{
-			gchar *debug_warn = NULL;
-			GError *warn = NULL;
-			gst_message_parse_warning (msg, &warn, &debug_warn);
+		case GST_MESSAGE_WARNING: {
+			gchar* debug_warn = NULL;
+			GError* warn = NULL;
+			gst_message_parse_warning(msg, &warn, &debug_warn);
 			/* CVR this Warning occurs from time to time with external srt files
 			When a new seek is done the problem off to long wait times before subtitles appears,
 			after movie was restarted with a resume position is solved. */
-			if(!strncmp(warn->message , "Internal data flow problem", 26) && !strncmp(sourceName, "subtitle_sink", 13))
-			{
-				eWarning("[eServiceMP3] Gstreamer warning : %s (%i) from %s" , warn->message, warn->code, sourceName);
-				subsink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "subtitle_sink");
-				if(subsink)
-				{
-					if (!gst_element_seek (subsink, m_currentTrickRatio, GST_FORMAT_TIME, (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-						GST_SEEK_TYPE_SET, m_last_seek_pos,
-						GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE))
-					{
+			if (!strncmp(warn->message, "Internal data flow problem", 26) &&
+				!strncmp(sourceName, "subtitle_sink", 13)) {
+				eWarning("[eServiceMP3] Gstreamer warning : %s (%i) from %s", warn->message, warn->code, sourceName);
+				if (dvb_subsink) {
+					if (!gst_element_seek(dvb_subsink, m_currentTrickRatio, GST_FORMAT_TIME,
+										  (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
+										  GST_SEEK_TYPE_SET, (gint64)(m_last_seek_pos * 11111LL), GST_SEEK_TYPE_NONE,
+										  GST_CLOCK_TIME_NONE)) {
 						eDebug("[eServiceMP3] seekToImpl subsink failed");
 					}
-					gst_object_unref(subsink);
 				}
 			}
 			g_free(debug_warn);
 			g_error_free(warn);
 			break;
 		}
-		case GST_MESSAGE_INFO:
-		{
-			gchar *debug;
-			GError *inf;
+		case GST_MESSAGE_INFO: {
+			gchar* debug;
+			GError* inf;
 
-			gst_message_parse_info (msg, &inf, &debug);
-			g_free (debug);
-			if ( inf->domain == GST_STREAM_ERROR && inf->code == GST_STREAM_ERROR_DECODE )
-			{
-				if ( g_strrstr(sourceName, "videosink") )
-					m_event((iPlayableService*)this, evUser+14);
+			gst_message_parse_info(msg, &inf, &debug);
+			g_free(debug);
+			if (inf->domain == GST_STREAM_ERROR && inf->code == GST_STREAM_ERROR_DECODE) {
+				if (g_strrstr(sourceName, "videosink"))
+					m_event((iPlayableService*)this, evUser + 14);
 			}
 			g_error_free(inf);
 			break;
 		}
-		case GST_MESSAGE_TAG:
-		{
+		case GST_MESSAGE_TAG: {
 			GstTagList *tags, *result;
 			gst_message_parse_tag(msg, &tags);
 
 			result = gst_tag_list_merge(m_stream_tags, tags, GST_TAG_MERGE_REPLACE);
-			if (result)
-			{
-				if (m_stream_tags && gst_tag_list_is_equal(m_stream_tags, result))
-				{
+			if (result) {
+				if (m_stream_tags && gst_tag_list_is_equal(m_stream_tags, result)) {
 					gst_tag_list_free(tags);
 					gst_tag_list_free(result);
 					break;
@@ -5667,19 +3828,16 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 				m_stream_tags = result;
 			}
 
-			if (!m_coverart)
-			{
-				const GValue *gv_image = gst_tag_list_get_value_index(tags, GST_TAG_IMAGE, 0);
-				if ( gv_image )
-				{
-					GstBuffer *buf_image;
-					GstSample *sample;
-					sample = (GstSample *)g_value_get_boxed(gv_image);
+			if (!m_coverart) {
+				const GValue* gv_image = gst_tag_list_get_value_index(tags, GST_TAG_IMAGE, 0);
+				if (gv_image) {
+					GstBuffer* buf_image;
+					GstSample* sample;
+					sample = (GstSample*)g_value_get_boxed(gv_image);
 					buf_image = gst_sample_get_buffer(sample);
-					int fd = open("/tmp/.id3coverart", O_CREAT|O_WRONLY|O_TRUNC, 0644);
-					if (fd >= 0)
-					{
-						guint8 *data;
+					int fd = open("/tmp/.id3coverart", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+					if (fd >= 0) {
+						guint8* data;
 						gsize size;
 						GstMapInfo map;
 						gst_buffer_map(buf_image, &map, GST_MAP_READ);
@@ -5699,652 +3857,262 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 			break;
 		}
 		/* TOC entry intercept used for chapter support CVR */
-		case GST_MESSAGE_TOC:
-		{
-			HandleTocEntry(msg);
+		case GST_MESSAGE_TOC: {
+			if (!m_sourceinfo.is_audio && !m_sourceinfo.is_streaming)
+				HandleTocEntry(msg);
 			break;
 		}
-		case GST_MESSAGE_ASYNC_DONE:
-		{
-			if(GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
+		case GST_MESSAGE_ASYNC_DONE: {
+			if (GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
 				break;
 
-			if (m_audio_switch_flush_phase == AudioSwitchFlushWaitSeek)
-			{
-				/* doAudioSwitchFlushSeek()'s seek just finished prerolling
-				 * at the target position - the whole point of pausing
-				 * first (see m_audio_switch_flush_phase's own comment) was
-				 * for this to land invisibly, with nothing to resume
-				 * displaying until it's already sitting on the right
-				 * frame. */
-				eDebug("[eServiceMP3] audio switch pause-flush: seek prerolled, %s",
-					m_audio_switch_flush_resume ? "resuming" : "staying paused");
-				m_audio_switch_flush_phase = AudioSwitchFlushNone;
-				if (m_audio_switch_flush_resume)
-				{
-					/* Consumed by, and explained at, gstBusCall()'s
-					 * GST_STATE_CHANGE_PAUSED_TO_PLAYING handling. */
-					m_audio_switch_flush_resuming = true;
-					gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+			if (m_is_dash_pipeline) {
+				/* No playbin n-video/n-audio to introspect; streams pre-registered. */
+				if (m_send_ev_start) {
+					m_event((iPlayableService*)this, evUpdatedInfo);
+					m_send_ev_start = false;
 				}
+				if (!m_prerolled)
+					applyPendingSeek();
+				break;
 			}
 
-			if (m_send_ev_start)
-			{
+			if (m_send_ev_start && m_sourceinfo.is_streaming && !m_is_live) {
+				// a live network stream has no duration, a VOD stream has one
+				gint64 duration = 0;
+				if (!gst_element_query_duration(m_gst_playbin, GST_FORMAT_TIME, &duration) || duration <= 0)
+					m_is_live = true;
+				eDebug("[eServiceMP3] GST_MESSAGE_ASYNC_DONE check stream live:%d", m_is_live);
+			}
+
+			if (m_send_ev_start) {
 				gint i, n_video = 0, n_audio = 0, n_text = 0;
+				// bool codec_tofix = false;
 
-				g_object_get (m_gst_playbin, "n-video", &n_video, NULL);
-				g_object_get (m_gst_playbin, "n-audio", &n_audio, NULL);
-				g_object_get (m_gst_playbin, "n-text", &n_text, NULL);
+				g_object_get(m_gst_playbin, "n-video", &n_video, NULL);
+				g_object_get(m_gst_playbin, "n-audio", &n_audio, NULL);
+				g_object_get(m_gst_playbin, "n-text", &n_text, NULL);
 
-				/*
-				 * Some DASH MPDs expose each bitrate as a separate video stream,
-				 * sometimes listing an I-frame-only/trick-play stream first.
-				 * Legacy playbin selects that first stream by default, regardless
-				 * of its connection-speed setting. Do not set current-video in
-				 * the constructor: playbin has no video selector at that point
-				 * and silently rejects the request. After preroll the pads have
-				 * real caps, so choose the largest normal video frame.
-				 * This is deliberately restricted to MPEG-DASH.
-				 */
-				if (m_sourceinfo.is_dash && n_video > 1)
-				{
-					gint best_video = -1;
-					guint64 best_pixels = 0;
-					for (gint vi = 0; vi < n_video; ++vi)
-					{
-						GstPad *video_pad = NULL;
-						g_signal_emit_by_name(m_gst_playbin, "get-video-pad", vi, &video_pad);
-						if (!video_pad)
-							continue;
+				// eDebug("[eServiceMP3] async-done - %d video, %d audio, %d subtitle", n_video, n_audio, n_text);
 
-						/* Reject trick-play streams when their stream ID says so. */
-						bool trick_play = false;
-						gchar *stream_id = gst_pad_get_stream_id(video_pad);
-						if (stream_id)
-						{
-							gchar *lower = g_ascii_strdown(stream_id, -1);
-							trick_play = g_strrstr(lower, "iframe") || g_strrstr(lower, "trick");
-							g_free(lower);
-							g_free(stream_id);
-						}
-
-						GstCaps *caps = gst_pad_get_current_caps(video_pad);
-						gst_object_unref(video_pad);
-						if (!caps)
-							continue;
-
-						gint width = 0, height = 0;
-						if (!gst_caps_is_empty(caps) && !gst_caps_is_any(caps))
-						{
-							const GstStructure *s = gst_caps_get_structure(caps, 0);
-							gst_structure_get_int(s, "width", &width);
-							gst_structure_get_int(s, "height", &height);
-						}
-						gst_caps_unref(caps);
-
-						eTrace("[eServiceMP3] DASH video %d: %dx%d%s",
-							vi, width, height, trick_play ? " (trick-play)" : "");
-						if (trick_play || width <= 0 || height <= 0)
-							continue;
-						const guint64 pixels = (guint64)width * (guint64)height;
-						if (pixels > best_pixels)
-						{
-							best_pixels = pixels;
-							best_video = vi;
-						}
-					}
-
-					if (best_video >= 0)
-					{
-						gint current_video = -1;
-						g_object_get(m_gst_playbin, "current-video", &current_video, NULL);
-						if (current_video != best_video)
-						{
-							eTrace("[eServiceMP3] DASH select video %d -> %d (%" G_GUINT64_FORMAT " pixels)",
-								current_video, best_video, best_pixels);
-							g_object_set(m_gst_playbin, "current-video", best_video, NULL);
-						}
-					}
-				}
-
-				eTrace("[eServiceMP3] async-done - %d video, %d audio, %d subtitle", n_video, n_audio, n_text);
-
-				if ( n_video + n_audio <= 0 )
+				if (n_video + n_audio <= 0)
 					stop();
-
-				installBitrateProbes(n_video, n_audio);
 
 				std::vector<audioStream> audioStreams_temp;
 				std::vector<subtitleStream> subtitleStreams_temp;
 
-				for (i = 0; i < n_audio; i++)
-				{
+				std::vector<audioMeta> audiometa;
+				if (m_sourceinfo.is_hls && !(m_ref.data[7] & DVB_I_MEDIA_MASK))
+					audiometa = parse_hls_audio_meta("/tmp/gsthlsaudiometa.info");
+
+				for (i = 0; i < n_audio; i++) {
 					audioStream audio = {};
-					gchar *g_codec, *g_lang;
-					GstTagList *tags = NULL;
+					gchar *g_codec, *g_lang, *g_title;
+					GstTagList* tags = NULL;
 					GstPad* pad = 0;
-					g_signal_emit_by_name (m_gst_playbin, "get-audio-pad", i, &pad);
-					if(!pad)
-						continue;
-					GstCaps* caps = gst_pad_get_current_caps(pad);
-					if (!caps)
-					{
+					g_signal_emit_by_name(m_gst_playbin, "get-audio-pad", i, &pad);
+					GstCaps* caps = pad ? gst_pad_get_current_caps(pad) : NULL;
+					if (pad)
 						gst_object_unref(pad);
-						continue;
+					// Keep playbin's indices even if an unselected pad has no caps yet.
+					// Dropping it would make every subsequent cached/menu index incorrect.
+					if (caps && gst_caps_get_size(caps)) {
+						GstStructure* str = gst_caps_get_structure(caps, 0);
+						audio.type = gstCheckAudioPad(str);
+						audio.codec = gst_structure_get_name(str);
 					}
-					GstStructure* str = gst_caps_get_structure(caps, 0);
-					const gchar *g_type = gst_structure_get_name(str);
-					gint channels = 0;
-					if (gst_structure_get_int(str, "channels", &channels) && channels > 0)
-						audio.channels = channels;
-					/* DASH often omits 'channels' from compressed AAC caps even
-					 * when the MP4 AudioSpecificConfig contains it. */
-					if (m_sourceinfo.is_dash && audio.channels == 0 &&
-						(!strcmp(g_type, "audio/mpeg") || !strcmp(g_type, "audio/x-aac") ||
-						 !strcmp(g_type, "audio/aac")))
-						audio.channels = aacCodecDataChannels(str);
-					eDebug("[eServiceMP3] AUDIO STRUCT=%s channels=%d", g_type, audio.channels);
-
-					if ((!strcmp(g_type, "audio/x-eac3") || !strcmp(g_type, "audio/eac3")) &&
-						!g_object_get_qdata(G_OBJECT(pad), eac3AtmosProbeQuark()))
-					{
-						g_object_set_qdata(G_OBJECT(pad), eac3AtmosProbeQuark(), GUINT_TO_POINTER(1));
-						gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, eac3AtmosProbe,
-							new EAC3AtmosProbeData{i, 0, false, m_sourceinfo.is_dash, 0, 0, 0, false, false, 0}, freeEAC3AtmosProbeData);
-					}
-
-					if ((!strcmp(g_type, "audio/x-dts") || !strcmp(g_type, "audio/dts")) &&
-						!g_object_get_qdata(G_OBJECT(pad), dtsHDProbeQuark()))
-					{
-						g_object_set_qdata(G_OBJECT(pad), dtsHDProbeQuark(), GUINT_TO_POINTER(1));
-						gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, dtsHDProbe,
-							new DTSHDProbeData(i), freeDTSHDProbeData);
-					}
-					gst_object_unref(pad);
-					audio.type = gstCheckAudioPad(str);
 					audio.language_code = "und";
-					audio.codec = g_type;
 					g_codec = NULL;
 					g_lang = NULL;
-					g_signal_emit_by_name (m_gst_playbin, "get-audio-tags", i, &tags);
-					if (tags && GST_IS_TAG_LIST(tags))
-					{
-						if (gst_tag_list_get_string(tags, GST_TAG_AUDIO_CODEC, &g_codec))
-						{
+					g_title = NULL;
+					g_signal_emit_by_name(m_gst_playbin, "get-audio-tags", i, &tags);
+					if (tags && GST_IS_TAG_LIST(tags)) {
+						if (gst_tag_list_get_string(tags, GST_TAG_AUDIO_CODEC, &g_codec)) {
 							audio.codec = std::string(g_codec);
 							g_free(g_codec);
 						}
-						if (gst_tag_list_get_string(tags, GST_TAG_LANGUAGE_CODE, &g_lang))
-						{
+						if (gst_tag_list_get_string(tags, GST_TAG_LANGUAGE_CODE, &g_lang)) {
 							audio.language_code = std::string(g_lang);
 							g_free(g_lang);
 						}
-					}
-
-					/* Refine only the human-readable codec description. Playback
-					 * type/decoder/passthrough selection above is deliberately unchanged. */
-					const gchar *profile = gst_structure_get_string(str, "profile");
-					gchar *caps_desc = gst_structure_to_string(str);
-					std::string audio_meta = audio.codec;
-					if (profile) { audio_meta += " "; audio_meta += profile; }
-					if (caps_desc) { audio_meta += " "; audio_meta += caps_desc; }
-
-					gchar *audio_meta_lower = g_ascii_strdown(audio_meta.c_str(), -1);
-					const bool has_atmos = audio_meta_lower &&
-						(strstr(audio_meta_lower, "dolby atmos") || strstr(audio_meta_lower, "atmos") || strstr(audio_meta_lower, "joc"));
-
-					const bool meta_truehd = audio_meta_lower &&
-						(strstr(audio_meta_lower, "truehd") || strstr(audio_meta_lower, "true-hd"));
-					const bool meta_dtshd = audio_meta_lower &&
-						(strstr(audio_meta_lower, "dts-hd") || strstr(audio_meta_lower, "dts hd") || strstr(audio_meta_lower, "dtshd"));
-					const bool meta_dtsx_pro = audio_meta_lower &&
-						(strstr(audio_meta_lower, "dts:x pro") || strstr(audio_meta_lower, "dts x pro") || strstr(audio_meta_lower, "dtsx pro"));
-					const bool meta_dtsx = audio_meta_lower &&
-						(strstr(audio_meta_lower, "dts:x") || strstr(audio_meta_lower, "dts x") || strstr(audio_meta_lower, "dtsx"));
-					const bool meta_dts_ma = audio_meta_lower &&
-						(strstr(audio_meta_lower, "dts-hd master") || strstr(audio_meta_lower, "dts hd master") ||
-						 strstr(audio_meta_lower, "dts-hd ma") || strstr(audio_meta_lower, "dts hd ma"));
-					const bool meta_dts_hra = audio_meta_lower &&
-						(strstr(audio_meta_lower, "dts-hd high resolution") || strstr(audio_meta_lower, "dts hd high resolution") ||
-						 strstr(audio_meta_lower, "dts-hd hra") || strstr(audio_meta_lower, "dts hd hra"));
-					const bool meta_dts_es = audio_meta_lower &&
-						(strstr(audio_meta_lower, "dts-es") || strstr(audio_meta_lower, "dts es"));
-					const bool meta_dts_96_24 = audio_meta_lower &&
-						(strstr(audio_meta_lower, "dts 96/24") || strstr(audio_meta_lower, "dts 96-24") || strstr(audio_meta_lower, "dts 96 24"));
-					const bool meta_mlp = audio_meta_lower &&
-						(strstr(audio_meta_lower, "meridian lossless") || strstr(audio_meta_lower, "mlp"));
-					const bool meta_realaudio = audio_meta_lower &&
-						(strstr(audio_meta_lower, "realaudio") || strstr(audio_meta_lower, "real audio"));
-					const bool meta_real_144 = audio_meta_lower &&
-						(strstr(audio_meta_lower, "real_144") || strstr(audio_meta_lower, "real 144") ||
-						 (meta_realaudio && strstr(audio_meta_lower, "14.4")));
-					const bool meta_real_288 = audio_meta_lower &&
-						(strstr(audio_meta_lower, "real_288") || strstr(audio_meta_lower, "real 288") ||
-						 (meta_realaudio && strstr(audio_meta_lower, "28.8")));
-
-					if (!strcmp(g_type, "audio/x-true-hd") || !strcmp(g_type, "audio/xTrueHD") || meta_truehd)
-						audio.codec = has_atmos ? "Dolby Atmos (TrueHD)" : "Dolby TrueHD";
-					else if (!strcmp(g_type, "audio/x-mlp") || meta_mlp)
-						audio.codec = "MLP";
-					else if (!strcmp(g_type, "audio/x-eac3") || !strcmp(g_type, "audio/eac3"))
-						audio.codec = has_atmos ? "Dolby Atmos" : "Dolby Digital +";
-					else if (!strcmp(g_type, "audio/x-ac3") || !strcmp(g_type, "audio/ac3"))
-						audio.codec = "Dolby Digital";
-					else if (!strcmp(g_type, "audio/x-ac4") || !strcmp(g_type, "audio/ac4") ||
-						(audio_meta_lower && (strstr(audio_meta_lower, "dolby ac-4") || strstr(audio_meta_lower, "ac-4"))))
-						audio.codec = "Dolby AC-4";
-					else if (meta_dtsx_pro)
-						audio.codec = "DTS:X Pro";
-					else if (meta_dtsx)
-						audio.codec = "DTS:X";
-					else if (meta_dts_ma)
-						audio.codec = "DTS-HD MA";
-					else if (meta_dts_hra)
-						audio.codec = "DTS-HD HRA";
-					else if (meta_dts_es)
-						audio.codec = "DTS-ES";
-					else if (meta_dts_96_24)
-						audio.codec = "DTS 96/24";
-					else if (!strcmp(g_type, "audio/x-dtshd") || !strcmp(g_type, "audio/dtshd") || meta_dtshd)
-						audio.codec = "DTS-HD";
-					else if (!strcmp(g_type, "audio/x-dts") || !strcmp(g_type, "audio/dts"))
-						/*
-						 * No bare strstr(audio_meta_lower, "dts") fallback here,
-						 * unlike the more specific meta_dts* variants above (which
-						 * only ever refine an already-g_type-confirmed DTS-family
-						 * stream into a more specific label - every other codec's
-						 * base identification above this point requires an exact
-						 * g_type match too). A bare "dts" substring match against
-						 * the full caps dump in audio_meta_lower is far too broad:
-						 * ADTS-framed AAC (stream-format=(string)adts - the normal
-						 * AAC framing for MPEG-TS/HLS, i.e. most network/IPTV
-						 * sources) contains "dts" as a literal substring of "adts",
-						 * so every such stream was being mislabeled DTS regardless
-						 * of its real codec.
-						 */
-						audio.codec = "DTS";
-					else if (audio.type == atAAC || audio.type == atAACHE)
-					{
-						if (audio_meta_lower && (strstr(audio_meta_lower, "xhe-aac") || strstr(audio_meta_lower, "xhe aac") || strstr(audio_meta_lower, "usac")))
-							audio.codec = "xHE-AAC";
-						else if (audio_meta_lower && (strstr(audio_meta_lower, "he-aac-v2") || strstr(audio_meta_lower, "he-aac v2") || strstr(audio_meta_lower, "heaacv2")))
-							audio.codec = "HE-AAC v2";
-						else if (audio_meta_lower && (strstr(audio_meta_lower, "he-aac-v1") || strstr(audio_meta_lower, "he-aac") || strstr(audio_meta_lower, "he aac") || strstr(audio_meta_lower, "heaac") || strstr(audio_meta_lower, "sbr")))
-							audio.codec = "HE-AAC";
-						else if (audio_meta_lower && (strstr(audio_meta_lower, "profile=(string)eld") || strstr(audio_meta_lower, "profile=eld") || strstr(audio_meta_lower, "aac-eld") || strstr(audio_meta_lower, "aac eld")))
-							audio.codec = "AAC-ELD";
-						else if (audio_meta_lower && (strstr(audio_meta_lower, "profile=(string)ld") || strstr(audio_meta_lower, "profile=ld") || strstr(audio_meta_lower, "aac-ld") || strstr(audio_meta_lower, "aac ld")))
-							audio.codec = "AAC-LD";
-						else if (audio_meta_lower && (strstr(audio_meta_lower, "profile=(string)lc") || strstr(audio_meta_lower, "profile=lc") || strstr(audio_meta_lower, "base-profile=(string)lc") || strstr(audio_meta_lower, "aac-lc") || strstr(audio_meta_lower, "aac lc")))
-							audio.codec = "AAC-LC";
-						else
-							audio.codec = "AAC";
-					}
-					else if (!strcmp(g_type, "audio/x-flac") || !strcmp(g_type, "audio/flac") ||
-						(audio_meta_lower && (strstr(audio_meta_lower, "flac") || strstr(audio_meta_lower, "free lossless audio codec"))))
-						audio.codec = "FLAC";
-					else if (!strcmp(g_type, "audio/x-alac") ||
-						(audio_meta_lower && (strstr(audio_meta_lower, "alac") || strstr(audio_meta_lower, "apple lossless"))))
-						audio.codec = "ALAC";
-					else if (!strcmp(g_type, "audio/x-opus") || (audio_meta_lower && strstr(audio_meta_lower, "opus")))
-						audio.codec = "Opus";
-					else if (!strcmp(g_type, "audio/x-vorbis") || (audio_meta_lower && strstr(audio_meta_lower, "vorbis")))
-						audio.codec = "Vorbis";
-					else if (!strcmp(g_type, "audio/x-wavpack") || (audio_meta_lower && strstr(audio_meta_lower, "wavpack")))
-						audio.codec = "WavPack";
-					else if (!strcmp(g_type, "audio/x-ape") ||
-						(audio_meta_lower && (strstr(audio_meta_lower, "monkey's audio") || strstr(audio_meta_lower, "monkeys audio"))))
-						audio.codec = "APE";
-					else if (!strcmp(g_type, "audio/x-tta") ||
-						(audio_meta_lower && (strstr(audio_meta_lower, "true audio") || strstr(audio_meta_lower, "tta"))))
-						audio.codec = "TTA";
-					else if (!strcmp(g_type, "audio/x-wma"))
-					{
-						if (audio_meta_lower && (strstr(audio_meta_lower, "wma lossless") || strstr(audio_meta_lower, "wmalossless")))
-							audio.codec = "WMA Lossless";
-						else if (audio_meta_lower && (strstr(audio_meta_lower, "wma pro") || strstr(audio_meta_lower, "wmapro") || strstr(audio_meta_lower, "wma/pro")))
-							audio.codec = "WMA Pro";
-						else
-							audio.codec = "WMA";
-					}
-					else if (!strcmp(g_type, "audio/x-pn-realaudio"))
-					{
-						gint raversion = 0;
-						if (gst_structure_get_int(str, "raversion", &raversion) && raversion == 1)
-							audio.codec = "RealAudio 14.4";
-						else if (raversion == 2)
-							audio.codec = "RealAudio 28.8";
-						else
-							audio.codec = "RealAudio";
-					}
-					else if (meta_real_144)
-						audio.codec = "RealAudio 14.4";
-					else if (meta_real_288)
-						audio.codec = "RealAudio 28.8";
-					else if (!strcmp(g_type, "audio/AMR-WB") || (audio_meta_lower && strstr(audio_meta_lower, "amr-wb")))
-						audio.codec = "AMR-WB";
-					else if (!strcmp(g_type, "audio/AMR") || (audio_meta_lower && strstr(audio_meta_lower, "amr")))
-						audio.codec = "AMR";
-					else if (!strcmp(g_type, "audio/x-speex") || (audio_meta_lower && strstr(audio_meta_lower, "speex")))
-						audio.codec = "Speex";
-					else if (!strcmp(g_type, "audio/x-dsd") || (audio_meta_lower && strstr(audio_meta_lower, "dsd")))
-						audio.codec = "DSD";
-					else if (!strcmp(g_type, "audio/mpeg"))
-					{
-						gint mpegversion = 0, layer = 0;
-						if (gst_structure_get_int(str, "mpegversion", &mpegversion) && mpegversion == 1 &&
-							gst_structure_get_int(str, "layer", &layer))
-						{
-							if (layer == 3)
-								audio.codec = "MP3";
-							else if (layer == 2)
-								audio.codec = "MP2";
-							else if (layer == 1)
-								audio.codec = "MPEG Layer I";
+						if (gst_tag_list_get_string(tags, GST_TAG_TITLE, &g_title)) {
+							audio.title = std::string(g_title);
+							g_free(g_title);
 						}
+						if (audio.title.empty() && (m_ref.data[7] & DVB_I_MEDIA_MASK) && gst_tag_list_get_string(tags, GST_TAG_DESCRIPTION, &g_title)) {
+							audio.title = g_title;
+							g_free(g_title);
+						}
+						gst_tag_list_free(tags);
 					}
-					else if (!strcmp(g_type, "audio/x-alaw"))
-						audio.codec = "A-law";
-					else if (!strcmp(g_type, "audio/x-mulaw"))
-						audio.codec = "mu-law";
-					else if (!strcmp(g_type, "audio/x-raw"))
-					{
-						/*
-						 * Keep encoded source identity when playbin has already decoded
-						 * the pad (TrueHD/FLAC/etc. are handled from codec metadata above).
-						 */
-						if (audio_meta_lower && strstr(audio_meta_lower, "lpcm"))
-							audio.codec = "LPCM";
-						else if (audio.codec == g_type || (audio_meta_lower &&
-							(strstr(audio_meta_lower, "raw") || strstr(audio_meta_lower, "pcm"))))
-							audio.codec = "PCM";
+					if ((int)audiometa.size() > i) {
+						if (!audiometa[i].lang.empty())
+							audio.language_code = audiometa[i].lang;
+						if (!audiometa[i].title.empty())
+							audio.title = audiometa[i].title;
 					}
-
-					eDebug("[eServiceMP3] audio stream=%i codec=%s language=%s channels=%d",
-						i, audio.codec.c_str(), audio.language_code.c_str(), audio.channels);
-					if (audio_meta_lower) g_free(audio_meta_lower);
-					if (caps_desc) g_free(caps_desc);
-					if (tags && GST_IS_TAG_LIST(tags)) gst_tag_list_free(tags);
+					// eDebug("[eServiceMP3] audio stream=%i codec=%s language=%s", i, audio.codec.c_str(),
+					// audio.language_code.c_str()); codec_tofix = (audio.codec.find("MPEG-1 Layer 3 (MP3)") == 0 ||
+					// audio.codec.find("MPEG-2 AAC") == 0) && n_audio - n_video == 1;
 					audioStreams_temp.push_back(audio);
-					gst_caps_unref(caps);
+					if (caps)
+						gst_caps_unref(caps);
 				}
 
-				for (i = 0; i < n_text; i++)
-				{
-					gchar *g_codec = NULL, *g_lang = NULL;
-					GstTagList *tags = NULL;
-					g_signal_emit_by_name (m_gst_playbin, "get-text-tags", i, &tags);
+				for (i = 0; i < n_text; i++) {
+					gchar *g_codec = NULL, *g_lang = NULL, *g_lang_title = NULL;
+					GstTagList* tags = NULL;
+					g_signal_emit_by_name(m_gst_playbin, "get-text-tags", i, &tags);
 					subtitleStream subs;
 					subs.language_code = "und";
-					if (tags && GST_IS_TAG_LIST(tags))
-					{
-						if (gst_tag_list_get_string(tags, GST_TAG_LANGUAGE_CODE, &g_lang))
-						{
+					subs.title = "";
+					if (tags && GST_IS_TAG_LIST(tags)) {
+						if (gst_tag_list_get_string(tags, GST_TAG_LANGUAGE_CODE, &g_lang)) {
 							subs.language_code = g_lang;
 							g_free(g_lang);
+						}
+						if (gst_tag_list_get_string(tags, GST_TAG_TITLE, &g_lang_title)) {
+							subs.title = g_lang_title;
+							g_free(g_lang_title);
 						}
 						gst_tag_list_get_string(tags, GST_TAG_SUBTITLE_CODEC, &g_codec);
 						gst_tag_list_free(tags);
 					}
 
-					eDebug("[eServiceMP3] subtitle stream=%i language=%s codec=%s", i, subs.language_code.c_str(), g_codec ? g_codec : "(null)");
+					// eDebug("[eServiceMP3] subtitle stream=%i language=%s codec=%s", i, subs.language_code.c_str(),
+					// g_codec ? g_codec : "(null)");
 
 					GstPad* pad = 0;
-					g_signal_emit_by_name (m_gst_playbin, "get-text-pad", i, &pad);
-					if ( pad )
-						g_signal_connect (G_OBJECT (pad), "notify::caps", G_CALLBACK (gstTextpadHasCAPS), this);
+					g_signal_emit_by_name(m_gst_playbin, "get-text-pad", i, &pad);
+					if (pad) {
+						g_signal_connect(G_OBJECT(pad), "notify::caps", G_CALLBACK(gstTextpadHasCAPS), this);
+						GstCaps* caps = gst_pad_get_current_caps(pad);
+						// eDebug("[eServiceMP3] subtitle Text pad %d caps: %s", i, gst_caps_to_string (caps));
+						gst_caps_unref(caps);
 
-					subs.type = getSubtitleType(pad, g_codec);
-					gst_object_unref(pad);
+						subs.type = getSubtitleType(pad, g_codec, &subs.cc_payload_type);
+
+						if (i == 0 && !m_external_subtitle_extension.empty()) {
+							if (m_external_subtitle_extension == "srt")
+								subs.type = stSRT;
+							if (m_external_subtitle_extension == "ass")
+								subs.type = stASS;
+							if (m_external_subtitle_extension == "ssa")
+								subs.type = stSSA;
+							if (m_external_subtitle_extension == "vtt")
+								subs.type = stWebVTT;
+							if (!m_external_subtitle_language.empty())
+								subs.language_code = m_external_subtitle_language;
+						}
+
+						gst_object_unref(pad);
+					}
 					g_free(g_codec);
 					subtitleStreams_temp.push_back(subs);
-				}
-
-				for (unsigned int ai = 0; ai < audioStreams_temp.size() && ai < m_audioStreams.size(); ++ai)
-				{
-					/* Avoid losing a previously detected channel count during
-					 * DASH re-preroll/audio re-enumeration when the caps omit it. */
-					if (m_sourceinfo.is_dash && audioStreams_temp[ai].channels == 0 &&
-						m_audioStreams[ai].channels > 0 &&
-						m_audioStreams[ai].type == audioStreams_temp[ai].type &&
-						m_audioStreams[ai].language_code == audioStreams_temp[ai].language_code)
-						audioStreams_temp[ai].channels = m_audioStreams[ai].channels;
-					const std::string &old_codec = m_audioStreams[ai].codec;
-					std::string &new_codec = audioStreams_temp[ai].codec;
-					if (old_codec == "Dolby Atmos" && new_codec == "Dolby Digital +")
-						new_codec = old_codec;
-					else if (old_codec.find("DTS") == 0 && old_codec != "DTS" &&
-						(new_codec == "DTS" || new_codec == "DTS-HD"))
-					{
-						new_codec = old_codec;
-						if (m_audioStreams[ai].channels > audioStreams_temp[ai].channels)
-							audioStreams_temp[ai].channels = m_audioStreams[ai].channels;
-					}
 				}
 
 				bool hasChanges = m_audioStreams != audioStreams_temp;
 				if (!hasChanges)
 					hasChanges = m_subtitleStreams != subtitleStreams_temp;
 
-				if (hasChanges)
-				{
+				if (hasChanges) {
 					eTrace("[eServiceMP3] audio or subtitle stream difference -- re enumerating");
 					m_audioStreams.assign(audioStreams_temp.begin(), audioStreams_temp.end());
 					m_subtitleStreams.assign(subtitleStreams_temp.begin(), subtitleStreams_temp.end());
-					eTrace("[eServiceMP3] evUpdatedInfo called for audiosubs");
+					eDebug("[eServiceMP3] GST_MESSAGE_ASYNC_DONE before evUpdatedInfo");
 					m_event((iPlayableService*)this, evUpdatedInfo);
 				}
 
-				/* Whatever seeded these (an "&e2audiotrack="/"&e2subtitletrack="
-				 * URL parameter, or the IPTV db lookup - see the constructor)
-				 * can be stale/out-of-range for this actual file - deselect
-				 * rather than leaving a dangling index that selectAudioStream()/
-				 * getCachedSubtitle() would silently misinterpret. -1 itself is
-				 * left alone: it already means "nothing picked yet" everywhere
-				 * else in this class. */
-				if (m_currentAudioStream >= (int)m_audioStreams.size())
-					m_currentAudioStream = -1;
-				if (m_currentSubtitleStream >= (int)m_subtitleStreams.size())
-				{
-					m_currentSubtitleStream = -1;
-					m_cachedSubtitleStream = -1;
-				}
-			}
-			else
-			{
+			} else {
 				m_send_ev_start = true;
 			}
+			applyAudioSelection();
 
-#ifdef HAS_SOFTWARE_HDR_DETECTION
-			updateHDRFromVideoPad();
+			if (!m_prerolled)
+				applyPendingSeek();
 
-			/* Start HEVC bitstream probe early so we capture the very first
-			 * I-frame of the stream.  For byte-stream HLG content the SPS
-			 * (carrying transfer_characteristics=18) is in those first packets;
-			 * if we wait until eventSizeChanged the decoder has already consumed
-			 * the SPS and the next one may be many seconds away (next IDR).
-			 * For hvc1/hev1 files the SPS is in codec_data and is pre-ingested
-			 * by startHDRProbe regardless of timing. */
-			if (!m_hdr_probe_active)
-				startHDRProbe();
-#endif
-
-			if (m_seek_paused)
-			{
-				m_seek_paused = false;
-				gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
+			if (m_errorInfo.missing_codec != "") {
+				if (m_errorInfo.missing_codec.find("video/") == 0 ||
+					(m_errorInfo.missing_codec.find("audio/") == 0 && m_audioStreams.empty()))
+					m_event((iPlayableService*)this, evUser + 12);
 			}
-
-			if ( m_errorInfo.missing_codec != "" )
+			/*+++*workaround for mp3 playback problem on some boxes - e.g. xtrend et9200 (if press stop and play or
+			switch to the next track is the state 'playing', but plays not. Restart the player-application or paused and
+			then play the track fix this for once.)*/
+			/*if (!m_paused && codec_tofix)
 			{
-				if (m_errorInfo.missing_codec.find("video/") == 0 || (m_errorInfo.missing_codec.find("audio/") == 0 && m_audioStreams.empty()))
-					m_event((iPlayableService*)this, evUser+12);
-			}
+				std::string filename = "/proc/stb/info/boxtype";
+				FILE *f = fopen(filename.c_str(), "rb");
+				if (f)
+				{
+					char boxtype[6];
+					fread(boxtype, 6, 1, f);
+					fclose(f);
+					if (!memcmp(boxtype, "et5000", 6) || !memcmp(boxtype, "et6000", 6) || !memcmp(boxtype, "et6500", 6)
+			|| !memcmp(boxtype, "et9000", 6) || !memcmp(boxtype, "et9100", 6) || !memcmp(boxtype, "et9200", 6) ||
+			!memcmp(boxtype, "et9500", 6))
+					{
+						eDebug("[eServiceMP3] mp3,aac playback fix for xtrend et5x00,et6x00,et9x00 - set paused and then
+			playing state"); GstStateChangeReturn ret; ret = gst_element_set_state (m_gst_playbin, GST_STATE_PAUSED); if
+			(ret != GST_STATE_CHANGE_SUCCESS)
+						{
+							eDebug("[eServiceMP3] mp3 playback fix - failure set paused state - sleep one second before
+			set playing state"); sleep(1);
+						}
+						gst_element_set_state (m_gst_playbin, GST_STATE_PLAYING);
+					}
+				}
+			}*/
+			/*+++*/
 			break;
 		}
-		case GST_MESSAGE_ELEMENT:
-		{
-			const GstStructure *msgstruct = gst_message_get_structure(msg);
-			if (msgstruct)
-			{
-				if ( gst_is_missing_plugin_message(msg) )
-				{
-					GstCaps *caps = NULL;
-					gst_structure_get (msgstruct, "detail", GST_TYPE_CAPS, &caps, NULL);
-					if (caps)
-					{
-						std::string codec = (const char*) gst_caps_to_string(caps);
-						gchar *description = gst_missing_plugin_message_get_description(msg);
-						if ( description )
-						{
+		case GST_MESSAGE_ELEMENT: {
+			const GstStructure* msgstruct = gst_message_get_structure(msg);
+			if (msgstruct) {
+				if (gst_is_missing_plugin_message(msg)) {
+					GstCaps* caps = NULL;
+					gst_structure_get(msgstruct, "detail", GST_TYPE_CAPS, &caps, NULL);
+					if (caps) {
+						std::string codec = (const char*)gst_caps_to_string(caps);
+						gchar* description = gst_missing_plugin_message_get_description(msg);
+						if (description) {
 							eDebug("[eServiceMP3] m_errorInfo.missing_codec = %s", codec.c_str());
-							m_errorInfo.error_message = "GStreamer plugin " + (std::string)description + " not available!\n";
-							m_errorInfo.missing_codec = codec.substr(0,(codec.find_first_of(',')));
+							m_errorInfo.error_message =
+								"GStreamer plugin " + (std::string)description + " not available!\n";
+							m_errorInfo.missing_codec = codec.substr(0, (codec.find_first_of(',')));
 							g_free(description);
 						}
 						gst_caps_unref(caps);
 					}
-				}
-				else
-				{
-					const gchar *eventname = gst_structure_get_name(msgstruct);
-					if ( eventname )
-					{
-						if (!strcmp(eventname, "eventSizeChanged") || !strcmp(eventname, "eventSizeAvail"))
-						{
-							gst_structure_get_int (msgstruct, "aspect_ratio", &m_aspect);
-							gst_structure_get_int (msgstruct, "width", &m_width);
-							gst_structure_get_int (msgstruct, "height", &m_height);
-
-							/* The video sink only posts this once it actually
-							 * has a real decoded size to report, i.e. once it
-							 * has a frame ready - the earliest reliable "first
-							 * frame" signal available here (see evFirstFrame's
-							 * own doc comment in iservice.h). */
-							if (!m_first_frame_fired)
-							{
-								m_first_frame_fired = true;
-								m_event((iPlayableService*)this, evFirstFrame);
-							}
+				} else {
+					const gchar* eventname = gst_structure_get_name(msgstruct);
+					if (eventname) {
+						if (!strcmp(eventname, "eventSizeChanged") || !strcmp(eventname, "eventSizeAvail")) {
+							gst_structure_get_int(msgstruct, "aspect_ratio", &m_aspect);
+							gst_structure_get_int(msgstruct, "width", &m_width);
+							gst_structure_get_int(msgstruct, "height", &m_height);
 							if (strstr(eventname, "Changed"))
 								m_event((iPlayableService*)this, evVideoSizeChanged);
-#ifdef HAS_SOFTWARE_HDR_DETECTION
-						updateHDRFromVideoPad();
-							/* If the early probe (ASYNC_DONE) already found an SPS,
-							 * leave it running — it has good data in flight.
-							 * If no SPS yet (HEVC pad wasn't ready at ASYNC_DONE,
-							 * or probe not started), restart now that caps are settled. */
-							if (!m_hdr_probe_active || m_hdr_probe_first_sps_at == 0)
-								startHDRProbe();
-#endif
-						}
-						else if (!strcmp(eventname, "eventFrameRateChanged") || !strcmp(eventname, "eventFrameRateAvail"))
-						{
-							gst_structure_get_int (msgstruct, "frame_rate", &m_framerate);
+						} else if (!strcmp(eventname, "eventFrameRateChanged") ||
+								   !strcmp(eventname, "eventFrameRateAvail")) {
+							gst_structure_get_int(msgstruct, "frame_rate", &m_framerate);
 							if (strstr(eventname, "Changed"))
 								m_event((iPlayableService*)this, evVideoFramerateChanged);
-						}
-						else if (!strcmp(eventname, "eventProgressiveChanged") || !strcmp(eventname, "eventProgressiveAvail"))
-						{
-							gst_structure_get_int (msgstruct, "progressive", &m_progressive);
+						} else if (!strcmp(eventname, "eventProgressiveChanged") ||
+								   !strcmp(eventname, "eventProgressiveAvail")) {
+							gst_structure_get_int(msgstruct, "progressive", &m_progressive);
 							if (strstr(eventname, "Changed"))
 								m_event((iPlayableService*)this, evVideoProgressiveChanged);
-						}
-						else if (!strcmp(eventname, "eventGammaChanged"))
-						{
-							gst_structure_get_int (msgstruct, "gamma", &m_gamma);
-#ifdef HAVE_EGL
-							gEGLDC::setVideoGamma(m_gamma);
-#endif
-							m_event((iPlayableService*)this, evVideoGammaChanged);
-							/* Derive m_hdr_type from the hardware decoder gamma.
-							 * gamma: 0=SDR 1=HDR(generic) 2=SMPTE ST2084/HDR10 3=HLG
-							 * This is more reliable than GStreamer caps colorimetry,
-							 * which many STB h265parse builds do not populate. */
-							int newHdrType = 0;
-							if (m_gamma == 2) newHdrType = 1;       /* HDR10 */
-							else if (m_gamma == 3) newHdrType = 2;  /* HLG */
-							else if (m_gamma == 1) newHdrType = 3;  /* plain HDR */
-							if (newHdrType != m_hdr_type)
-							{
-								m_hdr_type = newHdrType;
-								m_event((iPlayableService*)this, evUpdatedInfo);
-							}
-						}
-						else if (!strcmp(eventname, "eventAtmosDetected"))
-						{
-							int stream = -1, present = 1;
-							gst_structure_get_int(msgstruct, "present", &present);
-							if (gst_structure_get_int(msgstruct, "stream", &stream) &&
-								stream >= 0 && stream < (int)m_audioStreams.size())
-							{
-								if (present && m_audioStreams[stream].codec != "Dolby Atmos")
-								{
-									m_audioStreams[stream].codec = "Dolby Atmos";
-									eDebug("[eServiceMP3] audio stream=%d updated codec=Dolby Atmos", stream);
-									m_event((iPlayableService*)this, evUpdatedInfo);
-								}
-								else if (!present && m_sourceinfo.is_dash &&
-									m_audioStreams[stream].codec == "Dolby Atmos")
-								{
-									/* DASH: Atmos ended (e.g. programme -> ad), revert the label */
-									m_audioStreams[stream].codec = "Dolby Digital +";
-									eDebug("[eServiceMP3] audio stream=%d updated codec=Dolby Digital + (Atmos ended)", stream);
-									m_event((iPlayableService*)this, evUpdatedInfo);
-								}
-							}
-						}
-						else if (!strcmp(eventname, "eventAudioChannelsDetected"))
-						{
-							int stream = -1, channels = 0;
-							if (m_sourceinfo.is_dash &&
-								gst_structure_get_int(msgstruct, "stream", &stream) &&
-								gst_structure_get_int(msgstruct, "channels", &channels) &&
-								stream >= 0 && stream < (int)m_audioStreams.size() &&
-								channels > 0 && channels <= 16 &&
-								m_audioStreams[stream].channels != channels)
-							{
-								m_audioStreams[stream].channels = channels;
-								eDebug("[eServiceMP3] DASH audio stream=%d detected channels=%d", stream, channels);
-								m_event((iPlayableService*)this, evUpdatedInfo);
-							}
-						}
-						else if (!strcmp(eventname, "eventDTSProfileDetected"))
-						{
-							int stream = -1;
-							int channels = 0;
-							const char *codec = gst_structure_get_string(msgstruct, "codec");
-							if (codec && gst_structure_get_int(msgstruct, "stream", &stream) &&
-								stream >= 0 && stream < (int)m_audioStreams.size())
-							{
-								bool changed = false;
-								if (m_audioStreams[stream].codec != codec)
-								{
-									m_audioStreams[stream].codec = codec;
-									changed = true;
-								}
-								if (gst_structure_get_int(msgstruct, "channels", &channels) && channels > 0 &&
-									m_audioStreams[stream].channels != channels)
-								{
-									m_audioStreams[stream].channels = channels;
-									changed = true;
-								}
-								if (changed)
-								{
-									eDebug("[eServiceMP3] audio stream=%d updated codec=%s channels=%d",
-										stream, codec, m_audioStreams[stream].channels);
-									m_event((iPlayableService*)this, evUpdatedInfo);
-								}
-							}
-						}
-						else if (!strcmp(eventname, "redirect"))
-						{
-							const char *uri = gst_structure_get_string(msgstruct, "new-location");
-							eDebug("[eServiceMP3] redirect to %s", uri);
-							gst_element_set_state (m_gst_playbin, GST_STATE_NULL);
-							g_object_set(G_OBJECT (m_gst_playbin), "uri", uri, NULL);
-							gst_element_set_state (m_gst_playbin, GST_STATE_PLAYING);
+						} else if (!strcmp(eventname, "eventGammaChanged")) {
+							gst_structure_get_int(msgstruct, "gamma", &m_gamma);
+							if (strstr(eventname, "Changed"))
+								m_event((iPlayableService*)this, evVideoGammaChanged);
+						} else if (!strcmp(eventname, "redirect")) {
+							const char* uri = gst_structure_get_string(msgstruct, "new-location");
+							// eDebug("[eServiceMP3] redirect to %s", uri);
+							gst_element_set_state(m_gst_playbin, GST_STATE_NULL);
+							g_object_set(m_gst_playbin, "uri", uri, NULL);
+							gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
 						}
 					}
 				}
@@ -6352,13 +4120,14 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 			break;
 		}
 		case GST_MESSAGE_BUFFERING:
-			if (m_sourceinfo.is_streaming)
-			{
-				GstBufferingMode mode;
+			if (m_is_dash_pipeline)
+				break;  /* dashdemux's own buffering, not playbin's — ignore */
+			if (m_sourceinfo.is_streaming) {
+				// GstBufferingMode mode;
 				gst_message_parse_buffering(msg, &(m_bufferInfo.bufferPercent));
-				eTrace("[eServiceMP3] Buffering %u percent done", m_bufferInfo.bufferPercent);
-				gst_message_parse_buffering_stats(msg, &mode, &(m_bufferInfo.avgInRate), &(m_bufferInfo.avgOutRate), &(m_bufferInfo.bufferingLeft));
-				m_event((iPlayableService*)this, evBuffering);
+				// eDebug("[eServiceMP3] Buffering %u percent done", m_bufferInfo.bufferPercent);
+				// gst_message_parse_buffering_stats(msg, &mode, &(m_bufferInfo.avgInRate), &(m_bufferInfo.avgOutRate),
+				// &(m_bufferInfo.bufferingLeft)); m_event((iPlayableService*)this, evBuffering);
 				/*
 				 * we don't react to buffer level messages, unless we are configured to use a prefill buffer
 				 * (even if we are not configured to, we still use the buffer, but we rely on it to remain at the
@@ -6368,35 +4137,35 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 				 * (in which case the sink will not produce data while paused, so we won't
 				 * recover from an empty buffer)
 				 */
-				if (m_use_prefillbuffer && !m_is_live && !m_sourceinfo.is_hls && !m_sourceinfo.is_dash && --m_ignore_buffering_messages <= 0)
+				if (m_use_prefillbuffer && !m_is_live && !m_sourceinfo.is_hls)
 				{
-					if (m_bufferInfo.bufferPercent == 100)
+					--m_ignore_buffering_messages;
+					if (m_ignore_buffering_messages <= 0)
 					{
-						GstState state;
-						gst_element_get_state(m_gst_playbin, &state, NULL, 0LL);
-						if (state != GST_STATE_PLAYING)
-						{
-							eDebug("[eServiceMP3] start playing");
-							gst_element_set_state (m_gst_playbin, GST_STATE_PLAYING);
+						if (m_bufferInfo.bufferPercent == 100) {
+							GstState state, pending;
+							/* avoid setting to play while still in async state change mode */
+							gst_element_get_state(m_gst_playbin, &state, &pending, 5 * GST_SECOND);
+							if (state != GST_STATE_PLAYING && !m_first_paused) {
+								eDebug("[eServiceMP3] *** PREFILL BUFFER action start playing *** pending state was %s",
+									   pending == GST_STATE_VOID_PENDING ? "NO_PENDING" : "A_PENDING_STATE");
+								gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
+							}
+							/*
+							 * when we start the pipeline, the contents of the buffer will immediately drain
+							 * into the (hardware buffers of the) sinks, so we will receive low buffer level
+							 * messages right away.
+							 * Ignore the first few buffering messages, giving the buffer the chance to recover
+							 * a bit, before we start handling empty buffer states again.
+							 */
+							m_ignore_buffering_messages = 10;
+						} else if (m_bufferInfo.bufferPercent == 0 && !m_first_paused) {
+							eDebug("[eServiceMP3] *** PREFILLBUFFER action start pause ***");
+							gst_element_set_state(m_gst_playbin, GST_STATE_PAUSED);
+							m_ignore_buffering_messages = 0;
+						} else {
+							m_ignore_buffering_messages = 0;
 						}
-						/*
-						 * when we start the pipeline, the contents of the buffer will immediately drain
-						 * into the (hardware buffers of the) sinks, so we will receive low buffer level
-						 * messages right away.
-						 * Ignore the first few buffering messages, giving the buffer the chance to recover
-						 * a bit, before we start handling empty buffer states again.
-						 */
-						m_ignore_buffering_messages = 5;
-					}
-					else if (m_bufferInfo.bufferPercent == 0)
-					{
-						eDebug("[eServiceMP3] start pause");
-						gst_element_set_state (m_gst_playbin, GST_STATE_PAUSED);
-						m_ignore_buffering_messages = 0;
-					}
-					else
-					{
-						m_ignore_buffering_messages = 0;
 					}
 				}
 			}
@@ -6404,13 +4173,20 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 		default:
 			break;
 	}
-	g_free (sourceName);
+	g_free(sourceName);
 }
 
-void eServiceMP3::handleMessage(GstMessage *msg)
-{
-	if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_STATE_CHANGED && GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
-	{
+/**
+ * @brief Handles GStreamer bus messages.
+ *
+ * This function processes GStreamer bus messages and handles various message types,
+ * such as state changes, end-of-stream (EOS), and errors. It sends the messages to
+ * a message pump for further processing.
+ *
+ * @param[in] msg The GStreamer message to process.
+ */
+void eServiceMP3::handleMessage(GstMessage* msg) {
+	if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_STATE_CHANGED && GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin)) {
 		/*
 		 * ignore verbose state change messages for all active elements;
 		 * we only need to handle state-change events for the playbin
@@ -6421,150 +4197,166 @@ void eServiceMP3::handleMessage(GstMessage *msg)
 	m_pump.send(new GstMessageContainer(1, msg, NULL, NULL));
 }
 
-static bool isAdMarkerStructure(const GstStructure *s);
-GstBusSyncReply eServiceMP3::gstBusSyncHandler(GstBus *bus, GstMessage *message, gpointer user_data)
-{
-	eServiceMP3 *_this = (eServiceMP3*)user_data;
-	if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ELEMENT && isAdMarkerStructure(gst_message_get_structure(message)))
-		return GST_BUS_DROP; /* SCTE-35 section / emsg message: ignored */
-	if (_this) _this->handleMessage(message);
+/**
+ * @brief GStreamer bus sync handler.
+ *
+ * This function is called when a GStreamer bus message is received. It processes the
+ * message and calls the handleMessage function to handle it.
+ *
+ * @param[in] bus The GStreamer bus.
+ * @param[in] message The GStreamer message to process.
+ * @param[in] user_data User data passed to the handler.
+ * @return GST_BUS_DROP to drop the message after processing.
+ */
+GstBusSyncReply eServiceMP3::gstBusSyncHandler(GstBus* bus, GstMessage* message, gpointer user_data) {
+	eServiceMP3* _this = (eServiceMP3*)user_data;
+	if (_this)
+		_this->handleMessage(message);
 	return GST_BUS_DROP;
 }
-/*Processing TOC CVR */
-void eServiceMP3::HandleTocEntry(GstMessage *msg)
-{
+
+
+/**
+ * @brief Handles TOC entries from GStreamer messages.
+ *
+ * This function processes TOC entries from GStreamer messages, specifically for
+ * video media. It extracts chapter information and updates the cue entries.
+ *
+ * @param[in] msg The GStreamer message containing TOC entries.
+ */
+void eServiceMP3::HandleTocEntry(GstMessage* msg) {
 	/* limit TOC to dvbvideosink cue sheet only works for video media */
-	if (!strncmp(GST_MESSAGE_SRC_NAME(msg), "dvbvideosink", 12))
-	{
-		GstToc *toc;
+	if (!strncmp(GST_MESSAGE_SRC_NAME(msg), "dvbvideosink", 12)) {
+		GstToc* toc;
 		gboolean updated;
 		gst_message_parse_toc(msg, &toc, &updated);
-		for (GList* i = gst_toc_get_entries(toc); i; i = i->next)
-		{
-			GstTocEntry *entry = static_cast<GstTocEntry*>(i->data);
-			if (gst_toc_entry_get_entry_type (entry) == GST_TOC_ENTRY_TYPE_EDITION)
-			{
-				/* extra debug info for testing purposes CVR should_be_removed later on */
-				eTrace("[eServiceMP3] toc_type %s", gst_toc_entry_type_get_nick(gst_toc_entry_get_entry_type (entry)));
+		for (GList* i = gst_toc_get_entries(toc); i; i = i->next) {
+			GstTocEntry* entry = static_cast<GstTocEntry*>(i->data);
+			if (gst_toc_entry_get_entry_type(entry) == GST_TOC_ENTRY_TYPE_EDITION &&
+				eConfigManager::getConfigBoolValue("config.usage.useChapterInfo", true)) {
+				/* extra debug info for testing purposes should_be_removed later on */
+				// eDebug("[eServiceMP3] toc_type %s", gst_toc_entry_type_get_nick(gst_toc_entry_get_entry_type
+				// (entry)));
 				gint y = 0;
-				for (GList* x = gst_toc_entry_get_sub_entries (entry); x; x = x->next)
-				{
-					GstTocEntry *sub_entry = static_cast<GstTocEntry*>(x->data);
-					if (gst_toc_entry_get_entry_type (sub_entry) == GST_TOC_ENTRY_TYPE_CHAPTER)
-					{
-						if (y == 0)
-						{
+				for (GList* x = gst_toc_entry_get_sub_entries(entry); x; x = x->next) {
+					GstTocEntry* sub_entry = static_cast<GstTocEntry*>(x->data);
+					if (gst_toc_entry_get_entry_type(sub_entry) == GST_TOC_ENTRY_TYPE_CHAPTER) {
+						if (y == 0) {
 							m_use_chapter_entries = true;
-							if (m_cuesheet_loaded)
-								m_cue_entries.clear();
-							else
+							if (!m_cuesheet_loaded)
 								loadCuesheet();
 						}
 						/* first chapter is movie start no cut needed */
-						else if (y >= 1)
-						{
+						else if (y >= 1) {
 							gint64 start = 0;
 							gint64 pts = 0;
-							gint type = 0;
+							guint type = 0;
 							gst_toc_entry_get_start_stop_times(sub_entry, &start, NULL);
 							type = 2;
-							if(start > 0)
+							if (start > 0)
 								pts = start / 11111;
-							if (pts > 0)
-							{
-								m_cue_entries.insert(cueEntry(pts, type));
-								/* extra debug info for testing purposes CVR should_be_removed later on */
-								eTrace("[eServiceMP3] toc_subtype %s,Nr = %d, start= %#" G_GINT64_MODIFIER "x",
-										gst_toc_entry_type_get_nick(gst_toc_entry_get_entry_type (sub_entry)), y + 1, pts);
+							if (pts > 0) {
+								/* check cue and toc for identical entries */
+								bool tocadd = true;
+								for (std::multiset<cueEntry>::iterator i(m_cue_entries.begin());
+									 i != m_cue_entries.end(); ++i) {
+									/* toc not add if cue available */
+									if (pts == i->where && type == i->what) {
+										tocadd = false;
+										break;
+									}
+								}
+								if (tocadd) {
+									m_cue_entries.insert(cueEntry(pts, type));
+								}
+								m_cuesheet_changed = 1;
+								m_event((iPlayableService*)this, evCuesheetChanged);
+								/* extra debug info for testing purposes should_be_removed later on */
+								/*eDebug("[eServiceMP3] toc_subtype %s,Nr = %d, start= %#"G_GINT64_MODIFIER "x",
+										gst_toc_entry_type_get_nick(gst_toc_entry_get_entry_type (sub_entry)), y + 1,
+								   pts); */
 							}
 						}
 						y++;
 					}
 				}
-				if (y > 0)
-				{
-					m_cuesheet_changed = 1;
-					m_event((iPlayableService*)this, evCuesheetChanged);
-				}
 			}
 		}
-		eDebug("[eServiceMP3] TOC entry from source %s processed", GST_MESSAGE_SRC_NAME(msg));
-	}
-	else
-	{
-		eDebug("[eServiceMP3] TOC entry from source %s not used", GST_MESSAGE_SRC_NAME(msg));
+		// eDebug("[eServiceMP3] TOC entry from source %s processed", GST_MESSAGE_SRC_NAME(msg));
+	} else {
+		// eDebug("[eServiceMP3] TOC entry from source %s not used", GST_MESSAGE_SRC_NAME(msg));
+		;
 	}
 }
-void eServiceMP3::playbinNotifySource(GObject *object, GParamSpec *unused, gpointer user_data)
-{
-	GstElement *source = NULL;
-	eServiceMP3 *_this = (eServiceMP3*)user_data;
+
+/**
+ * @brief Callback function to notify when the source of the playbin changes.
+ *
+ * This function is called when the "source" property of the playbin changes.
+ * It sets various properties on the source element, such as timeout, retries,
+ * SSL strictness, user-agent, and extra headers.
+ *
+ * @param[in] object The GObject that emitted the signal.
+ * @param[in] unused Unused parameter (not used in this implementation).
+ * @param[in] user_data User data passed to the callback (eServiceMP3 instance).
+ */
+void eServiceMP3::playbinNotifySource(GObject* object, GParamSpec* unused, gpointer user_data) {
+	GstElement* source = NULL;
+	eServiceMP3* _this = (eServiceMP3*)user_data;
 	g_object_get(object, "source", &source, NULL);
-	if (source)
-	{
-		if (g_object_class_find_property(G_OBJECT_GET_CLASS(source), "timeout") != 0)
-		{
-			GstElementFactory *factory = gst_element_get_factory(source);
-			if (factory)
-			{
-				const gchar *sourcename = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
-				if (!strcmp(sourcename, "souphttpsrc"))
-				{
+	if (source) {
+		if (g_object_class_find_property(G_OBJECT_GET_CLASS(source), "timeout") != 0) {
+			GstElementFactory* factory = gst_element_get_factory(source);
+			if (factory) {
+				const gchar* sourcename = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
+				if (!strcmp(sourcename, "souphttpsrc")) {
 					g_object_set(G_OBJECT(source), "timeout", HTTP_TIMEOUT, NULL);
 					g_object_set(G_OBJECT(source), "retries", 20, NULL);
 				}
 			}
 		}
-		if (g_object_class_find_property(G_OBJECT_GET_CLASS(source), "ssl-strict") != 0)
-		{
+		if (g_object_class_find_property(G_OBJECT_GET_CLASS(source), "ssl-strict") != 0) {
 			g_object_set(G_OBJECT(source), "ssl-strict", FALSE, NULL);
 		}
-		if (g_object_class_find_property(G_OBJECT_GET_CLASS(source), "user-agent") != 0 && !_this->m_useragent.empty())
-		{
+		if (g_object_class_find_property(G_OBJECT_GET_CLASS(source), "user-agent") != 0 &&
+			!_this->m_useragent.empty()) {
 			g_object_set(G_OBJECT(source), "user-agent", _this->m_useragent.c_str(), NULL);
 		}
-		if (g_object_class_find_property(G_OBJECT_GET_CLASS(source), "extra-headers") != 0 && !_this->m_extra_headers.empty())
-		{
-			GstStructure *extras = gst_structure_new_empty("extras");
+		if (g_object_class_find_property(G_OBJECT_GET_CLASS(source), "extra-headers") != 0 &&
+			!_this->m_extra_headers.empty()) {
+			GstStructure* extras = gst_structure_new_empty("extras");
 			size_t pos = 0;
-			while (pos != std::string::npos)
-			{
+			while (pos != std::string::npos) {
 				std::string name, value;
 				size_t start = pos;
 				size_t len = std::string::npos;
 				pos = _this->m_extra_headers.find('=', pos);
-				if (pos != std::string::npos)
-				{
+				if (pos != std::string::npos) {
 					len = pos - start;
 					pos++;
 					name = _this->m_extra_headers.substr(start, len);
 					start = pos;
 					len = std::string::npos;
 					pos = _this->m_extra_headers.find('&', pos);
-					if (pos != std::string::npos)
-					{
+					if (pos != std::string::npos) {
 						len = pos - start;
 						pos++;
 					}
 					value = _this->m_extra_headers.substr(start, len);
 				}
-				if (!name.empty() && !value.empty())
-				{
+				if (!name.empty() && !value.empty()) {
 					GValue header;
-					eDebug("[eServiceMP3] setting extra-header '%s:%s'", name.c_str(), value.c_str());
+					// eDebug("[eServiceMP3] setting extra-header '%s:%s'", name.c_str(), value.c_str());
 					memset(&header, 0, sizeof(GValue));
 					g_value_init(&header, G_TYPE_STRING);
 					g_value_set_string(&header, value.c_str());
 					gst_structure_set_value(extras, name.c_str(), &header);
-				}
-				else
-				{
+				} else {
 					eDebug("[eServiceMP3] Invalid header format %s", _this->m_extra_headers.c_str());
 					break;
 				}
 			}
-			if (gst_structure_n_fields(extras) > 0)
-			{
+			if (gst_structure_n_fields(extras) > 0) {
 				g_object_set(G_OBJECT(source), "extra-headers", extras, NULL);
 			}
 			gst_structure_free(extras);
@@ -6573,270 +4365,192 @@ void eServiceMP3::playbinNotifySource(GObject *object, GParamSpec *unused, gpoin
 	}
 }
 
-/* ---- SCTE-35 / emsg ad-marker suppression -------------------------------
- * We never act on ad markers, so anything that carries them is thrown away
- * before it can reach an element that mishandles it (cencdec, the demuxers,
- * the dvb sinks). */
-static bool isAdMarkerStructure(const GstStructure *s)
-{
-	const gchar *n = s ? gst_structure_get_name(s) : NULL;
-	return n && (strcasestr(n, "scte") || strcasestr(n, "emsg") ||
-		strcasestr(n, "splice") || strcasestr(n, "mpegts-section") ||
-		strcasestr(n, "cue-out") || strcasestr(n, "cue-in") || strcasestr(n, "daterange"));
-}
+/**
+ * @brief Callback function to handle the addition of elements to a GStreamer bin.
+ *
+ * This function is called when an element is added to a GStreamer bin. It checks if the
+ * element is a queue2 element and sets its "temp-template" property based on the
+ * download buffer path. It also connects to the "element-added" signal for uridecodebin
+ * or decodebin elements to handle queue2 elements added there.
+ *
+ * @param[in] bin The GStreamer bin where the element was added.
+ * @param[in] element The GStreamer element that was added.
+ * @param[in] user_data User data passed to the callback (eServiceMP3 instance).
+ */
+void eServiceMP3::handleElementAdded(GstBin* bin, GstElement* element, gpointer user_data) {
+	eServiceMP3* _this = (eServiceMP3*)user_data;
+	if (_this) {
+		gchar* elementname = gst_element_get_name(element);
+		bool is_uridecodebin = g_str_has_prefix(elementname, "uridecodebin");
+		bool is_decodebin = g_str_has_prefix(elementname, "decodebin");
 
-static GstPadProbeReturn dropAdMarkerEventProbe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-	GstEvent *ev = GST_PAD_PROBE_INFO_EVENT(info);
-	if (!ev)
-		return GST_PAD_PROBE_OK;
-	switch (GST_EVENT_TYPE(ev))
-	{
-		case GST_EVENT_CUSTOM_DOWNSTREAM:
-		case GST_EVENT_CUSTOM_DOWNSTREAM_STICKY:
-		case GST_EVENT_CUSTOM_DOWNSTREAM_OOB:
-		case GST_EVENT_CUSTOM_BOTH:
-		case GST_EVENT_CUSTOM_BOTH_OOB:
-			if (isAdMarkerStructure(gst_event_get_structure(ev)))
-			{
-				eDebug("[eServiceMP3] dropped ad-marker event '%s' on %s:%s",
-					gst_structure_get_name(gst_event_get_structure(ev)),
-					GST_DEBUG_PAD_NAME(pad));
-				return GST_PAD_PROBE_DROP;
-			}
-			break;
-		default:
-			break;
-	}
-	return GST_PAD_PROBE_OK;
-}
-
-static void attachAdMarkerProbe(GstPad *pad)
-{
-	if (!pad)
-		return;
-	gst_pad_add_probe(pad, (GstPadProbeType)(GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_EVENT_BOTH),
-		dropAdMarkerEventProbe, NULL, NULL);
-}
-
-static void adMarkerPadAdded(GstElement *element, GstPad *pad, gpointer user_data)
-{
-	attachAdMarkerProbe(pad);
-}
-
-static void stripAdMarkersFromElement(GstElement *element, const char *fname)
-{
-	static const char *const demuxers[] = {
-		"dashdemux", "dashdemux2", "hlsdemux", "hlsdemux2", "adaptivedemux",
-		"tsdemux", "qtdemux", "cencdec", NULL };
-	bool match = false;
-	for (int i = 0; demuxers[i]; i++)
-		if (!strcmp(fname, demuxers[i])) { match = true; break; }
-	if (!match)
-		return;
-
-	/* tsdemux can forward SCTE-35 sections downstream - make sure it doesn't */
-	if (!strcmp(fname, "tsdemux") &&
-		g_object_class_find_property(G_OBJECT_GET_CLASS(element), "send-scte35-events"))
-		g_object_set(G_OBJECT(element), "send-scte35-events", FALSE, NULL);
-
-	/* existing pads (cencdec/qtdemux/tsdemux have static ones) ... */
-	GstIterator *it = gst_element_iterate_pads(element);
-	GValue v = G_VALUE_INIT;
-	bool done = false;
-	while (!done)
-	{
-		switch (gst_iterator_next(it, &v))
-		{
-			case GST_ITERATOR_OK:
-				attachAdMarkerProbe(GST_PAD(g_value_get_object(&v)));
-				g_value_reset(&v);
-				break;
-			case GST_ITERATOR_RESYNC:
-				gst_iterator_resync(it);
-				break;
-			default:
-				done = true;
-				break;
-		}
-	}
-	g_value_unset(&v);
-	gst_iterator_free(it);
-	/* ... and the ones that appear later (dashdemux/hlsdemux/tsdemux src pads) */
-	g_signal_connect(element, "pad-added", G_CALLBACK(adMarkerPadAdded), NULL);
-	eDebug("[eServiceMP3] ad-marker (SCTE-35) filter installed on %s", fname);
-}
-
-void eServiceMP3::handleDeepElementAdded(GstBin *bin, GstBin *sub_bin, GstElement *element, gpointer user_data)
-{
-	eServiceMP3 *_this = (eServiceMP3*)user_data;
-	GstElementFactory *factory = gst_element_get_factory(element);
-	if (!_this || !factory)
-		return;
-	stripAdMarkersFromElement(element, gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)));
-	if (_this->m_clearkeys.empty())
-		return;
-	if (strcmp(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)), "cencdec") != 0)
-		return;
-	if (!g_object_class_find_property(G_OBJECT_GET_CLASS(element), "clearkeys"))
-	{
-		eDebug("[eServiceMP3] cencdec has no 'clearkeys' property, installed plugin is not the patched build");
-		return;
-	}
-	eDebug("[eServiceMP3] passing clearkeys to cencdec");
-	g_object_set(G_OBJECT(element), "clearkeys", _this->m_clearkeys.c_str(), NULL);
-}
-
-void eServiceMP3::handleElementAdded(GstBin *bin, GstElement *element, gpointer user_data)
-{
-	eServiceMP3 *_this = (eServiceMP3*)user_data;
-	if (_this)
-	{
-		gchar *elementname = gst_element_get_name(element);
-
-		if (g_str_has_prefix(elementname, "queue2"))
-		{
-			if (_this->m_download_buffer_path != "")
-			{
+		if (g_str_has_prefix(elementname, "queue2")) {
+			if (_this->m_download_buffer_path != "") {
 				g_object_set(G_OBJECT(element), "temp-template", _this->m_download_buffer_path.c_str(), NULL);
-			}
-			else
-			{
+			} else {
 				g_object_set(G_OBJECT(element), "temp-template", NULL, NULL);
 			}
-		}
-		else if (g_str_has_prefix(elementname, "uridecodebin")
-			|| g_str_has_prefix(elementname, "decodebin"))
-		{
+		} else if (is_uridecodebin || is_decodebin) {
 			/*
 			 * Listen for queue2 element added to uridecodebin/decodebin2 as well.
 			 * Ignore other bins since they may have unrelated queues
 			 */
-				g_signal_connect(element, "element-added", G_CALLBACK(handleElementAdded), user_data);
+			g_signal_connect(element, "element-added", G_CALLBACK(handleElementAdded), user_data);
 		}
 		g_free(elementname);
 	}
 }
 
-audiotype_t eServiceMP3::gstCheckAudioPad(GstStructure* structure)
-{
+/**
+ * @brief Checks the audio pad structure to determine the audio type.
+ *
+ * This function checks the given GstStructure to determine the audio type
+ * based on the codec information present in the structure.
+ *
+ * @param[in] structure The GstStructure to check.
+ * @return The detected audio type as an audiotype_t enum value.
+ */
+audiotype_t eServiceMP3::gstCheckAudioPad(GstStructure* structure) {
 	if (!structure)
 		return atUnknown;
 
-	if ( gst_structure_has_name (structure, "audio/mpeg"))
-	{
+	if (gst_structure_has_name(structure, "audio/mpeg")) {
 		gint mpegversion, layer = -1;
-		if (!gst_structure_get_int (structure, "mpegversion", &mpegversion))
+		if (!gst_structure_get_int(structure, "mpegversion", &mpegversion))
 			return atUnknown;
 
 		switch (mpegversion) {
-			case 1:
-				{
-					gst_structure_get_int (structure, "layer", &layer);
-					if ( layer == 3 )
-						return atMP3;
-					else
-						return atMPEG;
-					break;
-				}
+			case 1: {
+				gst_structure_get_int(structure, "layer", &layer);
+				return (layer == 3) ? atMP3 : atMPEG;
+			}
 			case 2:
 				return atAAC;
 			case 4:
-				return atAACHE;
+				return atAAC;
 			default:
 				return atUnknown;
 		}
 	}
 
-	else if ( gst_structure_has_name (structure, "audio/x-ac3") || gst_structure_has_name (structure, "audio/ac3") )
+	else if (gst_structure_has_name(structure, "audio/x-ac3") || gst_structure_has_name(structure, "audio/ac3"))
 		return atAC3;
-	else if (gst_structure_has_name (structure, "audio/x-eac3") || gst_structure_has_name (structure, "audio/eac3") || gst_structure_has_name (structure, "audio/x-true-hd") || gst_structure_has_name (structure, "audio/xTrueHD"))
+	else if (gst_structure_has_name(structure, "audio/x-eac3") || gst_structure_has_name(structure, "audio/eac3") ||
+			 gst_structure_has_name(structure, "audio/x-true-hd") || gst_structure_has_name(structure, "audio/xTrueHD"))
 		return atEAC3;
-	else if ( gst_structure_has_name (structure, "audio/x-dts") || gst_structure_has_name (structure, "audio/dts") )
+	else if (gst_structure_has_name(structure, "audio/x-dts") || gst_structure_has_name(structure, "audio/dts"))
 		return atDTS;
-	else if ( gst_structure_has_name (structure, "audio/x-dtshd") || gst_structure_has_name (structure, "audio/dtshd") )
-		return atDTSHD;
-	else if ( gst_structure_has_name (structure, "audio/x-aache") || gst_structure_has_name (structure, "audio/aache") || gst_structure_has_name (structure, "audio/x-heaac") || gst_structure_has_name (structure, "audio/heaac") )
-		return atAACHE;
-	else if ( gst_structure_has_name (structure, "audio/x-aac") || gst_structure_has_name (structure, "audio/aac") )
-		return atAAC;
 
 	return atPCM;
 }
 
-void eServiceMP3::gstPoll(ePtr<GstMessageContainer> const &msg)
-{
-	switch (msg->getType())
-	{
-		case 1:
-		{
-			GstMessage *gstmessage = *((GstMessageContainer*)msg);
-			if (gstmessage)
-			{
+/**
+ * @brief Polls the message pump for GStreamer messages.
+ *
+ * This function processes messages from the message pump and handles different
+ * types of messages, such as GstMessageContainer, GstBuffer, and GstPad.
+ *
+ * @param[in] msg The GStreamer message to process.
+ */
+void eServiceMP3::gstPoll(ePtr<GstMessageContainer> const& msg) {
+	switch (msg->getType()) {
+		case 1: {
+			GstMessage* gstmessage = *((GstMessageContainer*)msg);
+			if (gstmessage) {
 				gstBusCall(gstmessage);
 			}
 			break;
 		}
-		case 2:
-		{
-			GstBuffer *buffer = *((GstMessageContainer*)msg);
-			if (buffer)
-			{
-				/* Captured (gstCBsubtitleAvail()) before the last subtitle
-				 * switch: still holds the previous track's raw bytes and
-				 * would be parsed as though it were the current track's -
-				 * see m_subtitle_generation's own comment. */
-				if (msg->getGeneration() != m_subtitle_generation.load())
-					eDebug("[eServiceMP3] dropping stale subtitle buffer (gen %d, current %d)",
-						msg->getGeneration(), m_subtitle_generation.load());
-				else
-					pullSubtitle(buffer);
+		case 2: {
+			GstBuffer* buffer = *((GstMessageContainer*)msg);
+			if (buffer) {
+				/* queued before the last stream switch, or the switch is still deferred:
+				   the buffer still holds data of the previous track and would be fed to
+				   the parser of the new one */
+				if (m_subtitle_switch_deferred || msg->getGeneration() != m_subtitle_generation) {
+					break;
+				}
+				pullSubtitle(buffer);
 			}
 			break;
 		}
-		case 3:
-		{
-			GstPad *pad = *((GstMessageContainer*)msg);
+		case 3: {
+			GstPad* pad = *((GstMessageContainer*)msg);
 			gstTextpadHasCAPS_synced(pad);
 			break;
 		}
 	}
 }
 
-eAutoInitPtr<eServiceFactoryMP3> init_eServiceFactoryMP3(eAutoInitNumbers::service+1, "eServiceFactoryMP3");
+/**
+ * @brief Initializes the eServiceFactoryMP3 class.
+ *
+ * This function initializes the eServiceFactoryMP3 class, which is responsible for
+ * creating instances of eServiceMP3. It sets the service number and name for the factory.
+ */
+eAutoInitPtr<eServiceFactoryMP3> init_eServiceFactoryMP3(eAutoInitNumbers::service + 1, "eServiceFactoryMP3");
 
-void eServiceMP3::gstCBsubtitleAvail(GstElement *subsink, GstBuffer *buffer, gpointer user_data)
-{
-	eServiceMP3 *_this = (eServiceMP3*)user_data;
-	if (_this->m_currentSubtitleStream < 0)
-	{
-		if (buffer) gst_buffer_unref(buffer);
+/**
+ * @brief Callback function to handle subtitle availability.
+ *
+ * This function is called when subtitles are available in the GstElement subsink.
+ * It sends the subtitle buffer to the message pump for further processing.
+ *
+ * @param[in] subsink The GstElement that provides subtitles.
+ * @param[in] buffer The GstBuffer containing the subtitle data.
+ * @param[in] user_data User data passed to the callback (eServiceMP3 instance).
+ */
+void eServiceMP3::gstCBsubtitleAvail(GstElement* subsink, GstBuffer* buffer, gpointer user_data) {
+	eServiceMP3* _this = (eServiceMP3*)user_data;
+	if (!_this || !buffer || !_this->m_subtitle_widget || _this->m_currentSubtitleStream < 0) {
+		if (buffer)
+			gst_buffer_unref(buffer);
 		return;
 	}
-	_this->m_pump.send(new GstMessageContainer(2, NULL, NULL, buffer, _this->m_subtitle_generation.load()));
+
+	/* Note: No bounds check on m_subtitleStreams here - this callback runs on
+	 * the GStreamer thread and m_subtitleStreams can be modified by the main
+	 * thread during stream re-enumeration. The bounds check is done in
+	 * pullSubtitle() which runs on the main thread via the pump. */	
+	_this->m_pump.send(new GstMessageContainer(2, nullptr, nullptr, buffer, _this->m_subtitle_generation.load()));
 }
 
-void eServiceMP3::gstTextpadHasCAPS(GstPad *pad, GParamSpec * unused, gpointer user_data)
-{
-	eServiceMP3 *_this = (eServiceMP3*)user_data;
+/**
+ * @brief Callback function to handle CAPS availability on a GstPad.
+ *
+ * This function is called when CAPS are available on a GstPad. It sends the pad
+ * to the message pump for further processing.
+ *
+ * @param[in] pad The GstPad that has CAPS available.
+ * @param[in] unused Unused parameter (not used in this implementation).
+ * @param[in] user_data User data passed to the callback (eServiceMP3 instance).
+ */
+void eServiceMP3::gstTextpadHasCAPS(GstPad* pad, GParamSpec* unused, gpointer user_data) {
+	eServiceMP3* _this = (eServiceMP3*)user_data;
 
-	gst_object_ref (pad);
+	gst_object_ref(pad);
 
 	_this->m_pump.send(new GstMessageContainer(3, NULL, pad, NULL));
 }
 
-void eServiceMP3::gstTextpadHasCAPS_synced(GstPad *pad)
-{
-	GstCaps *caps = NULL;
+/**
+ * @brief Callback function to handle CAPS availability on a GstPad, synchronized.
+ *
+ * This function is called when CAPS are available on a GstPad. It retrieves the
+ * CAPS and processes them to update subtitle streams.
+ *
+ * @param[in] pad The GstPad that has CAPS available.
+ */
+void eServiceMP3::gstTextpadHasCAPS_synced(GstPad* pad) {
+	GstCaps* caps = NULL;
 
-	g_object_get (G_OBJECT (pad), "caps", &caps, NULL);
+	g_object_get(G_OBJECT(pad), "caps", &caps, NULL);
 
-	if (caps)
-	{
+	if (caps) {
 		subtitleStream subs;
 
-		eDebug("[eServiceMP3] gstTextpadHasCAPS:: signal::caps = %s", gst_caps_to_string(caps));
-//		eDebug("[eServiceMP3] gstGhostpadHasCAPS_synced %p %d", pad, m_subtitleStreams.size());
+		//		eDebug("[eServiceMP3] gstTextpadHasCAPS:: signal::caps = %s", gst_caps_to_string(caps));
+		//		eDebug("[eServiceMP3] gstGhostpadHasCAPS_synced %p %d", pad, m_subtitleStreams.size());
 
 		if (m_currentSubtitleStream >= 0 && m_currentSubtitleStream < (int)m_subtitleStreams.size())
 			subs = m_subtitleStreams[m_currentSubtitleStream];
@@ -6845,20 +4559,21 @@ void eServiceMP3::gstTextpadHasCAPS_synced(GstPad *pad)
 			subs.pad = pad;
 		}
 
-		if ( subs.type == stUnknown )
-		{
-			GstTagList *tags = NULL;
-			gchar *g_lang = NULL;
-			g_signal_emit_by_name (m_gst_playbin, "get-text-tags", m_currentSubtitleStream, &tags);
+		if (subs.type == stUnknown) {
+			GstTagList* tags = NULL;
+			gchar *g_lang = NULL, *g_lang_title = NULL;
+			g_signal_emit_by_name(m_gst_playbin, "get-text-tags", m_currentSubtitleStream, &tags);
 
 			subs.language_code = "und";
-			subs.type = getSubtitleType(pad);
-			if (tags && GST_IS_TAG_LIST(tags))
-			{
-				if (gst_tag_list_get_string(tags, GST_TAG_LANGUAGE_CODE, &g_lang))
-				{
+			subs.type = getSubtitleType(pad, NULL, &subs.cc_payload_type);
+			if (tags && GST_IS_TAG_LIST(tags)) {
+				if (gst_tag_list_get_string(tags, GST_TAG_LANGUAGE_CODE, &g_lang)) {
 					subs.language_code = std::string(g_lang);
 					g_free(g_lang);
+				}
+				if (gst_tag_list_get_string(tags, GST_TAG_TITLE, &g_lang_title)) {
+					subs.title = g_lang_title;
+					g_free(g_lang_title);
 				}
 				gst_tag_list_free(tags);
 			}
@@ -6869,105 +4584,148 @@ void eServiceMP3::gstTextpadHasCAPS_synced(GstPad *pad)
 				m_subtitleStreams.push_back(subs);
 		}
 
-//		eDebug("[eServiceMP3] gstGhostpadHasCAPS:: m_gst_prev_subtitle_caps=%s equal=%i",gst_caps_to_string(m_gst_prev_subtitle_caps),gst_caps_is_equal(m_gst_prev_subtitle_caps, caps));
+		// eDebug("[eServiceMP3] gstGhostpadHasCAPS:: m_gst_prev_subtitle_caps=%s
+		// equal=%i",gst_caps_to_string(m_gst_prev_subtitle_caps),gst_caps_is_equal(m_gst_prev_subtitle_caps, caps));
 
-		gst_caps_unref (caps);
+		gst_caps_unref(caps);
 	}
 }
 
-void eServiceMP3::pullSubtitle(GstBuffer *buffer)
-{
-	if (buffer && m_currentSubtitleStream >= 0 && m_currentSubtitleStream < (int)m_subtitleStreams.size())
-	{
+/**
+ * @brief Pulls subtitles from a GstBuffer and processes them.
+ *
+ * This function extracts subtitle data from the given GstBuffer and processes it
+ * based on the current subtitle stream type. It supports WebVTT, DVB, and text subtitles.
+ *
+ * @param[in] buffer The GstBuffer containing subtitle data.
+ */
+void eServiceMP3::pullSubtitle(GstBuffer* buffer) {
+	if (buffer && m_currentSubtitleStream >= 0 && m_currentSubtitleStream < (int)m_subtitleStreams.size()) {
 		GstMapInfo map;
-		if(!gst_buffer_map(buffer, &map, GST_MAP_READ))
-		{
-			eLog(3, "[eServiceMP3] pullSubtitle gst_buffer_map failed");
+		if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
 			return;
-		}
-        int64_t buf_pos = GST_BUFFER_PTS(buffer);
-        if (!GST_CLOCK_TIME_IS_VALID((GstClockTime)buf_pos))
-        {
-            eDebug("[OPENATV_FULLPORT_1] subtitle buffer has no PTS; skipped");
-            gst_buffer_unmap(buffer, &map);
-            return;
-        }
-		size_t len = map.size;
-		eTrace("[eServiceMP3] gst_buffer_get_size %zu map.size %zu", gst_buffer_get_size(buffer), len);
-        int64_t duration_ns = GST_BUFFER_DURATION(buffer);
-        // OPENATV_FULLPORT_1: GStreamer uses a UINT64_MAX sentinel for
-        // unknown duration. In the legacy uint32_t maths this wrapped to a
-        // negative/zero end time, permanently dropping embedded text cues.
-        if (!GST_CLOCK_TIME_IS_VALID((GstClockTime)duration_ns) || duration_ns <= 0)
-            duration_ns = 2500LL * GST_MSECOND;
-
 		int subType = m_subtitleStreams[m_currentSubtitleStream].type;
-		eTrace("[eServiceMP3] pullSubtitle type=%d size=%zu", subType, len);
-		if ( subType )
-		{
-			if (subType == stDVB)
-			{
-				uint8_t * data = map.data;
-				m_dvb_subtitle_parser->processBuffer(data, len, buf_pos / 1000000ULL);
+		if (subType == stWebVTT) {
+			std::string vtt_string(reinterpret_cast<char*>(map.data), map.size);
+			std::vector<SubtitleEntry> parsed_subs;
+
+			// eDebug("SUB DEBUG line");
+			// eDebug(">>>\n%s\n<<<", vtt_string.c_str());
+
+			if (parseWebVTT(vtt_string, parsed_subs)) {
+				for (const auto& sub : parsed_subs) {
+					if (sub.vtt_mpegts_base) {
+						if (!m_vtt_live)
+							m_vtt_live = true; // Set live flag if we have a base MPEGTS
+						int64_t decoder_pts = getLiveDecoderTime();
+						int64_t delta = 0;
+
+						// Initialize base MPEGTS with first subtitle's MPEGTS
+						if (m_base_mpegts == -1) {
+							m_base_mpegts = sub.vtt_mpegts_base;
+						}
+
+						if (decoder_pts >= 0) {
+							// Calculate delta based on MPEGTS difference
+							delta = (sub.vtt_mpegts_base - m_base_mpegts) / 90; // Convert to ms
+						}
+
+						int64_t adjusted_start = sub.start_time_ms + delta;
+						int64_t adjusted_end = sub.end_time_ms + delta;
+
+						std::lock_guard<std::mutex> lock(m_subtitle_pages_mutex);
+						m_subtitle_pages.insert(subtitle_pages_map_pair_t(
+							adjusted_end, subtitle_page_t(adjusted_start, adjusted_end, sub.text)));
+					} else {
+						m_subtitle_pages.insert(subtitle_pages_map_pair_t(
+							sub.end_time_ms, subtitle_page_t(sub.start_time_ms, sub.end_time_ms, sub.text)));
+					}
+				}
+				if (!parsed_subs.empty())
+					m_subtitle_sync_timer->start(250, true);
 			}
-			else if ( subType < stVOB )
-			{
-				int delay = eConfigManager::getConfigIntValue("config.subtitles.pango_subtitles_delay");
-				int subtitle_fps = eConfigManager::getConfigIntValue("config.subtitles.pango_subtitles_fps");
-
-				double convert_fps = 1.0;
-				if (subtitle_fps > 1 && m_framerate > 0)
-					convert_fps = subtitle_fps / (double)m_framerate;
-
-				std::string line((const char*)map.data, len);
-				// some media muxers do add an extra new line at the end off a muxed/reencoded srt to ssa codec
-				if (!line.empty() && line[line.length()-1] == '\n')
-					line.erase(line.length()-1);
-
-				eTrace("[eServiceMP3] got new text subtitle @ buf_pos = %lld ns (in pts=%lld), dur=%lld: '%s' ", buf_pos, buf_pos/11111, duration_ns, line.c_str());
-
-				uint32_t start_ms = ((buf_pos / 1000000ULL) * convert_fps) + (delay / 90);
-				uint32_t end_ms = start_ms + (duration_ns / 1000000ULL);
-				m_subtitle_pages.insert(subtitle_pages_map_pair_t(end_ms, subtitle_page_t(start_ms, end_ms, line)));
-				m_subtitle_sync_timer->start(1, true);
-			}
+		} else if (subType == stPGS) {
+			GstClockTime buf_pos = GST_BUFFER_PTS(buffer);
+			if (GST_CLOCK_TIME_IS_VALID(buf_pos))
+				m_pgs_subtitle_parser->processBuffer(map.data, map.size, buf_pos / 1000000ULL);
 			else
-			{
-				eLog(3, "[eServiceMP3] unsupported subpicture... ignoring");
+				eDebug("[eServiceMP3] PGS buffer without pts, dropped");
+		} else if (subType == stDVB) {
+			GstClockTime buf_pos = GST_BUFFER_PTS(buffer);
+			if (GST_CLOCK_TIME_IS_VALID(buf_pos))
+				m_dvb_subtitle_parser->processBuffer(map.data, map.size, buf_pos / 1000000ULL);
+			else
+				eDebug("[eServiceMP3] DVB subtitle buffer without pts, dropped");
+		} else if (subType == stCC) {
+			int payload = m_subtitleStreams[m_currentSubtitleStream].cc_payload_type;
+			GstClockTime pts = GST_BUFFER_PTS(buffer);
+			if (payload >= 0 && map.size && GST_CLOCK_TIME_IS_VALID(pts)) {
+				std::vector<uint16_t> pairs;
+				eCea608Decoder::extractField1Pairs(payload, map.data, map.size, pairs);
+				if (!pairs.empty()) {
+					int64_t ms = (int64_t)(pts / 1000000);
+					{
+						std::lock_guard<std::mutex> lock(m_cc_queue_mutex);
+						for (uint16_t pair : pairs)
+							m_cc_track.enqueue(ms, pair);
+					}
+					if (m_cc_enabled && !m_cc_sync_timer->isActive())
+						m_cc_sync_timer->start(100, true);
+				}
+			}
+		} else if (subType < stVOB) {
+			GstClockTime buf_pos = GST_BUFFER_PTS(buffer);
+			GstClockTime buf_dur = GST_BUFFER_DURATION(buffer);
+			if (!GST_CLOCK_TIME_IS_VALID(buf_pos)) {
+				eDebug("[eServiceMP3] text subtitle buffer without pts, dropped");
+			} else {
+				std::string line(reinterpret_cast<char*>(map.data), map.size);
+				uint32_t start_ms = buf_pos / 1000000ULL;
+				uint32_t duration = GST_CLOCK_TIME_IS_VALID(buf_dur) ? buf_dur / 1000000ULL : 0;
+				uint32_t end_ms = start_ms + duration;
+				// eDebug("[eServiceMP3] got new text subtitle @ start_ms=%d / dur=%d: '%s' ", start_ms, duration,
+				// line.c_str());
+
+				m_subtitle_pages.insert(subtitle_pages_map_pair_t(end_ms, subtitle_page_t(start_ms, end_ms, line)));
+				m_subtitle_sync_timer->start(250, true);
 			}
 		}
 		gst_buffer_unmap(buffer, &map);
 	}
 }
 
-void eServiceMP3::newDVBSubtitlePage(const eDVBSubtitlePage &p)
-{
+/**
+ * @brief Adds a new DVB subtitle page to the list and pushes it to the subtitle widget.
+ *
+ * This function adds a new DVB subtitle page to the list of pages and triggers
+ * the subtitle widget to display it.
+ *
+ * @param[in] p The eDVBSubtitlePage to add.
+ */
+void eServiceMP3::newDVBSubtitlePage(const eDVBSubtitlePage& p) {
 	m_dvb_subtitle_pages.push_back(p);
 	pushDVBSubtitles();
 }
 
-void eServiceMP3::pushDVBSubtitles()
-{
+/**
+ * @brief Pushes DVB subtitles to the subtitle widget.
+ *
+ * This function processes the DVB subtitle pages and displays them in the
+ * subtitle widget based on the current decoder time.
+ */
+void eServiceMP3::pushDVBSubtitles() {
 	pts_t running_pts = 0, decoder_ms;
 
-	/* show_time comes from raw GStreamer buffer PTS (see pullSubtitle()), so
-	 * this must be compared against the same raw domain, not the
-	 * display-corrected getPlayPosition(). */
-	if ((!m_sourceinfo.is_streaming && !m_is_live && m_sourceinfo.is_video)
-            ? getPlayPosition(running_pts) < 0
-            : getRawPlayPosition(running_pts) < 0)
+	if (getPlayPosition(running_pts) < 0)
 		eTrace("[eServiceMP3] Cant get current decoder time.");
 
-	while (1)
-	{
+	while (1) {
 		eDVBSubtitlePage dvb_page;
 		pts_t show_time;
-		if (!m_dvb_subtitle_pages.empty())
-		{
+		if (!m_dvb_subtitle_pages.empty()) {
 			dvb_page = m_dvb_subtitle_pages.front();
 			show_time = dvb_page.m_show_time;
-		}
-		else
+		} else
 			return;
 
 		decoder_ms = running_pts / 90;
@@ -6976,270 +4734,722 @@ void eServiceMP3::pushDVBSubtitles()
 		// If cant get decoder PTS then display the subtitles.
 		// If not, pause subtitle processing until the subtitle should be shown
 		pts_t diff = show_time - decoder_ms;
-		if (diff < 20 || decoder_ms == 0)
-		{
-			eTrace("[eServiceMP3] Showing subtitles at %lld. Current decoder time: %lld. Difference: %lld", show_time, decoder_ms, diff);
-			m_subtitle_widget->setPage(dvb_page);
+		if (diff < 20 || decoder_ms == 0) {
+			eTrace("[eServiceMP3] Showing subtitles at %lld. Current decoder time: %lld. Difference: %lld", show_time,
+				   decoder_ms, diff);
+			if (m_subtitle_widget)
+				m_subtitle_widget->setPage(dvb_page);
 			m_dvb_subtitle_pages.pop_front();
-		}
-		else
-		{
-			eDebug("[eServiceMP3] Delay early subtitle by %.03fs. Page stack size %d", diff / 1000.0f, m_dvb_subtitle_pages.size());
+		} else {
+			eDebug("[eServiceMP3] Delay early subtitle by %.03fs. Page stack size %zu", diff / 1000.0f,
+				   m_dvb_subtitle_pages.size());
 			m_dvb_subtitle_sync_timer->start(diff, 1);
 			break;
 		}
 	}
 }
 
-void eServiceMP3::pushSubtitles()
-{
+/**
+ * @brief Pushes subtitles to the subtitle widget.
+ *
+ * This function processes the subtitle pages and displays them in the
+ * subtitle widget based on the current decoder time. It handles both live
+ * streams and VOD content, applying necessary delays and conversions.
+ */
+void eServiceMP3::pushSubtitles() {
 	pts_t running_pts = 0;
-	int32_t next_timer = 0, decoder_ms, start_ms, end_ms, diff_start_ms, diff_end_ms;
+	int32_t next_timer = 0, decoder_ms = 0, start_ms, end_ms, diff_start_ms, diff_end_ms, delay_ms;
+	double convert_fps = 1.0;
 	subtitle_pages_map_t::iterator current;
 
 	if (m_currentSubtitleStream < 0 || m_currentSubtitleStream >= (int)m_subtitleStreams.size())
 		return;
 
-	// wait until clock is stable
-
-	/* start_ms/end_ms below come from raw GStreamer buffer PTS (see
-	 * pullSubtitle()), so this must be compared against the same raw domain,
-	 * not the display-corrected getPlayPosition(). */
-	if ((!m_sourceinfo.is_streaming && !m_is_live && m_sourceinfo.is_video)
-            ? getPlayPosition(running_pts) < 0
-            : getRawPlayPosition(running_pts) < 0)
-		m_decoder_time_valid_state = 0;
-
-	if (m_decoder_time_valid_state < 4)
-	{
-		m_decoder_time_valid_state++;
-
-		if (m_prev_decoder_time == running_pts)
+	// For live streams, get decoder time directly from videosink
+	if (m_vtt_live && dvb_videosink) {
+		gint64 pos = 0;
+		gboolean success = FALSE;
+		g_signal_emit_by_name(dvb_videosink, "get-decoder-time", &pos, &success);
+		if (success && GST_CLOCK_TIME_IS_VALID(pos) && pos > 0) {
+			// Convert from nanoseconds back to ms
+			decoder_ms = pos / 1000000;
+			running_pts = pos / 11111;
+			m_decoder_time_valid_state = 4;
+		} else {
+			// If we can't get valid decoder time, use fallback for WebVTT
+			if (m_subtitleStreams[m_currentSubtitleStream].type == stWebVTT) {
+				m_decoder_time_valid_state = 4; // Consider clock stable
+				// Let decoder_ms stay 0 to trigger fallback
+			} else {
+				if (getPlayPosition(running_pts) < 0)
+					m_decoder_time_valid_state = 0;
+				decoder_ms = running_pts / 90;
+			}
+		}
+	} else {
+		// Original VOD logic
+		if (getPlayPosition(running_pts) < 0)
 			m_decoder_time_valid_state = 0;
+		if (m_decoder_time_valid_state == 0)
+			m_decoder_time_valid_state = 2;
+		else
+			m_decoder_time_valid_state = 4;
 
-		if (m_decoder_time_valid_state < 4)
-		{
-			//eDebug("[eServiceMP3] *** push subtitles, waiting for clock to stabilise");
-			m_prev_decoder_time = running_pts;
-			next_timer = 50;
-			goto exit;
+		if (m_decoder_time_valid_state < 4) {
+			m_decoder_time_valid_state++;
+
+			if (m_decoder_time_valid_state < 4) {
+				// eDebug("[eServiceMP3] *** push subtitles, waiting for clock to stabilise");
+				m_prev_decoder_time = running_pts;
+				next_timer = 100;
+				goto exit;
+			}
+
+			// eDebug("[eServiceMP3] *** push subtitles, clock stable");
 		}
 
-		//eDebug("[eServiceMP3] *** push subtitles, clock stable");
+		decoder_ms = running_pts / 90;
 	}
+	delay_ms = 0;
 
-	decoder_ms = running_pts / 90;
+	// eDebug("[eServiceMP3] pushSubtitles running_pts=%lld decoder_ms=%d delay=%d fps=%.2f", running_pts, decoder_ms,
+	//	   delay_ms, convert_fps);
 
 #if 0
-		eDebug("[eServiceMP3] *** all subs: ");
+    eDebug("\n*** all subs: ");
 
-		for (current = m_subtitle_pages.begin(); current != m_subtitle_pages.end(); current++)
-		{
-			start_ms = current->second.start_ms;
-			end_ms = current->second.end_ms;
-			diff_start_ms = start_ms - decoder_ms;
-			diff_end_ms = end_ms - decoder_ms;
-
-			eDebug("[eServiceMP3]    start: %d, end: %d, diff_start: %d, diff_end: %d: %s",
-					start_ms, end_ms, diff_start_ms, diff_end_ms, current->second.text.c_str());
-		}
-
-#endif
-
-	for (current = m_subtitle_pages.lower_bound(decoder_ms); current != m_subtitle_pages.end(); current++)
-	{
+    for (current = m_subtitle_pages.begin(); current != m_subtitle_pages.end(); current++) {
 		start_ms = current->second.start_ms;
 		end_ms = current->second.end_ms;
 		diff_start_ms = start_ms - decoder_ms;
 		diff_end_ms = end_ms - decoder_ms;
 
+	eDebug("[eServiceMP3] start: %d, end: %d, diff_start: %d, diff_end: %d: %s", start_ms, end_ms, diff_start_ms,
+	    diff_end_ms, current->second.text.c_str());
+    }
+
+    eDebug("\n\n");
+#endif
+	// Apply subtitle delay and fps conversion if needed
+	if (m_currentSubtitleStream >= 0 && m_currentSubtitleStream < (int)m_subtitleStreams.size() &&
+		m_subtitleStreams[m_currentSubtitleStream].type && m_subtitleStreams[m_currentSubtitleStream].type < stVOB) {
+		delay_ms = eConfigManager::getConfigIntValue("config.subtitles.pango_subtitles_delay") / 90;
+		int subtitle_fps = eConfigManager::getConfigIntValue("config.subtitles.pango_subtitles_fps");
+		if (subtitle_fps > 1 && m_framerate > 0)
+			convert_fps = subtitle_fps / (double)m_framerate;
+	}
+
+	// Clean up old subtitles for live streams to prevent memory growth
+	/*
+	if (m_vtt_live && !m_subtitle_pages.empty()) {
+		std::lock_guard<std::mutex> lock(m_subtitle_pages_mutex);
+		subtitle_pages_map_t::iterator it = m_subtitle_pages.begin();
+		while (it != m_subtitle_pages.end()) {
+			bool erase = false;
+			int end_ms = it->second.end_ms;
+
+			if (m_subtitleStreams[m_currentSubtitleStream].type == stWebVTT && m_is_live) {
+				int64_t now = getCurrentTimeMs();
+				if (m_vtt_live_base_time == -1 && !m_subtitle_pages.empty())
+					m_vtt_live_base_time = now - m_subtitle_pages.begin()->second.start_ms;
+				int64_t live_playback_time = now - m_vtt_live_base_time;
+				if ((end_ms - live_playback_time) < -5000) // 5 seconds
+					erase = true;
+			} else {
+				if ((end_ms - decoder_ms) < -5000)
+					erase = true;
+			}
+
+			if (erase) {
+				eDebug("[eServiceMP3] Cleaning up old subtitle: end=%d", end_ms);
+				it = m_subtitle_pages.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+	*/
+	for (current = m_subtitle_pages.begin(); current != m_subtitle_pages.end(); ++current) {
+		start_ms = current->second.start_ms;
+		end_ms = current->second.end_ms;
+
+		if (m_subtitleStreams[m_currentSubtitleStream].type == stWebVTT && m_vtt_live) {
+			// --- WebVTT LIVE WORKAROUND ---
+			int64_t now = getCurrentTimeMs();
+
+			if (m_vtt_live_base_time == -1)
+				m_vtt_live_base_time = now - start_ms;
+
+			int64_t live_playback_time = now - m_vtt_live_base_time;
+
+			diff_start_ms = start_ms - live_playback_time;
+			diff_end_ms = end_ms - live_playback_time;
+
+			// eDebug("[eServiceMP3] WebVTT LIVE: now=%" PRId64 " base=%" PRId64 " live_playback_time=%" PRId64
+			//	   " start=%d end=%d "
+			//	   "diff_start=%d diff_end=%d",
+			//	   now, m_vtt_live_base_time, live_playback_time, start_ms, end_ms, diff_start_ms, diff_end_ms);
+
+			if (diff_end_ms < -500) {
+				// eDebug("[eServiceMP3] *** current sub has already ended, skip: %d\n", diff_end_ms);
+				continue;
+			}
+			if (diff_start_ms > 10) {
+				// eDebug("[eServiceMP3] *** current sub in the future, start timer, %d\n", diff_start_ms);
+				next_timer = diff_start_ms;
+				goto exit;
+			}
+			// showtime for WebVTT
+			if (m_subtitle_widget && !m_paused) {
+				// eDebug("[eServiceMP3] *** current sub actual, show!");
+				ePangoSubtitlePage pango_page;
+				gRGB rgbcol(0xff, 0xff, 0xff); // White color for WebVTT
+				pango_page.m_elements.push_back(ePangoSubtitlePageElement(rgbcol, current->second.text));
+				pango_page.m_show_pts = start_ms * 90;
+				pango_page.m_timeout = diff_end_ms > 0 ? diff_end_ms : end_ms - start_ms;
+				m_subtitle_widget->setPage(pango_page);
+				continue;
+			}
+			// --- END WORKAROUND ---
+		} else if (m_subtitleStreams[m_currentSubtitleStream].type == stWebVTT) {
+			diff_start_ms = start_ms - decoder_ms;
+			diff_end_ms = end_ms - decoder_ms;
+
+			// eDebug("[eServiceMP3] WebVTT decoder timing: start_ms=%d end_ms=%d decoder_ms=%d diff_start=%d
+			// diff_end=%d", 	   start_ms, end_ms, decoder_ms, diff_start_ms, diff_end_ms);
+
+			if (diff_end_ms < -500) {
+				// eDebug("[eServiceMP3] *** current sub has already ended, skip: %d\n", diff_end_ms);
+				continue;
+			}
+			if (diff_start_ms > 10) {
+				// eDebug("[eServiceMP3] *** current sub in the future, start timer, %d\n", diff_start_ms);
+				next_timer = diff_start_ms;
+				goto exit;
+			}
+			if (m_subtitle_widget && !m_paused) {
+				// eDebug("[eServiceMP3] *** current sub actual, show!");
+				ePangoSubtitlePage pango_page;
+				gRGB rgbcol(0xff, 0xff, 0xff);
+				pango_page.m_elements.push_back(ePangoSubtitlePageElement(rgbcol, current->second.text));
+				pango_page.m_show_pts = start_ms * 90;
+				pango_page.m_timeout = diff_end_ms > 0 ? diff_end_ms : end_ms - start_ms;
+				m_subtitle_widget->setPage(pango_page);
+				continue;
+			}
+		} else {
+			start_ms = (current->second.start_ms * convert_fps) + delay_ms;
+			end_ms = (current->second.end_ms * convert_fps) + delay_ms;
+			diff_start_ms = start_ms - decoder_ms;
+			diff_end_ms = end_ms - decoder_ms;
+
+			const int64_t wrap_threshold = 1LL << 31;
+			const int64_t wrap_value = 1LL << 32;
+			if (diff_start_ms > wrap_threshold)
+				diff_start_ms -= wrap_value;
+			else if (diff_start_ms < -wrap_threshold)
+				diff_start_ms += wrap_value;
+			if (diff_end_ms > wrap_threshold)
+				diff_end_ms -= wrap_value;
+			else if (diff_end_ms < -wrap_threshold)
+				diff_end_ms += wrap_value;
+
 #if 0
-		eDebug("[eServiceMP3] *** next subtitle: decoder: %d, start: %d, end: %d, duration_ms: %d, diff_start: %d, diff_end: %d : %s",
-			decoder_ms, start_ms, end_ms, end_ms - start_ms, diff_start_ms, diff_end_ms, current->second.text.c_str());
+			eDebug("[eServiceMP3] *** next subtitle: decoder: %d start: %d, end: %d, duration_ms: %d, "
+				   "diff_start: %d, diff_end: %d : %s",
+				   decoder_ms, start_ms, end_ms, end_ms - start_ms, diff_start_ms, diff_end_ms,
+				   current->second.text.c_str());
 #endif
 
-		if (diff_end_ms < 0)
-		{
-			//eDebug("[eServiceMP3] *** current sub has already ended, skip: %d", diff_end_ms);
-			continue;
+			if (diff_end_ms < 0) {
+				// eDebug("[eServiceMP3] *** current sub has already ended, skip: %d\n", diff_end_ms);
+				continue;
+			}
+			if (diff_start_ms > 20) {
+				// eDebug("[eServiceMP3] *** current sub in the future, start timer, %d\n", diff_start_ms);
+				next_timer = diff_start_ms;
+				goto exit;
+			}
+			if (m_subtitle_widget && !m_paused) {
+				eDebug("[eServiceMP3] *** current sub actual, show!");
+				ePangoSubtitlePage pango_page;
+				gRGB rgbcol(0xD0, 0xD0, 0xD0);
+				pango_page.m_elements.push_back(ePangoSubtitlePageElement(rgbcol, current->second.text.c_str()));
+				pango_page.m_show_pts = start_ms * 90; // actually completely unused by widget!
+				if (!m_subtitles_paused)
+					pango_page.m_timeout = end_ms - decoder_ms; // take late start into account
+				else
+					pango_page.m_timeout = 60000;
+				// paused, subs must stay on (60s for now), avoid timeout in lib/gui/esubtitle.cpp:
+				// m_hide_subtitles_timer->start(m_pango_page.m_timeout, true);
+				m_subtitle_widget->setPage(pango_page);
+			}
 		}
-
-		if (diff_start_ms > 20)
-		{
-			//eDebug("[eServiceMP3] *** current sub in the future, start timer, %d", diff_start_ms);
-			next_timer = diff_start_ms;
-			goto exit;
-		}
-
-		// showtime
-
-		if (m_subtitle_widget && !m_paused)
-		{
-			//eDebug("[eServiceMP3] *** current sub actual, show!");
-
-			ePangoSubtitlePage pango_page;
-			gRGB rgbcol(0xD0,0xD0,0xD0);
-
-			pango_page.m_elements.push_back(ePangoSubtitlePageElement(rgbcol, current->second.text.c_str()));
-			pango_page.m_show_pts = start_ms * 90;			// actually completely unused by widget!
-			pango_page.m_timeout = end_ms - decoder_ms;		// take late start into account
-
-			eDebug("[OPENATV_FULLPORT_1] SUB_RENDER start_ms=%d clock_ms=%d timeout_ms=%d",
-                start_ms, decoder_ms, pango_page.m_timeout);
-            m_subtitle_widget->setPage(pango_page);
-		}
-
-		//eDebug("[eServiceMP3] *** no next sub scheduled, check NEXT subtitle");
+		// eDebug("[eServiceMP3] *** no next sub scheduled, check NEXT subtitle");
 	}
-
-	// no more subs in cache, fall through
 
 exit:
-	if (next_timer == 0)
-	{
-		//eDebug("[eServiceMP3] *** next timer = 0, set default timer!");
+	if (next_timer == 0) {
+		// eDebug("[eServiceMP3] *** next timer = 0, set default timer!");
 		next_timer = 1000;
 	}
-
 	m_subtitle_sync_timer->start(next_timer, true);
-
 }
 
-RESULT eServiceMP3::enableSubtitles(iSubtitleUser *user, struct SubtitleTrack &track)
-{
-	int m_subtitleStreams_size = int(m_subtitleStreams.size());
-	if (track.pid > m_subtitleStreams_size || track.pid < 1)
-	{
-		return -1;
+/*
+ * CEA-608/708 closed captions ride inside the video elementary stream (A/53
+ * user data / SEI); the GStreamer parsers (h264parse, h265parse,
+ * mpegvideoparse) extract them onto every buffer as GstVideoCaptionMeta since
+ * 1.16. Nothing downstream consumes that meta on an STB (the video goes as ES
+ * into the hardware decoder), so a buffer probe on the video sink pad harvests
+ * it: pairs are queued by buffer pts (SEI data arrives in decode order, the
+ * pts-ordered queue restores presentation order across B frames), fed to the
+ * CEA-608 decoder in sync with the playback position and rendered through the
+ * regular pango subtitle path.
+ */
+/** @brief Wake the main thread after the first real field-1 caption payload. */
+void eServiceMP3::captionDataReady(int events) {
+	char ready;
+	while (read(m_cc_notify_pipe[0], &ready, sizeof(ready)) > 0) {}
+	if (m_state == stRunning && !m_subtitles_paused && !m_cc_sync_timer->isActive())
+		m_cc_sync_timer->start(100, true);
+}
+
+/** @brief Prevent new service access and wait for an in-flight caption callback. */
+void eServiceMP3::invalidateCCProbe() {
+	if (m_cc_probe_context) {
+		std::lock_guard<std::mutex> lock(m_cc_probe_context->mutex);
+		m_cc_probe_context->service = nullptr;
 	}
-	eDebug ("[eServiceMP3][enableSubtitles] entered: subtitle stream %i track.pid %i", m_currentSubtitleStream, track.pid - 1);
-	/*
-	 * Clearing the pending-page queues below only stops whatever hasn't been
-	 * displayed yet - it does nothing about a page already on screen: setPage()
-	 * arms the widget's own internal hide timer for that page's timeout with
-	 * no knowledge of a track switch happening underneath it, so without this
-	 * the old track's last subtitle just stays correctly rendered - and
-	 * stale - on screen until that original timeout happens to elapse.
-	 * Whichever widget is about to stop being used should have this called on
-	 * it, so this runs before m_subtitle_widget is reassigned to "user" below
-	 * (usually the same object, but not guaranteed to be).
-	 */
-	/*
-	 * Whether an already-active subtitle track is being replaced by a
-	 * different one, captured before m_currentSubtitleStream is overwritten
-	 * below - see m_subtitle_switch_needs_flush's own comment in the .h for
-	 * why this, not just "is the pipeline settled", decides whether
-	 * applySubtitleStreamSwitch() actually flushes.
-	 */
-	const bool wasAlreadyShowingSubtitles = (m_currentSubtitleStream >= 0);
+}
 
-	if (m_subtitle_widget) m_subtitle_widget->clearPage();
-    // OPENATV_FULLPORT_1: do not switch via -1 (it arms a second pending
-    // input-selector pad switch and can deadlock a subsequent flush).
+/** @brief Release probe context after GStreamer releases its last callback reference. */
+void eServiceMP3::destroyCCProbe(gpointer context) {
+	delete static_cast<CCProbeContext*>(context);
+}
 
+/** @brief Attach caption collection without starting a polling timer. */
+void eServiceMP3::installCCProbe() {
+	if (m_cc_probe_pad || m_sourceinfo.is_audio || !m_cc_notify)
+		return;
+	GstElement* vsink = nullptr;
+	if (m_is_dash_pipeline && m_gst_playbin)
+		vsink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "dashvideosink");
+	else if (dvb_videosink)
+		vsink = GST_ELEMENT(gst_object_ref(dvb_videosink));
+	if (!vsink)
+		return;
+	m_cc_probe_pad = gst_element_get_static_pad(vsink, "sink");
+	gst_object_unref(vsink);
+	if (!m_cc_probe_pad)
+		return;
+	m_cc_probe_context = new CCProbeContext(this);
+	m_cc_probe_id = gst_pad_add_probe(m_cc_probe_pad,
+		(GstPadProbeType)(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_EVENT_FLUSH),
+		ccVideoProbe, m_cc_probe_context, destroyCCProbe);
+}
+
+/** @brief Detach collection after invalidating callback access. */
+void eServiceMP3::removeCCProbe() {
+	invalidateCCProbe();
+	if (m_cc_probe_pad) {
+		if (m_cc_probe_id)
+			gst_pad_remove_probe(m_cc_probe_pad, m_cc_probe_id);
+		m_cc_probe_id = 0;
+		m_cc_probe_context = nullptr;
+		gst_object_unref(m_cc_probe_pad);
+		m_cc_probe_pad = nullptr;
+	}
+}
+
+/** @brief Collect timestamped CC1 pairs on the streaming thread. */
+GstPadProbeReturn eServiceMP3::ccVideoProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
+	CCProbeContext *context = static_cast<CCProbeContext*>(user_data);
+	std::lock_guard<std::mutex> lifetime(context->mutex);
+	eServiceMP3 *_this = context->service;
+	if (!_this)
+		return GST_PAD_PROBE_OK;
+	std::lock_guard<std::mutex> lock(_this->m_cc_queue_mutex);
+	if (GST_PAD_PROBE_INFO_TYPE(info) & (GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_EVENT_FLUSH)) {
+		GstEvent* event = GST_PAD_PROBE_INFO_EVENT(info);
+		if (GST_EVENT_TYPE(event) == GST_EVENT_SEGMENT || GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_START
+			|| GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
+			++_this->m_cc_generation;
+			_this->m_cc_timestamp.reset();
+			_this->m_cc_video.reset();
+			gst_segment_init(&_this->m_cc_segment, GST_FORMAT_TIME);
+			if (GST_EVENT_TYPE(event) == GST_EVENT_SEGMENT) {
+				const GstSegment* segment = nullptr;
+				gst_event_parse_segment(event, &segment);
+				if (segment && segment->format == GST_FORMAT_TIME)
+					gst_segment_copy_into(segment, &_this->m_cc_segment);
+			}
+		}
+		return GST_PAD_PROBE_OK;
+	}
+	GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+	if (!buffer)
+		return GST_PAD_PROBE_OK;
+	/* Update on every NAL, not just caption-bearing buffers. Vu+ h264parse
+	 * emits caption SEIs without PTS, following a timestamped NAL with the
+	 * same DTS. Recover only that access unit's presentation timestamp. */
+	GstClockTime pts = _this->m_cc_timestamp.resolve(GST_BUFFER_PTS(buffer), GST_BUFFER_DTS(buffer),
+		GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT));
+	gpointer state = nullptr;
+	GstMeta* meta;
+	while ((meta = gst_buffer_iterate_meta_filtered(buffer, &state, GST_VIDEO_CAPTION_META_API_TYPE))) {
+		GstVideoCaptionMeta* cc = (GstVideoCaptionMeta*)meta;
+
+		if (!cc->data || !cc->size)
+			continue;
+		int payload_type;
+		switch (cc->caption_type) {
+			case GST_VIDEO_CAPTION_TYPE_CEA608_RAW:
+				payload_type = eCea608Decoder::PAYLOAD_CEA608_RAW;
+				break;
+			case GST_VIDEO_CAPTION_TYPE_CEA608_S334_1A:
+				payload_type = eCea608Decoder::PAYLOAD_CEA608_S334_1A;
+				break;
+			case GST_VIDEO_CAPTION_TYPE_CEA708_RAW:
+				payload_type = eCea608Decoder::PAYLOAD_CEA708_RAW;
+				break;
+			case GST_VIDEO_CAPTION_TYPE_CEA708_CDP:
+				payload_type = eCea608Decoder::PAYLOAD_CEA708_CDP;
+				break;
+			default:
+				continue;
+		}
+		std::vector<uint16_t> pairs;
+		eCea608Decoder::extractField1Pairs(payload_type, cc->data, cc->size, pairs);
+		if (!eCea608Decoder::hasCaptionData(pairs))
+			continue;
+		if (!_this->m_cc_available.exchange(true)) {
+			const char ready = 1;
+			// One nonblocking wake-up per service; timer operations stay on the main thread.
+			ssize_t result = write(_this->m_cc_notify_pipe[1], &ready, sizeof(ready));
+			(void)result;
+		}
+		if (!GST_CLOCK_TIME_IS_VALID(pts)) {
+			continue;
+		}
+		if (pts < _this->m_cc_segment.start)
+			continue;
+		int64_t ms = (int64_t)(pts / 1000000);
+		for (size_t i = 0; i < pairs.size(); ++i)
+			_this->m_cc_video.enqueue(ms, pairs[i]);
+	}
+	return GST_PAD_PROBE_OK;
+}
+
+/** @brief Reset both playback queues and decoder memories on seek. */
+void eServiceMP3::flushClosedCaptions() {
+	{
+		std::lock_guard<std::mutex> lock(m_cc_queue_mutex);
+		++m_cc_generation;
+		m_cc_track.reset();
+		m_cc_timestamp.reset();
+		m_cc_video.reset();
+	}
+}
+
+/** @brief Advance both caption sources using the hardware video clock. */
+void eServiceMP3::pushClosedCaptions() {
+	if (m_state != stRunning || m_subtitles_paused || (!m_cc_available && !m_cc_enabled))
+		return;
+
+	const int next_timer = 100;
+	if (m_paused || m_seeking_or_paused) {
+		m_cc_sync_timer->start(next_timer, true);
+		return;
+	}
+	pts_t running_pts = 0;
+	bool clock_valid = false;
+	GstClockTime clock_ns = GST_CLOCK_TIME_NONE;
+	uint64_t clock_generation;
+	{
+		std::lock_guard<std::mutex> lock(m_cc_queue_mutex);
+		clock_generation = m_cc_generation;
+	}
+	/* Hardware sinks can accept the entire file before playback catches up.
+	 * A playbin position fallback at startup would consume every CC immediately.
+	 * Use the actual video decoder clock when the sink exposes it; if it is
+	 * unavailable, wait rather than substituting demux/read-ahead position. */
+	GstElement* video_sink = m_cc_probe_pad ? gst_pad_get_parent_element(m_cc_probe_pad) : nullptr;
+	if (video_sink && g_signal_lookup("get-decoder-time", G_OBJECT_TYPE(video_sink))) {
+		gint64 position = GST_CLOCK_TIME_NONE;
+		if (m_state == stRunning && !m_paused && !m_seeking_or_paused)
+			g_signal_emit_by_name(video_sink, "get-decoder-time", &position);
+		clock_valid = GST_CLOCK_TIME_IS_VALID(position) && position >= 0;
+		if (clock_valid)
+			clock_ns = position;
+	}
+	if (video_sink)
+		gst_object_unref(video_sink);
+	if (clock_valid) {
+		int64_t decoder_ms;
+		std::string video_text, track_text;
+		bool video_changed, track_changed;
+		{
+			std::lock_guard<std::mutex> lock(m_cc_queue_mutex);
+			GstClockTime raw = eCea608Timestamp::rawTime(clock_ns, m_cc_segment.start, m_cc_segment.position);
+			if (clock_generation != m_cc_generation || !GST_CLOCK_TIME_IS_VALID(raw)) {
+				m_cc_sync_timer->start(next_timer, true);
+				return;
+			}
+			decoder_ms = raw / 1000000;
+			running_pts = raw / 11111LL;
+			video_changed = m_cc_video.advance(decoder_ms,
+				m_cc_enabled && m_cc_from_video, video_text);
+			track_changed = m_cc_track.advance(decoder_ms,
+				m_cc_enabled && !m_cc_from_video, track_text);
+
+		}
+		const std::string &text = m_cc_from_video ? video_text : track_text;
+		const bool changed = m_cc_from_video ? video_changed : track_changed;
+
+		if (changed && m_cc_enabled && m_subtitle_widget && !m_paused) {
+			ePangoSubtitlePage pango_page;
+			pango_page.m_show_pts = running_pts;
+			pango_page.m_timeout = 10000; /* stays up until the next update */
+			if (!text.empty()) {
+				gRGB rgbcol(0xff, 0xff, 0xff);
+				pango_page.m_elements.push_back(ePangoSubtitlePageElement(rgbcol, text));
+			}
+			m_subtitle_widget->setPage(pango_page);
+		}
+	}
+	m_cc_sync_timer->start(next_timer, true);
+}
+
+/**
+ * @brief Enables subtitles for the current service.
+ *
+ * This function enables subtitles for the current service by setting the
+ * current text stream in the GStreamer playbin and updating the subtitle
+ * widget with the specified track.
+ *
+ * @param[in] user The subtitle user interface to update.
+ * @param[in] track The subtitle track to enable.
+ * @return RESULT indicating success or failure.
+ */
+RESULT eServiceMP3::enableSubtitles(iSubtitleUser* user, struct SubtitleTrack& track) {
+	const bool closed_caption = track.type == 2 && track.page_number == (int)stCC;
+	if (m_currentSubtitleStream == track.pid && !eConfigManager::getConfigBoolValue("config.subtitles.pango_autoturnon", true)
+		&& m_cc_enabled == closed_caption)
+		return 0;
+
+	m_cc_enabled = false;
+	/* Selection is not a seek: preserve video read-ahead and decoder memory. */
+	{
+		std::lock_guard<std::mutex> lock(m_cc_queue_mutex);
+		m_cc_track.reset();
+		m_cc_video.hide();
+	}
+
+	/* the page on screen belongs to the old track and would sit there until
+	   its own timeout elapses */
+	if (m_subtitle_widget)
+		m_subtitle_widget->clearPage();
+
+	m_subtitle_generation++;
 	m_subtitle_sync_timer->stop();
 	m_dvb_subtitle_sync_timer->stop();
 	m_dvb_subtitle_pages.clear();
 	m_subtitle_pages.clear();
+	m_initial_vtt_mpegts = 0;
+	m_vtt_live = false;
+	m_vtt_live_base_time = -1;
 	m_prev_decoder_time = -1;
 	m_decoder_time_valid_state = 0;
-	m_currentSubtitleStream = track.pid - 1;
+	m_currentSubtitleStream = track.pid;
 	m_cachedSubtitleStream = m_currentSubtitleStream;
-	setCacheEntry(false, track.pid - 1);
-
-	m_subtitle_switch_needs_flush = wasAlreadyShowingSubtitles;
-
-	/* Bump first: any subtitle buffer already captured under the previous
-	 * generation and still in flight to gstPoll() (queued in m_pump - see
-	 * gstCBsubtitleAvail()/m_subtitle_generation) must be dropped there
-	 * rather than parsed as though it belonged to the track being switched
-	 * to now. */
-	m_subtitle_generation++;
-	if (pipelineSettledInPlaying(m_gst_playbin))
-	{
-		m_subtitle_switch_deferred = false;
-		applySubtitleStreamSwitch();
-	}
-	else
-	{
-		/* gstBusCall()'s GST_STATE_CHANGE_PAUSED_TO_PLAYING handling applies
-		 * this the moment the pipeline next settles - same deferral as
-		 * selectAudioStream()'s m_audio_switch_deferred, and for the same
-		 * reason: forcing the selector commit below against an unsettled
-		 * pipeline is untested territory this class would rather not risk. */
-		m_subtitle_switch_deferred = true;
-		eDebug("[eServiceMP3] enableSubtitles: pipeline not settled in PLAYING, deferring switch to stream %i", m_currentSubtitleStream);
-	}
+	setCacheEntry(false, track.pid);
+	m_pgs_subtitle_parser->reset();
 
 	m_subtitle_widget = user;
+	if (closed_caption) {
+		bool from_video = true;
+		if (track.pid >= 0 && track.pid < (int)m_subtitleStreams.size())
+			from_video = m_subtitleStreams[track.pid].cc_payload_type < 0;
+		m_cachedSubtitleStream = from_video ? -1 : track.pid;
+		setCacheEntry(false, m_cachedSubtitleStream);
+		m_cc_from_video = from_video;
+		m_cc_enabled = true;
+		m_cc_sync_timer->start(100, true);
+		if (m_is_dash_pipeline) {
+			m_subtitle_switch_deferred = false;
+			return 0;
+		}
+	}
 
-	eDebug ("[eServiceMP3] switched to subtitle stream %i", m_currentSubtitleStream);
-
-#ifdef GSTREAMER_SUBTITLE_SYNC_MODE_BUG
-		/*
-		 * when we're running the subsink in sync=false mode,
-		 * we have to force a seek, before the new subtitle stream will start
-		 */
-		seekRelative(-1, 90000);
-#endif
+	/* The forced selector commit in applySubtitleStreamSwitch() cannot complete
+	   while a streaming thread sits blocked in the text sink, which it does until
+	   the pipeline is back in PLAYING (pause, buffering, re-preroll after a seek).
+	   Defer the whole switch then, not just the commit: a pending active pad left
+	   behind would deadlock the next flushing seek. */
+	if (pipelineSettledInPlaying(m_gst_playbin)) {
+		m_subtitle_switch_deferred = false;
+		applySubtitleStreamSwitch();
+	} else {
+		m_subtitle_switch_deferred = true;
+		// eDebug("[eServiceMP3] enableSubtitles: pipeline not settled in PLAYING, deferring switch to stream %i",
+		//	   m_currentSubtitleStream);
+	}
 
 	return 0;
 }
 
-RESULT eServiceMP3::disableSubtitles()
-{
+/**
+ * @brief Switches playbin's text stream to m_currentSubtitleStream.
+ *
+ * Must only be called while the pipeline is settled in PLAYING, see
+ * enableSubtitles().
+ */
+void eServiceMP3::applySubtitleStreamSwitch() {
+	// Video CC has a synthetic track id, not a playbin text-pad index.
+	const int textStream = m_cc_enabled && m_cc_from_video ? -1 : m_currentSubtitleStream;
+	g_object_set(m_gst_playbin, "current-text", textStream, NULL);
+
+	/* Work around a playbin/input-selector timing bug in GStreamer >= 1.28
+	   (verified against the gstplaybin2.c and gstinputselector.c sources, and
+	   GST_DEBUG traces; up to 1.26.10 input-selector switched active-pad at once):
+	   playbin's own current-text setter (gst_play_bin_set_current_text_stream)
+	   already does g_object_set(combiner, "active-pad", sinkpad, NULL) for us,
+	   but that call, like ours would be, is a no-op beyond recording a *pending*
+	   active pad on the text input-selector -- gst_input_selector_set_active_pad
+	   only ever touches pending_active_sinkpad. The actual switch only commits
+	   lazily, the next time an event or buffer happens to pass through any of
+	   the selector's sink pads (gst_selector_pad_event/_chain check for a
+	   pending commit unconditionally, before looking at what they received).
+	   For a sparse stream (e.g. PGS, with long gaps between cues) that next
+	   occasion can be many seconds away. A seek issued in that window deadlocks
+	   the pipeline: its FLUSH_START runs the pending commit first, which takes
+	   active_sinkpad_lock as writer and waits for all readers -- but _chain
+	   holds it as reader across the push into the text sink, and a thread
+	   blocked there (PAUSED, re-preroll) is only released by that FLUSH_START.
+	   Force the commit to happen now instead of waiting for the lazy one: send
+	   the selector's sink pad for this stream a harmless custom event, which
+	   makes it run that unconditional pending-commit check immediately. The
+	   commit still has to wait for the writer lock, and subsink runs with
+	   sync=TRUE (GSTREAMER_SUBTITLE_SYNC_MODE_BUG is undefined), so even in
+	   PLAYING a reader can sit in the sink's clock wait until the cue's display
+	   time -- for external SRT/ASS up to the next cue. Hence the event is sent
+	   from a GStreamer pool thread, never from the E2 main thread. */
+	GstPad* textPad = NULL;
+	if (textStream >= 0 && g_signal_lookup("get-text-pad", G_OBJECT_TYPE(m_gst_playbin)))
+		g_signal_emit_by_name(m_gst_playbin, "get-text-pad", textStream, &textPad);
+	if (textPad) {
+		// eDebug("[eServiceMP3] applySubtitleStreamSwitch: forcing input-selector active-pad commit for %s",
+		//	   GST_PAD_NAME(textPad));
+		GstElement* selector = gst_pad_get_parent_element(textPad);
+		if (selector) {
+			/* textPad's ref is handed to the async call, released by the
+			   GDestroyNotify once forceSelectorCommit has run. */
+			gst_element_call_async(selector, forceSelectorCommit, textPad, (GDestroyNotify)gst_object_unref);
+			gst_object_unref(selector);
+		} else {
+			gst_object_unref(textPad);
+		}
+	}
+
+	// eDebug("[eServiceMP3] switched to subtitle stream %i (generation %d)", m_currentSubtitleStream,
+	//	   m_subtitle_generation.load());
+}
+
+/**
+ * @brief Disables subtitles for the current service.
+ *
+ * This function disables subtitles by setting the current text stream to -1
+ * in the GStreamer playbin and clearing the subtitle widget.
+ *
+ * @return RESULT indicating success or failure.
+ */
+RESULT eServiceMP3::disableSubtitles() {
 	eDebug("[eServiceMP3] disableSubtitles");
-	/* See enableSubtitles(): invalidates any buffer still in flight from the
-	 * track being turned off, and cancels a still-pending deferred switch -
-	 * there is nothing left to apply it to. */
+	m_cc_enabled = false;
+	{
+		std::lock_guard<std::mutex> lock(m_cc_queue_mutex);
+		m_cc_track.reset();
+		m_cc_video.hide();
+	}
 	m_subtitle_generation++;
 	m_subtitle_switch_deferred = false;
 	m_currentSubtitleStream = -1;
+	m_pgs_subtitle_parser->reset();
 	m_cachedSubtitleStream = m_currentSubtitleStream;
 	setCacheEntry(false, -1);
-	g_object_set (G_OBJECT (m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
+	g_object_set(m_gst_playbin, "current-text", m_currentSubtitleStream, NULL);
 	m_subtitle_sync_timer->stop();
 	m_dvb_subtitle_sync_timer->stop();
-	m_subtitle_pages.clear();
 	m_dvb_subtitle_pages.clear();
+	m_subtitle_pages.clear();
+	m_initial_vtt_mpegts = 0;
+	m_vtt_live = false;
+	m_vtt_live_base_time = -1;
 	m_prev_decoder_time = -1;
 	m_decoder_time_valid_state = 0;
-	if (m_subtitle_widget) m_subtitle_widget->destroy();
+	if (m_subtitle_widget)
+		m_subtitle_widget->destroy();
 	m_subtitle_widget = 0;
 	return 0;
 }
 
-RESULT eServiceMP3::getCachedSubtitle(struct SubtitleTrack &track)
-{
-	int m_subtitleStreams_size = (int)m_subtitleStreams.size();
-	if (m_autoturnon && m_subtitleStreams_size)
-	{
-		eDebug("[eServiceMP3][getCachedSubtitle] m_cachedSubtitleStream == -2 && m_subtitleStreams_size)");
-		m_cachedSubtitleStream = 0;
-		int autosub_level = 5;
-		std::string configvalue;
-		std::vector<std::string> autosub_languages;
+/* iSubtitleOutput track types: 0 DVB, 1 teletext, 2 text/pango, 3 PGS.
+   PGS needs its own value - it renders through the eDVBSubtitlePage widget like
+   DVB, but page_number then carries a composition page id for DVB and a
+   subtype_t for us, so the two are not distinguishable from python. */
+static int subtitleTrackType(subtype_t type) {
+	if (type == stDVB)
+		return 0;
+	if (type == stPGS)
+		return 3;
+	return 2;
+}
+
+/**
+ * @brief Retrieves the cached subtitle stream for the current service.
+ *
+ * This function checks if there is a cached subtitle stream available and
+ * returns the corresponding SubtitleTrack structure. If no suitable subtitle
+ * stream is found, it returns -1.
+ *
+ * @param[out] track The SubtitleTrack structure to fill with subtitle information.
+ * @return RESULT indicating success or failure.
+ */
+RESULT eServiceMP3::getCachedSubtitle(struct SubtitleTrack& track) {
+	// If autostart not active, exit
+	if (!eConfigManager::getConfigBoolValue("config.subtitles.pango_autoturnon", true) && !m_subtitle_requested)
+		return -1;
+	int autosub_level = 5;
+	std::string configvalue;
+	std::vector<std::string> autosub_languages;
+
+
+	// Initialize cache if needed
+	if (m_cachedSubtitleStream == -2 && !m_subtitleStreams.empty()) {
+		m_cachedSubtitleStream = -1;
+
+		// Get configured languages
 		configvalue = eConfigManager::getConfigValue("config.autolanguage.subtitle_autoselect1");
-		if (configvalue != "" && configvalue != "None")
+		if (configvalue != "")
 			autosub_languages.push_back(configvalue);
 		configvalue = eConfigManager::getConfigValue("config.autolanguage.subtitle_autoselect2");
-		if (configvalue != "" && configvalue != "None")
+		if (configvalue != "")
 			autosub_languages.push_back(configvalue);
 		configvalue = eConfigManager::getConfigValue("config.autolanguage.subtitle_autoselect3");
-		if (configvalue != "" && configvalue != "None")
+		if (configvalue != "")
 			autosub_languages.push_back(configvalue);
 		configvalue = eConfigManager::getConfigValue("config.autolanguage.subtitle_autoselect4");
-		if (configvalue != "" && configvalue != "None")
+		if (configvalue != "")
 			autosub_languages.push_back(configvalue);
-		for (int i = 0; i < m_subtitleStreams_size; i++)
-		{
-			if (!m_subtitleStreams[i].language_code.empty())
-			{
+
+		// Find best matching subtitle
+		for (size_t i = 0; i < m_subtitleStreams.size(); i++) {
+			if (!m_subtitleStreams[i].language_code.empty()) {
 				int x = 1;
-				for (std::vector<std::string>::iterator it2 = autosub_languages.begin(); x < autosub_level && it2 != autosub_languages.end(); x++, it2++)
-				{
-					if ((*it2).find(m_subtitleStreams[i].language_code) != std::string::npos)
-					{
+				for (std::vector<std::string>::iterator it = autosub_languages.begin();
+					 x < autosub_level && it != autosub_languages.end(); x++, it++) {
+					if ((*it).find(m_subtitleStreams[i].language_code) != std::string::npos) {
 						autosub_level = x;
 						m_cachedSubtitleStream = i;
 						break;
@@ -7249,81 +5459,109 @@ RESULT eServiceMP3::getCachedSubtitle(struct SubtitleTrack &track)
 		}
 	}
 
-	eDebug("[eServiceMP3][getCachedSubtitle] m_cachedSubtitleStream = %d; m_currentSubtitleStream = %d; m_subtitleStreams_size = %d ", m_cachedSubtitleStream, m_currentSubtitleStream, m_subtitleStreams_size);
-
-	if (m_cachedSubtitleStream >= 0 && m_cachedSubtitleStream < m_subtitleStreams_size)
-	{
-		eDebug("[eServiceMP3][getCachedSubtitle] (m_cachedSubtitleStream >= 0 && m_cachedSubtitleStream < m_subtitleStreams_size)");
+	if (m_cachedSubtitleStream >= 0 && m_cachedSubtitleStream < (int)m_subtitleStreams.size()) {
 		subtype_t type = m_subtitleStreams[m_cachedSubtitleStream].type;
-		track.type = type == stDVB ? 0 : 2;
-		track.pid = m_cachedSubtitleStream + 1;
+		track.type = subtitleTrackType(type);
+		track.pid = m_cachedSubtitleStream;
 		track.page_number = int(type);
 		track.magazine_number = 0;
 		track.language_code = m_subtitleStreams[m_cachedSubtitleStream].language_code;
+		track.title = m_subtitleStreams[m_cachedSubtitleStream].title;
 		return 0;
 	}
+
 	return -1;
 }
 
-RESULT eServiceMP3::getSubtitleList(std::vector<struct SubtitleTrack> &subtitlelist)
-{
-// 	eDebug("[eServiceMP3] getSubtitleList");
-	int stream_idx = 1;
+/**
+ * @brief Retrieves the list of available subtitle tracks for the current service.
+ *
+ * This function populates the provided vector with SubtitleTrack structures
+ * representing the available subtitle streams. It iterates through the
+ * m_subtitleStreams vector and fills in the details for each subtitle track.
+ *
+ * @param[out] subtitlelist The vector to fill with available subtitle tracks.
+ * @return RESULT indicating success or failure.
+ */
+RESULT eServiceMP3::getSubtitleList(std::vector<struct SubtitleTrack>& subtitlelist) {
+	// Process all subtitle streams including CC streams in one loop
+	for (size_t i = 0; i < m_subtitleStreams.size(); i++) {
+		const subtitleStream& stream = m_subtitleStreams[i];
 
-	for (std::vector<subtitleStream>::iterator IterSubtitleStream(m_subtitleStreams.begin()); IterSubtitleStream != m_subtitleStreams.end(); ++IterSubtitleStream)
-	{
-		subtype_t type = IterSubtitleStream->type;
-		switch(type)
-		{
-		case stUnknown:
-		case stVOB:
-		case stPGS:
-			break;
-		case stDVB:
-		{
-			struct SubtitleTrack track = {};
-			track.type = 0;
-			track.pid = stream_idx;
-			track.page_number = int(type);
-			track.magazine_number = 0;
-			track.language_code = IterSubtitleStream->language_code;
-			subtitlelist.push_back(track);
-			break;
+		// Skip unsupported types
+		if (stream.type == stUnknown || stream.type == stVOB) {
+			continue;
 		}
-		default:
-		{
-			struct SubtitleTrack track = {};
-			track.type = 2;
-			track.pid = stream_idx;
-			track.page_number = int(type);
-			track.magazine_number = 0;
-			track.language_code = IterSubtitleStream->language_code;
-			subtitlelist.push_back(track);
-		}
-		}
-		stream_idx++;
+
+		struct SubtitleTrack track;
+		track.type = subtitleTrackType(stream.type);
+		track.pid = i;
+		track.page_number = int(stream.type);
+		track.magazine_number = 0;
+		track.language_code = stream.language_code;
+		track.title = stream.title;
+
+		subtitlelist.push_back(track);
 	}
-	eDebug("[eServiceMP3] getSubtitleList finished");
+
+	/* captions embedded in the video stream have no gstreamer stream to
+	 * enumerate; offer them as an extra track once caption data has been seen.
+	 * The pid is deliberately one past the last real stream, which is how
+	 * enableSubtitles tells them apart from a dedicated caption track. */
+	if (m_cc_available) {
+		struct SubtitleTrack track;
+		track.type = 2;
+		track.pid = m_subtitleStreams.size();
+		track.page_number = int(stCC);
+		track.magazine_number = 0;
+		track.language_code = "und";
+		subtitlelist.push_back(track);
+	}
+
 	return 0;
 }
 
-RESULT eServiceMP3::streamed(ePtr<iStreamedService> &ptr)
-{
+/**
+ * @brief Retrieves the current subtitle stream.
+ *
+ * This function returns the current subtitle stream as an integer. If no
+ * subtitle stream is set, it returns -1.
+ *
+ * @return The current subtitle stream ID or -1 if none is set.
+ */
+RESULT eServiceMP3::streamed(ePtr<iStreamedService>& ptr) {
 	ptr = this;
 	return 0;
 }
 
-ePtr<iStreamBufferInfo> eServiceMP3::getBufferCharge()
-{
-	return new eStreamBufferInfo(m_bufferInfo.bufferPercent, m_bufferInfo.avgInRate, m_bufferInfo.avgOutRate, m_bufferInfo.bufferingLeft, m_buffer_size);
+/**
+ * @brief Retrieves the buffer charge information for the service.
+ *
+ * This function returns a pointer to an iStreamBufferInfo object containing
+ * the current buffer charge information, including buffer percentage, average
+ * input and output rates, buffering left time, and buffer size.
+ *
+ * @return A pointer to an iStreamBufferInfo object with buffer charge details.
+ */
+ePtr<iStreamBufferInfo> eServiceMP3::getBufferCharge() {
+	return new eStreamBufferInfo(m_bufferInfo.bufferPercent, m_bufferInfo.avgInRate, m_bufferInfo.avgOutRate,
+								 m_bufferInfo.bufferingLeft, m_buffer_size);
 }
+
+
 /* cuesheet CVR */
-PyObject *eServiceMP3::getCutList()
-{
+/**
+ * @brief Retrieves the cut list as a Python list.
+ *
+ * This function creates a Python list containing tuples of cue entries,
+ * where each tuple consists of the position (pts) and type of the cue entry.
+ *
+ * @return A Python list containing the cut list.
+ */
+PyObject* eServiceMP3::getCutList() {
 	ePyObject list = PyList_New(0);
 
-	for (std::multiset<struct cueEntry>::iterator i(m_cue_entries.begin()); i != m_cue_entries.end(); ++i)
-	{
+	for (std::multiset<struct cueEntry>::iterator i(m_cue_entries.begin()); i != m_cue_entries.end(); ++i) {
 		ePyObject tuple = PyTuple_New(2);
 		PyTuple_SET_ITEM(tuple, 0, PyLong_FromLongLong(i->where));
 		PyTuple_SET_ITEM(tuple, 1, PyLong_FromLong(i->what));
@@ -7333,9 +5571,17 @@ PyObject *eServiceMP3::getCutList()
 
 	return list;
 }
-/* cuesheet CVR */
-void eServiceMP3::setCutList(ePyObject list)
-{
+
+/**
+ * @brief Sets the cut list from a Python list.
+ *
+ * This function takes a Python list of tuples, where each tuple contains
+ * a position (pts) and type of the cue entry, and updates the internal
+ * cut list accordingly. It clears the existing entries before adding new ones.
+ *
+ * @param[in] list A Python list containing tuples of cue entries.
+ */
+void eServiceMP3::setCutList(ePyObject list) {
 	if (!PyList_Check(list))
 		return;
 	int size = PyList_Size(list);
@@ -7343,63 +5589,94 @@ void eServiceMP3::setCutList(ePyObject list)
 
 	m_cue_entries.clear();
 
-	for (i=0; i<size; ++i)
-	{
+	for (i = 0; i < size; ++i) {
 		ePyObject tuple = PyList_GET_ITEM(list, i);
-		if (!PyTuple_Check(tuple))
-		{
+		if (!PyTuple_Check(tuple)) {
 			eDebug("[eServiceMP3] non-tuple in cutlist");
 			continue;
 		}
-		if (PyTuple_Size(tuple) != 2)
-		{
+		if (PyTuple_Size(tuple) != 2) {
 			eDebug("[eServiceMP3] cutlist entries need to be a 2-tuple");
 			continue;
 		}
 		ePyObject ppts = PyTuple_GET_ITEM(tuple, 0), ptype = PyTuple_GET_ITEM(tuple, 1);
-		if (!(PyLong_Check(ppts) && PyLong_Check(ptype)))
-		{
-			eDebug("[eServiceMP3] cutlist entries need to be (pts, type)-tuples (%d %d)", PyLong_Check(ppts), PyLong_Check(ptype));
+		if (!(PyLong_Check(ppts) && PyLong_Check(ptype))) {
+			eDebug("[eServiceMP3] cutlist entries need to be (pts, type)-tuples (%d %d)", PyLong_Check(ppts),
+				   PyLong_Check(ptype));
 			continue;
 		}
 		pts_t pts = PyLong_AsLongLong(ppts);
 		int type = PyLong_AsLong(ptype);
 		m_cue_entries.insert(cueEntry(pts, type));
-		eDebug("[eServiceMP3] adding %08llx, %d", pts, type);
+		eDebug("[eServiceMP3] adding %" G_GINT64_FORMAT " type %d", (gint64)pts, type);
 	}
 	m_cuesheet_changed = 1;
 	m_event((iPlayableService*)this, evCuesheetChanged);
 }
 
-void eServiceMP3::setCutListEnable(int enable)
-{
+/**
+ * @brief Sets whether the cut list is enabled.
+ *
+ * This function enables or disables the cut list functionality based on the
+ * provided integer value. If the value is non-zero, the cut list is enabled;
+ * otherwise, it is disabled.
+ *
+ * @param[in] enable An integer indicating whether to enable (non-zero) or disable (zero) the cut list.
+ */
+void eServiceMP3::setCutListEnable(int enable) {
 	m_cutlist_enabled = enable;
 }
 
-int eServiceMP3::setBufferSize(int size)
-{
+/**
+ * @brief Retrieves whether the cut list is enabled.
+ *
+ * This function returns the current state of the cut list, indicating whether
+ * it is enabled or not.
+ *
+ * @return An integer indicating whether the cut list is enabled (non-zero) or disabled (zero).
+ */
+int eServiceMP3::setBufferSize(int size) {
 	m_buffer_size = size;
-	g_object_set (G_OBJECT (m_gst_playbin), "buffer-size", m_buffer_size, NULL);
+	g_object_set(m_gst_playbin, "buffer-size", m_buffer_size, NULL);
 	return 0;
 }
 
-int eServiceMP3::getAC3Delay()
-{
+/**
+ * @brief Retrieves the current buffer size.
+ *
+ * This function returns the current buffer size set for the service.
+ *
+ * @return The current buffer size in bytes.
+ */
+int eServiceMP3::getAC3Delay() {
 	return ac3_delay;
 }
 
-int eServiceMP3::getPCMDelay()
-{
+/**
+ * @brief Retrieves the current PCM delay.
+ *
+ * This function returns the current PCM delay set for the service.
+ *
+ * @return The current PCM delay in milliseconds.
+ */
+int eServiceMP3::getPCMDelay() {
 	return pcm_delay;
 }
 
-void eServiceMP3::setAC3Delay(int delay)
-{
+/**
+ * @brief Sets the AC3 delay for the service.
+ *
+ * This function sets the AC3 delay in milliseconds. If the playbin is running,
+ * it configures the hardware decoder with the specified delay, adjusted by
+ * the general AC3 delay setting if a video sink is present.
+ *
+ * @param[in] delay The AC3 delay in milliseconds to set.
+ */
+void eServiceMP3::setAC3Delay(int delay) {
 	ac3_delay = delay;
 	if (!m_gst_playbin || m_state != stRunning)
 		return;
-	else
-	{
+	else {
 		int config_delay_int = delay;
 
 		/*
@@ -7407,30 +5684,33 @@ void eServiceMP3::setAC3Delay(int delay)
 		 * If either the video or audio sink is of a different type,
 		 * we have no chance to get them synced anyway.
 		 */
-		if (videoSink)
-		{
+		if (dvb_videosink) {
 			config_delay_int += eConfigManager::getConfigIntValue("config.av.generalAC3delay");
-		}
-		else
-		{
-			eDebug("[eServiceMP3] dont apply ac3 delay when no video is running!");
+		} else {
+			// eDebug("[eServiceMP3]dont apply ac3 delay when no video is running!");
 			config_delay_int = 0;
 		}
 
-		if (audioSink)
-		{
+		if (dvb_audiosink) {
 			eTSMPEGDecoder::setHwAC3Delay(config_delay_int);
 		}
 	}
 }
 
-void eServiceMP3::setPCMDelay(int delay)
-{
+/**
+ * @brief Sets the PCM delay for the service.
+ *
+ * This function sets the PCM delay in milliseconds. If the playbin is running,
+ * it configures the hardware decoder with the specified delay, adjusted by
+ * the general PCM delay setting if a video sink is present.
+ *
+ * @param[in] delay The PCM delay in milliseconds to set.
+ */
+void eServiceMP3::setPCMDelay(int delay) {
 	pcm_delay = delay;
 	if (!m_gst_playbin || m_state != stRunning)
 		return;
-	else
-	{
+	else {
 		int config_delay_int = delay;
 
 		/*
@@ -7438,51 +5718,45 @@ void eServiceMP3::setPCMDelay(int delay)
 		 * If either the video or audio sink is of a different type,
 		 * we have no chance to get them synced anyway.
 		 */
-		if (videoSink)
-		{
+		if (dvb_videosink) {
 			config_delay_int += eConfigManager::getConfigIntValue("config.av.generalPCMdelay");
-		}
-		else
-		{
-			eDebug("[eServiceMP3] dont apply pcm delay when no video is running!");
+		} else {
+			// eDebug("[eServiceMP3] dont apply pcm delay when no video is running!");
 			config_delay_int = 0;
 		}
 
-		if (audioSink)
-		{
+		if (dvb_audiosink) {
 			eTSMPEGDecoder::setHwPCMDelay(config_delay_int);
 		}
 	}
 }
+
+
 /* cuesheet CVR */
-void eServiceMP3::loadCuesheet()
-{
-	if (!m_cuesheet_loaded)
-	{
+/**
+ * @brief Loads the cuesheet from a file.
+ *
+ * This function loads the cuesheet entries from a file with the same name as
+ * the service path, appending ".cuts" to it. It reads the entries and stores
+ * them in the m_cue_entries multiset.
+ */
+void eServiceMP3::loadCuesheet() {
+	if (!m_cuesheet_loaded) {
 		eDebug("[eServiceMP3] loading cuesheet");
 		m_cuesheet_loaded = true;
-	}
-	else
-	{
-		eDebug("[eServiceMP3] skip loading cuesheet multiple times");
+	} else {
+		// eDebug("[eServiceMP3] skip loading cuesheet multiple times");
 		return;
 	}
 
 	m_cue_entries.clear();
-	/* only load manual cuts if no chapter info avbl CVR */
-	if (m_use_chapter_entries)
-		return;
 
 	std::string filename = m_ref.path + ".cuts";
 
-	m_cue_entries.clear();
+	FILE* f = fopen(filename.c_str(), "rb");
 
-	FILE *f = fopen(filename.c_str(), "rb");
-
-	if (f)
-	{
-		while (1)
-		{
+	if (f) {
+		while (1) {
 			unsigned long long where;
 			unsigned int what;
 
@@ -7494,10 +5768,11 @@ void eServiceMP3::loadCuesheet()
 			where = be64toh(where);
 			what = ntohl(what);
 
-			if (what > 3)
-				break;
+			if (what < 256)
+				m_cue_entries.insert(cueEntry(where, what));
 
-			m_cue_entries.insert(cueEntry(where, what));
+			// if (m_cuesheet_changed == 2)
+			//	eDebug("[eServiceMP3] reloading cuts: %" G_GINT64_FORMAT " type %d", (gint64)where, what);
 		}
 		fclose(f);
 		eDebug("[eServiceMP3] cuts file has %zd entries", m_cue_entries.size());
@@ -7507,41 +5782,125 @@ void eServiceMP3::loadCuesheet()
 	m_cuesheet_changed = 0;
 	m_event((iPlayableService*)this, evCuesheetChanged);
 }
-/* cuesheet CVR */
-void eServiceMP3::saveCuesheet()
-{
+/* cuesheet */
+
+/**
+ * @brief Saves the cuesheet to a file.
+ *
+ * This function saves the current cuesheet entries to a file with the same
+ * name as the service path, appending ".cuts" to it. It writes the entries
+ * in a binary format, where each entry consists of a position (pts) and type.
+ */
+void eServiceMP3::saveCuesheet() {
 	std::string filename = m_ref.path;
 
-		/* save cuesheet only when main file is accessible. */
-		/* save cuesheet only when main file is accessible. and no TOC chapters avbl*/
-	if ((::access(filename.c_str(), R_OK) < 0) || m_use_chapter_entries)
+	if (::access(filename.c_str(), R_OK) < 0)
 		return;
+
 	filename.append(".cuts");
-	/* do not save to file if there are no cuts */
-	/* remove the cuts file if cue is empty */
-	if(m_cue_entries.begin() == m_cue_entries.end())
+
+	bool nativeCuesheetSupport = eConfigManager::getConfigBoolValue("config.usage.nativeCuesheetSupport", false);
+
+	if (nativeCuesheetSupport && (m_cutlist_enabled & 2) == 0)
 	{
-		if (::access(filename.c_str(), F_OK) == 0)
-			remove(filename.c_str());
-		return;
+
+		/* Update CUT_TYPE_LAST (type 3) with the last known play position,
+		* analogous to what eDVBServicePlay::stop() does for TV recordings.
+		* m_last_seek_pos holds the cached position from getPlayPosition().
+		* m_cutlist_enabled bit 2 is the "don't remember" flag, set by
+		* MovieSelection via setCutListEnable(2) for background playback.
+		* Don't save a resume position below 10 seconds. */
+
+		/* Save old CUT_TYPE_LAST as CUT_TYPE_SAVEDLAST before replacing it */
+		pts_t old_last = 0;
+		for (auto i = m_cue_entries.begin(); i != m_cue_entries.end();) {
+			if (i->what == 3) { /* CUT_TYPE_LAST */
+				old_last = i->where;
+				i = m_cue_entries.erase(i);
+			} else if (i->what == 4) { /* CUT_TYPE_SAVEDLAST */
+				i = m_cue_entries.erase(i);
+			} else
+				++i;
+		}
+		if (old_last > 0) {
+			m_cue_entries.insert(cueEntry(old_last, 4));
+		}
+		if ((m_cutlist_enabled & 2) == 0 && m_last_seek_pos > 900000) {
+			m_cue_entries.insert(cueEntry(m_last_seek_pos, 3));
+			eDebug("[eServiceMP3] last play position saved: %" G_GINT64_FORMAT, (gint64)m_last_seek_pos);
+		}
+
+		/* Update CUT_TYPE_LENGTH with the media length */
+		for (auto i = m_cue_entries.begin(); i != m_cue_entries.end();) {
+			if (i->what == 5) /* CUT_TYPE_LENGTH */
+				i = m_cue_entries.erase(i);
+			else
+				++i;
+		}
+		if (m_media_lenght > 0) {
+			m_cue_entries.insert(cueEntry(m_media_lenght, 5));
+		}
+
 	}
 
-	FILE *f = fopen(filename.c_str(), "wb");
+	struct stat s = {};
+	bool removefile = false;
+	bool use_videocuesheet = eConfigManager::getConfigBoolValue("config.usage.useVideoCuesheet", true);
+	bool use_audiocuesheet = eConfigManager::getConfigBoolValue("config.usage.useAudioCuesheet", true);
+	bool exist_cuesheetfile = (stat(filename.c_str(), &s) == 0);
 
-	if (f)
-	{
-		unsigned long long where;
-		int what;
+	if (!exist_cuesheetfile && m_cue_entries.size() == 0)
+		return;
+	else if ((use_videocuesheet && !m_sourceinfo.is_audio) || (m_sourceinfo.is_audio && use_audiocuesheet)) {
+		if (m_cue_entries.size() == 0) {
+			m_cuesheet_loaded = false;
+			// m_cuesheet_changed = 2;
+			loadCuesheet();
+			if (m_cue_entries.size() != 0) {
+				eDebug("[eServiceMP3] *** NO NEW CUTS TO WRITE CUTS FILE ***");
+				return;
+			} else {
+				eDebug("[eServiceMP3] *** REMOVING EXISTING CUTS FILE NO LAST PLAY NO MANUAL CUTS ***");
+				removefile = true;
+			}
+		} else
+			eDebug("[eServiceMP3] *** WRITE CUTS TO CUTS FILE ***");
+	} else if (exist_cuesheetfile) {
+		eDebug("[eServiceMP3] *** REMOVING EXISTING CUTS FILE ***");
+		removefile = true;
+	} else
+		return;
 
-		for (std::multiset<cueEntry>::iterator i(m_cue_entries.begin()); i != m_cue_entries.end(); ++i)
-		{
-			where = htobe64(i->where);
-			what = htonl(i->what);
-			fwrite(&where, sizeof(where), 1, f);
-			fwrite(&what, sizeof(what), 1, f);
+	FILE* f = fopen(filename.c_str(), "wb");
 
+	if (f) {
+		if (removefile) {
+			fclose(f);
+			remove(filename.c_str());
+			eDebug("[eServiceMP3] cuts file has been removed");
+			return;
+		}
+
+		signed long long where = 0;
+		guint what = 0;
+
+		for (std::multiset<cueEntry>::iterator i(m_cue_entries.begin()); i != m_cue_entries.end(); ++i) {
+			if (where == i->where && what == i->what)
+				/* ignore double entries */
+				continue;
+			else {
+				where = htobe64(i->where);
+				what = htonl(i->what);
+				fwrite(&where, sizeof(where), 1, f);
+				fwrite(&what, sizeof(what), 1, f);
+				/* temorary save for comparing */
+				where = i->where;
+				what = i->what;
+			}
 		}
 		fclose(f);
+		eDebug("[eServiceMP3] cuts file has been write");
 	}
 	m_cuesheet_changed = 0;
 }
+

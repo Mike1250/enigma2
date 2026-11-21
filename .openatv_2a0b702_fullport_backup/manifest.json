@@ -1,0 +1,38 @@
+{
+  "lib/service/servicemp3.cpp": {
+    "existed": true,
+    "sha256": "cee8b470dc2f0a428d8363d8ef6dcf8fa837adde51355c982108359784e8ac9b"
+  },
+  "lib/service/servicemp3.h": {
+    "existed": true,
+    "sha256": "8706ab774af0424f75d88b0989b325a8e2b4f5331c31187ab4b34f396b881f69"
+  },
+  "lib/service/cea608.cpp": {
+    "existed": false,
+    "sha256": null
+  },
+  "lib/service/cea608.h": {
+    "existed": false,
+    "sha256": null
+  },
+  "lib/dvb/pgssubtitle.cpp": {
+    "existed": false,
+    "sha256": null
+  },
+  "lib/dvb/pgssubtitle.h": {
+    "existed": false,
+    "sha256": null
+  },
+  "lib/service/Makefile.inc": {
+    "existed": true,
+    "sha256": "323398cdf9902e78210f4fc4f16b503c35d6b62cddeaaeece5ac545414ca06fc"
+  },
+  "lib/dvb/Makefile.inc": {
+    "existed": true,
+    "sha256": "094e92af8251267838e4491e3c53cddd5f8ec5154294c1c81909984d72e6e2aa"
+  },
+  "configure.ac": {
+    "existed": true,
+    "sha256": "8671d21f9f339f1109e7565af003c3c6e3e5a9c42bf3c7487c11bb7fd9f5ff24"
+  }
+}

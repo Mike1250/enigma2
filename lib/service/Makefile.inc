@@ -11,6 +11,7 @@ service/servicedvb.cpp \
 service/servicedvbrecord.cpp \
 service/servicedvbfcc.cpp \
 service/servicefs.cpp \
+service/cea608.cpp \
 service/servicemp3.cpp \
 service/servicemp3record.cpp \
 service/servicem2ts.cpp \
@@ -39,6 +40,7 @@ service/servicedvb.h \
 service/servicedvbrecord.h \
 service/servicedvbfcc.h \
 service/servicefs.h \
+service/cea608.h \
 service/servicemp3.h \
 service/servicemp3record.h \
 service/servicem2ts.h \
