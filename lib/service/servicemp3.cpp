@@ -2841,11 +2841,9 @@ gpointer stopWorker(gpointer data)
 	GstStateChangeReturn ret = gst_element_set_state(playbin, GST_STATE_NULL);
 	if (ret != GST_STATE_CHANGE_SUCCESS)
 		eDebug("[eServiceMP3] stop GST_STATE_NULL failure");
-	gst_object_unref(playbin);
-
-	int remaining = g_atomic_int_add(&s_mp3_stop_workers, -1) - 1;
-	eDebug("[eServiceMP3] stop worker released hardware; %d teardown(s) remain", remaining);
-
+	/* V12: complete video blanking BEFORE announcing hardware release.
+	 * Otherwise DVB start() can see zero stop-workers, start its decoder,
+	 * then this thread issues VIDEO_STOP against the NEW DVB picture. */
 	/* GstDVBVideoSink's own device fd is gone once GST_STATE_NULL has actually
 	 * returned (guaranteed synchronous per the comment above), but whether it
 	 * blanks the video plane on the way down is up to that (out-of-tree) sink.
@@ -2853,7 +2851,14 @@ gpointer stopWorker(gpointer data)
 	 * screen after playback has genuinely stopped - this opens its own fd, so
 	 * it doesn't race the sink's teardown. */
 	if (hadVideo)
+	{
+		eDebug("[OPENBH_LOCAL_V12] clearing old movie video before DVB handover");
 		eTSMPEGDecoder::blankPrimaryVideoDecoder();
+	}
+	gst_object_unref(playbin);
+	/* V12: a channel may proceed only AFTER sink shutdown AND video blank. */
+	int remaining = g_atomic_int_add(&s_mp3_stop_workers, -1) - 1;
+	eDebug("[OPENBH_LOCAL_V12] stop worker fully released hardware; %d teardown(s) remain", remaining);
 
 	g_atomic_int_set(&watchdog->done, 1);
 	stopWatchdogRelease(watchdog);
@@ -3023,7 +3028,9 @@ RESULT eServiceMP3::stop()
 	gst_object_ref(m_gst_playbin);
 	g_atomic_int_inc(&s_mp3_stop_workers);
 	StopWatchdog *watchdog = new StopWatchdog{0, 2};
-	GThread *worker = g_thread_new("mp3stop", stopWorker, new StopWorkerArgs{m_gst_playbin, watchdog, videoSink != NULL && m_pip_decoder < 0 /* a PiP must never blank the primary decoder */});
+	GThread *worker = g_thread_new("mp3stop", stopWorker, new StopWorkerArgs{m_gst_playbin, watchdog,
+		(m_pip_decoder < 0 && (videoSink != NULL ||
+		 (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio))) /* dreamvideosink is not GstDVBVideoSink */});
 	g_thread_unref(worker);
 	GThread *watchdogThread = g_thread_new("mp3stopwd", stopWatchdog, watchdog);
 	g_thread_unref(watchdogThread);
@@ -3097,6 +3104,11 @@ RESULT eServiceMP3::unpause()
 {
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
+
+	/* V12: a local PAUSED request can still be pending when the user
+	 * presses Play; always send PLAYING to cancel it, not an early-out. */
+	if (!m_sourceinfo.is_streaming && !m_sourceinfo.is_audio && m_pip_decoder < 0)
+		return trickSeek(1.0);
 
 	/* no need to unpase if we are not paused already */
 	if (m_currentTrickRatio == 1.0 && !m_paused)
@@ -3202,6 +3214,33 @@ RESULT eServiceMP3::trickSeek(gdouble ratio)
 {
 	if (!m_gst_playbin)
 		return -1;
+
+	/* V12: OpenATV DREAMNEXTGEN local file semantics. A normal pause or
+	 * resume is a state transition, NEVER a flushing trick-mode seek.
+	 * In particular, GST_SEEK_FLAG_SKIP used below for legacy trick play
+	 * can suppress the ALSA audio chain after resume on DreamTwo. */
+	const bool local_movie = !m_sourceinfo.is_streaming &&
+		!m_sourceinfo.is_audio && m_pip_decoder < 0;
+	const bool normal_pause = ratio > -0.01 && ratio < 0.01;
+	const bool normal_resume = ratio > 0.99 && ratio < 1.01;
+	if (local_movie && (normal_pause || normal_resume))
+	{
+		GstState target = normal_pause ? GST_STATE_PAUSED : GST_STATE_PLAYING;
+		eDebug("[OPENBH_LOCAL_V12] %s state transition (no seek)",
+			normal_pause ? "PAUSE" : "RESUME");
+		GstStateChangeReturn state_result = gst_element_set_state(m_gst_playbin, target);
+		if (state_result == GST_STATE_CHANGE_FAILURE)
+		{
+			eWarning("[OPENBH_LOCAL_V12] failed to change GStreamer state");
+			return -1;
+		}
+		setHDAudioAuxState(m_gst_playbin, target);
+		m_currentTrickRatio = 1.0;
+		m_prev_decoder_time = -1;
+		m_decoder_time_valid_state = 0;
+		return 0;
+	}
+
 	GstState state, pending;
 	if (ratio > -0.01 && ratio < 0.01)
 	{
@@ -3329,8 +3368,11 @@ RESULT eServiceMP3::seekRelative(int direction, pts_t to)
 
 	int res = seekTo(ppos);
 
-	// Do double seek to same position so to overcome problem with seeking backward and passthrough on for some boxes
-	if (res > -1 && !getHDAudioAuxState(m_gst_playbin))
+	/* V12: one seek per user jump for a local movie. The original double
+	 * FLUSH seek is a known workaround for other passthrough devices, but
+	 * it can leave the DreamTwo local ALSA path with silent audio. */
+	if (res > -1 && !getHDAudioAuxState(m_gst_playbin) &&
+		(m_sourceinfo.is_streaming || m_sourceinfo.is_audio || m_pip_decoder >= 0))
 		seekTo(ppos);
 
 	return res;

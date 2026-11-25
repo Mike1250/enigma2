@@ -1514,7 +1514,11 @@ RESULT eDVBServicePlay::start()
 	 * service's decoder permanently unable to open video/audio and playback
 	 * silently never showing a picture. Cheap/instant no-op when nothing is
 	 * outstanding, which is the common case. */
-	eServiceMP3::waitForHardwareRelease(500);
+	/* V12: DreamTwo's native dreamvideosink cleanup may still be active
+	 * after the old movie service returns from stop(). Wait for the stop
+	 * worker to finish its video blank before DVB reopens the decoder. */
+	if (!eServiceMP3::waitForHardwareRelease(3500))
+		eWarning("[OPENBH_LOCAL_V12] previous movie decoder did not release within 3500ms");
 
 	eServiceReferenceDVB service = (eServiceReferenceDVB&)m_reference;
 	bool scrambled = true;
