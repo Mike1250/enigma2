@@ -2494,19 +2494,11 @@ class InfoBarSeek:
 		if self.seekstate == self.SEEK_STATE_PLAY:
 			return 0
 		elif self.seekstate == self.SEEK_STATE_PAUSE:
-			# OPENBH_MOVIE_OK_RESUME_V1: OK resumes a paused local MoviePlayer.
-			if isMoviePlayerInfoBar(self):
-				self.unPauseService()
-			else:
-				self.pauseService()
+			self.pauseService()
 		else:
 			self.unPauseService()
 
 	def playpauseService(self):
-		# OPENBH_MOVIE_OK_RESUME_V1: MoviePlayer toggle resumes instead of stepping.
-		if isMoviePlayerInfoBar(self) and self.seekstate == self.SEEK_STATE_PAUSE:
-			self.unPauseService()
-			return
 		if self.seekstate == self.SEEK_STATE_PLAY:
 			self.pauseService()
 		else:

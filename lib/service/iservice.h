@@ -226,14 +226,6 @@ public:
 	{
 		return type != idInvalid;
 	}
-
-public:
-#ifndef SWIG
-	// Optional URL used by OpenATV-compatible ServiceMP3 recording.
-	std::string alternativeurl;
-#endif
-	void setAlternativeUrl(const std::string &url) { alternativeurl = url; }
-	std::string getAlternativeUrl() const { return alternativeurl; }
 };
 
 SWIG_ALLOW_OUTPUT_SIMPLE(eServiceReference);

@@ -1514,14 +1514,7 @@ RESULT eDVBServicePlay::start()
 	 * service's decoder permanently unable to open video/audio and playback
 	 * silently never showing a picture. Cheap/instant no-op when nothing is
 	 * outstanding, which is the common case. */
-	/* V12: DreamTwo's native dreamvideosink cleanup may still be active
-	 * after the old movie service returns from stop(). Wait for the stop
-	 * worker to finish its video blank before DVB reopens the decoder. */
-	/* OPENATV_SERVICE_MP3_DVB_COMPAT: imported OpenATV ServiceMP3 stops its GStreamer
-	 * pipeline inline (NULL transition + bounded state wait). There is no
-	 * detached stop worker or waitForHardwareRelease() API to poll.
-	 * This removes the obsolete pre-DVB wait; hardware release must still
-	 * be checked at runtime because the bounded NULL wait can time out. */
+	eServiceMP3::waitForHardwareRelease(500);
 
 	eServiceReferenceDVB service = (eServiceReferenceDVB&)m_reference;
 	bool scrambled = true;
