@@ -183,6 +183,9 @@ struct eDVBChannelID
 class eServiceReferenceDVB: public eServiceReference
 {
 public:
+	// DVB service-type constants expected by OpenATV ServiceMP3Record.
+	enum { dTv = 0x01, dRadio = 0x02, dRadioAvc = 0x0A };
+
 	enum service_ref
 	{
 		ref_service_type= 0,
