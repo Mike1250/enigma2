@@ -1517,8 +1517,11 @@ RESULT eDVBServicePlay::start()
 	/* V12: DreamTwo's native dreamvideosink cleanup may still be active
 	 * after the old movie service returns from stop(). Wait for the stop
 	 * worker to finish its video blank before DVB reopens the decoder. */
-	if (!eServiceMP3::waitForHardwareRelease(3500))
-		eWarning("[OPENBH_LOCAL_V12] previous movie decoder did not release within 3500ms");
+	/* OPENATV_SERVICE_MP3_DVB_COMPAT: imported OpenATV ServiceMP3 stops its GStreamer
+	 * pipeline inline (NULL transition + bounded state wait). There is no
+	 * detached stop worker or waitForHardwareRelease() API to poll.
+	 * This removes the obsolete pre-DVB wait; hardware release must still
+	 * be checked at runtime because the bounded NULL wait can time out. */
 
 	eServiceReferenceDVB service = (eServiceReferenceDVB&)m_reference;
 	bool scrambled = true;
