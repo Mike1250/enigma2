@@ -352,6 +352,15 @@ private:
 	bool m_paused;
 	// Main-loop user intent, independent of asynchronous GStreamer state messages.
 	bool m_local_movie_pause_requested;
+	/* DreamTwoLocalV2: display-only clock, owned by the Enigma2 main loop.
+	 * Raw media position is still used by subtitle/decoder recovery. */
+	pts_t m_local_movie_clock_pts = 0;
+	GstClockTime m_local_movie_clock_anchor = GST_CLOCK_TIME_NONE;
+	bool m_local_movie_clock_seek_pending = false;
+	GstClockTime localMovieClockNow() const;
+	void localMovieClockFreeze();
+	void localMovieClockStart();
+	void localMovieClockSeek(pts_t pts);
 	bool isDreamTwoLocalMovie() const;
 	RESULT setDreamTwoLocalMoviePaused(bool paused);
 	bool m_clear_buffers;

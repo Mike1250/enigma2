@@ -2415,8 +2415,17 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 				if (local_video_sink)
 				{
 					GObjectClass *klass = G_OBJECT_GET_CLASS(local_video_sink);
-					if (g_object_class_find_property(klass, "e2-sync"))
-						g_object_set(G_OBJECT(local_video_sink), "e2-sync", FALSE, NULL);
+					/* DreamTwoLocalV2: opt-in clock pacing of the native video sink.
+					 * The vendor's internal queue/pause implementation is not in E2.
+					 * Leave audio sync and preroll configuration alone. */
+					const bool paced = g_file_test("/tmp/openbh_local_video_clock_sync", G_FILE_TEST_EXISTS);
+					GParamSpec *e2sync = g_object_class_find_property(klass, "e2-sync");
+					GParamSpec *sync = g_object_class_find_property(klass, "sync");
+					if (e2sync && G_IS_PARAM_SPEC_BOOLEAN(e2sync) && (e2sync->flags & G_PARAM_WRITABLE))
+						g_object_set(G_OBJECT(local_video_sink), "e2-sync", paced ? TRUE : FALSE, NULL);
+					else if (paced && sync && G_IS_PARAM_SPEC_BOOLEAN(sync) && (sync->flags & G_PARAM_WRITABLE))
+						g_object_set(G_OBJECT(local_video_sink), "sync", TRUE, NULL);
+					eDebug("[DreamTwoLocalV2] native video pacing requested=%d e2-sync=%d sync=%d", paced, e2sync != NULL, sync != NULL);
 					if (g_object_class_find_property(klass, "e2-async"))
 						g_object_set(G_OBJECT(local_video_sink), "e2-async", FALSE, NULL);
 					gst_object_ref_sink(local_video_sink);
@@ -3111,6 +3120,9 @@ RESULT eServiceMP3::stop()
 	if (isDreamTwoLocalMovie())
 	{
 		m_local_movie_pause_requested = false;
+		m_local_movie_clock_pts = 0;
+		m_local_movie_clock_anchor = GST_CLOCK_TIME_NONE;
+		m_local_movie_clock_seek_pending = false;
 		m_subtitle_generation++;
 		m_subtitle_sync_timer->stop();
 		m_dvb_subtitle_sync_timer->stop();
@@ -3206,53 +3218,121 @@ bool eServiceMP3::isDreamTwoLocalMovie() const
 #endif
 }
 
+/* DreamTwoLocalV2: read the actual pipeline clock, not demuxer read-ahead
+ * or a synthetic wall-clock timer. Keep the UI epoch separate from raw PTS. */
+GstClockTime eServiceMP3::localMovieClockNow() const
+{
+	if (!m_gst_playbin)
+		return GST_CLOCK_TIME_NONE;
+	GstClock *clock = gst_element_get_clock(m_gst_playbin);
+	if (!clock)
+		return GST_CLOCK_TIME_NONE;
+	const GstClockTime now = gst_clock_get_time(clock);
+	gst_object_unref(clock);
+	const GstClockTime base = gst_element_get_base_time(m_gst_playbin);
+	return GST_CLOCK_TIME_IS_VALID(now) && GST_CLOCK_TIME_IS_VALID(base) && now >= base
+		? now - base : GST_CLOCK_TIME_NONE;
+}
+
+void eServiceMP3::localMovieClockFreeze()
+{
+	const GstClockTime now = localMovieClockNow();
+	if (GST_CLOCK_TIME_IS_VALID(m_local_movie_clock_anchor) &&
+		GST_CLOCK_TIME_IS_VALID(now) && now >= m_local_movie_clock_anchor)
+		m_local_movie_clock_pts += static_cast<pts_t>(gst_util_uint64_scale(now - m_local_movie_clock_anchor, 90000, GST_SECOND));
+	m_local_movie_clock_anchor = GST_CLOCK_TIME_NONE;
+}
+
+void eServiceMP3::localMovieClockStart()
+{
+	if (m_currentTrickRatio != 1.0 || m_local_movie_pause_requested ||
+		m_local_movie_clock_seek_pending || GST_CLOCK_TIME_IS_VALID(m_local_movie_clock_anchor) || !m_gst_playbin)
+		return;
+	GstState state = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
+	if (gst_element_get_state(m_gst_playbin, &state, &pending, 0) == GST_STATE_CHANGE_SUCCESS &&
+		state == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING)
+	{
+		m_paused = false; // settled state is authoritative, even after a cancelled transition
+		m_local_movie_clock_anchor = localMovieClockNow();
+	}
+}
+
+void eServiceMP3::localMovieClockSeek(pts_t pts)
+{
+	m_local_movie_clock_pts = pts < 0 ? 0 : pts;
+	m_local_movie_clock_anchor = GST_CLOCK_TIME_NONE;
+	m_local_movie_clock_seek_pending = true;
+}
+
 RESULT eServiceMP3::setDreamTwoLocalMoviePaused(bool paused)
 {
 	if (!m_gst_playbin || m_state != stRunning)
 		return -1;
 
-	/* Never turn normal Resume into a flushing seek or force an audio
-	 * selector change while a sink is transitioning. The bus remains the
-	 * authority for m_paused; user intent covers a second keypress before
-	 * the first state message has reached the main loop. */
 	const bool previous_request = m_local_movie_pause_requested;
+	const auto previous_phase = m_audio_switch_flush_phase;
+	const bool previous_flush_resume = m_audio_switch_flush_resume;
+	const bool previous_flush_resuming = m_audio_switch_flush_resuming;
 	m_local_movie_pause_requested = paused;
-	if (m_audio_switch_flush_phase != AudioSwitchFlushNone)
-	{
-		/* A real audio-track change already owns the state transition.
-		 * Its completion must honor the latest Pause/Resume request. */
-		m_audio_switch_flush_resume = !paused;
-		if (paused)
-		{
-			m_subtitle_sync_timer->stop();
-			m_dvb_subtitle_sync_timer->stop();
-		}
-		eDebug("[DreamTwoLocal55] %s deferred to audio switch completion", paused ? "pause" : "resume");
-		return 0;
-	}
-
-	const GstState target = paused ? GST_STATE_PAUSED : GST_STATE_PLAYING;
-	const GstStateChangeReturn ret = gst_element_set_state(m_gst_playbin, target);
-	eDebug("[DreamTwoLocal55] %s state request=%s", paused ? "pause" : "resume",
-		gst_element_state_change_return_get_name(ret));
-	if (ret == GST_STATE_CHANGE_FAILURE)
-	{
-		m_local_movie_pause_requested = previous_request;
-		return -1;
-	}
-	setHDAudioAuxState(m_gst_playbin, target);
+	GstState before = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
+	gst_element_get_state(m_gst_playbin, &before, &pending, 0);
+	const gint64 begin = g_get_monotonic_time();
 	if (paused)
 	{
+		localMovieClockFreeze();
 		m_subtitle_sync_timer->stop();
 		m_dvb_subtitle_sync_timer->stop();
 	}
-	else if (!m_paused && m_currentSubtitleStream >= 0)
+
+	/* Do not let a missing audio-switch ASYNC_DONE own user Resume forever.
+	 * A Resume supersedes the pause/flush coordinator; PLAYING may still
+	 * wait for an already-accepted seek to preroll. Never issue a second
+	 * seek here and never schedule a PLAYING request after a user Pause. */
+	if (m_audio_switch_flush_phase != AudioSwitchFlushNone)
 	{
-		/* A rapid PAUSE->PLAY request can cancel the pending transition
-		 * without a PAUSED->PLAYING bus message. Re-arm in that case too. */
-		m_subtitle_sync_timer->start(1, true);
-		if (!m_dvb_subtitle_pages.empty())
-			m_dvb_subtitle_sync_timer->start(1, true);
+		m_audio_switch_flush_resume = !paused;
+		if (!paused)
+		{
+			m_audio_switch_flush_phase = AudioSwitchFlushNone;
+			m_audio_switch_flush_resuming = true;
+			eDebug("[DreamTwoLocalV2] Resume supersedes pending audio flush");
+		}
+	}
+	const GstState target = paused ? GST_STATE_PAUSED : GST_STATE_PLAYING;
+	const GstStateChangeReturn ret = gst_element_set_state(m_gst_playbin, target);
+	eDebug("[DreamTwoLocalV2] %s before=%s pending=%s result=%s call_ms=%lld",
+		paused ? "PAUSE" : "RESUME", gst_element_state_get_name(before),
+		gst_element_state_get_name(pending), gst_element_state_change_return_get_name(ret),
+		(long long)((g_get_monotonic_time() - begin) / 1000));
+	if (ret == GST_STATE_CHANGE_FAILURE)
+	{
+		m_local_movie_pause_requested = previous_request;
+		m_audio_switch_flush_phase = previous_phase;
+		m_audio_switch_flush_resume = previous_flush_resume;
+		m_audio_switch_flush_resuming = previous_flush_resuming;
+		if (!previous_request)
+			localMovieClockStart();
+		return -1;
+	}
+	setHDAudioAuxState(m_gst_playbin, target);
+	/* SUCCESS can mean a rapid PAUSE/PLAY cancelled the first transition:
+	 * no new bus transition is required in this case. */
+	if (!paused && ret == GST_STATE_CHANGE_SUCCESS)
+	{
+		GstState state = GST_STATE_NULL, next = GST_STATE_VOID_PENDING;
+		if (gst_element_get_state(m_gst_playbin, &state, &next, 0) == GST_STATE_CHANGE_SUCCESS &&
+			state == GST_STATE_PLAYING && next == GST_STATE_VOID_PENDING)
+		{
+			m_paused = false;
+			m_local_movie_clock_seek_pending = false;
+			localMovieClockStart();
+			if (m_currentSubtitleStream >= 0)
+			{
+				m_subtitle_sync_timer->start(1, true);
+				if (!m_dvb_subtitle_pages.empty())
+					m_dvb_subtitle_sync_timer->start(1, true);
+			}
+		}
 	}
 	return 0;
 }
@@ -3385,6 +3465,11 @@ RESULT eServiceMP3::seekTo(pts_t to)
 				m_subtitle_widget->clearPage();
 		}
 		ret = seekToImpl(to);
+		if (ret == 0 && isDreamTwoLocalMovie())
+		{
+			localMovieClockSeek(to);
+			eDebug("[DreamTwoLocalV2] explicit seek target_pts=%lld", (long long)to);
+		}
 	}
 
 	return ret;
@@ -3400,7 +3485,10 @@ RESULT eServiceMP3::trickSeek(gdouble ratio)
 		if (m_currentTrickRatio == 1.0 && (ratio == 0.0 || ratio == 1.0))
 			return setDreamTwoLocalMoviePaused(ratio == 0.0);
 		if (ratio != 0.0)
+		{
+			localMovieClockFreeze();
 			m_local_movie_pause_requested = false;
+		}
 	}
 	GstState state, pending;
 	if (ratio > -0.01 && ratio < 0.01)
@@ -3495,11 +3583,12 @@ seek_unpause:
 	if (state != GST_STATE_PLAYING)
 		gst_element_set_state(m_gst_playbin, GST_STATE_PLAYING);
 
+	gboolean seek_ok = FALSE;
 	if (validposition)
 	{
 		if (ratio >= 0.0)
 		{
-			gst_element_seek(m_gst_playbin, ratio, GST_FORMAT_TIME, (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_SKIP), GST_SEEK_TYPE_SET, pos, GST_SEEK_TYPE_SET, -1);
+			seek_ok = gst_element_seek(m_gst_playbin, ratio, GST_FORMAT_TIME, (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_SKIP), GST_SEEK_TYPE_SET, pos, GST_SEEK_TYPE_SET, -1);
 		}
 		else
 		{
@@ -3508,6 +3597,8 @@ seek_unpause:
 		}
 	}
 
+	if (isDreamTwoLocalMovie() && ratio == 1.0 && seek_ok)
+		localMovieClockSeek(pts);
 	setHDAudioAuxState(m_gst_playbin, ratio == 1.0 ? GST_STATE_PLAYING : GST_STATE_PAUSED);
 	m_prev_decoder_time = -1;
 	m_decoder_time_valid_state = 0;
@@ -3682,6 +3773,29 @@ RESULT eServiceMP3::getRawPlayPosition(pts_t &pts)
  * applied only here, at the point the position is actually reported. */
 RESULT eServiceMP3::getPlayPosition(pts_t &pts)
 {
+	if (isDreamTwoLocalMovie() && m_currentTrickRatio == 1.0)
+	{
+		if (!m_gst_playbin || m_state != stRunning)
+			return -1;
+		/* A synchronous seek may not post ASYNC_DONE. A settled PLAYING
+		 * query also acknowledges it. Do not advance during preroll. */
+		if (m_local_movie_clock_seek_pending && !m_local_movie_pause_requested)
+		{
+			GstState state = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
+			if (gst_element_get_state(m_gst_playbin, &state, &pending, 0) == GST_STATE_CHANGE_SUCCESS &&
+				state == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING)
+				m_local_movie_clock_seek_pending = false;
+		}
+		pts = m_local_movie_clock_pts;
+		if (!m_local_movie_pause_requested && m_initial_start && !m_local_movie_clock_seek_pending)
+		{
+			localMovieClockStart();
+			const GstClockTime now = localMovieClockNow();
+			if (!m_paused && GST_CLOCK_TIME_IS_VALID(m_local_movie_clock_anchor) && GST_CLOCK_TIME_IS_VALID(now) && now >= m_local_movie_clock_anchor)
+				pts += static_cast<pts_t>(gst_util_uint64_scale(now - m_local_movie_clock_anchor, 90000, GST_SECOND));
+		}
+		return 0;
+	}
 	pts_t raw;
 	RESULT res = getRawPlayPosition(raw);
 	if (res < 0)
@@ -4896,7 +5010,7 @@ void eServiceMP3::doAudioSwitchFlushSeek()
 	{
 		eDebug("[eServiceMP3] doAudioSwitchFlushSeek: no valid position, aborting pause-flush");
 		m_audio_switch_flush_phase = AudioSwitchFlushNone;
-		if (m_audio_switch_flush_resume)
+		if (m_audio_switch_flush_resume && (!isDreamTwoLocalMovie() || !m_local_movie_pause_requested))
 		{
 			/* See m_audio_switch_flush_resuming's own comment in the .h -
 			 * without this, the PLAYING transition below would fall through
@@ -5503,6 +5617,11 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 				case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
 				{
 					m_paused = false;
+					if (isDreamTwoLocalMovie())
+					{
+						eDebug("[DreamTwoLocalV2] PLAYING acknowledged pause_intent=%d", m_local_movie_pause_requested);
+						localMovieClockStart();
+					}
 
 					if (m_subtitle_switch_deferred && pipelineSettledInPlaying(m_gst_playbin))
 					{
@@ -5678,6 +5797,11 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 				case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
 				{
 					m_paused = true;
+					if (isDreamTwoLocalMovie())
+					{
+						localMovieClockFreeze();
+						eDebug("[DreamTwoLocalV2] PAUSED acknowledged pause_intent=%d", m_local_movie_pause_requested);
+					}
 					if (m_audio_switch_flush_phase == AudioSwitchFlushWaitPaused)
 					{
 						/* beginAudioSwitchPauseFlush()'s own PAUSED request
@@ -5854,6 +5978,11 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 			if(GST_MESSAGE_SRC(msg) != GST_OBJECT(m_gst_playbin))
 				break;
 
+			if (isDreamTwoLocalMovie() && m_local_movie_clock_seek_pending)
+			{
+				m_local_movie_clock_seek_pending = false;
+				localMovieClockStart();
+			}
 			if (m_audio_switch_flush_phase == AudioSwitchFlushWaitSeek)
 			{
 				/* doAudioSwitchFlushSeek()'s seek just finished prerolling
@@ -5865,7 +5994,7 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 				eDebug("[eServiceMP3] audio switch pause-flush: seek prerolled, %s",
 					m_audio_switch_flush_resume ? "resuming" : "staying paused");
 				m_audio_switch_flush_phase = AudioSwitchFlushNone;
-				if (m_audio_switch_flush_resume)
+				if (m_audio_switch_flush_resume && (!isDreamTwoLocalMovie() || !m_local_movie_pause_requested))
 				{
 					/* Consumed by, and explained at, gstBusCall()'s
 					 * GST_STATE_CHANGE_PAUSED_TO_PLAYING handling. */
