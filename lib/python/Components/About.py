@@ -14,10 +14,28 @@ def getCPUArch(MODEL):
 
 
 def checkCPUArch():
-	if fileExists("/proc/cpuinfo"):
-		return [x.split(": ")[1].split(" ")[0] for x in open("/proc/cpuinfo").readlines() if x.startswith(("system type", "model name", "Processor")) and len(x.split(": ")) > 1][0]
-	else:
-		return _("unavailable")
+	from platform import machine
+
+	architecture = machine().lower()
+
+	if architecture in ("aarch64", "arm64"):
+		return "ARM64"
+
+	try:
+		with open("/proc/cpuinfo", "r") as cpuinfo:
+			for line in cpuinfo:
+				key, separator, value = line.partition(":")
+				if separator and key.strip() in ("system type", "model name", "Processor"):
+					fields = value.strip().split()
+					if fields:
+						return fields[0]
+	except OSError:
+		pass
+
+	if architecture.startswith("arm"):
+		return architecture.upper()
+
+	return architecture or _("unavailable")
 
 
 def getCPUSpeedString(MODEL):
