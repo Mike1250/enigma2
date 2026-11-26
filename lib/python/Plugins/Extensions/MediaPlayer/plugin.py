@@ -999,7 +999,11 @@ class MediaPlayer(Screen, InfoBarBase, InfoBarScreenSaver, InfoBarSeek, InfoBarA
 			self.playlist.rewindFile()
 
 	def pauseEntry(self):
-		self.pauseService()
+		if self.seekstate == self.SEEK_STATE_PAUSE:
+			self.unPauseService()
+		else:
+			self.pauseService()
+
 		if self.seekstate == self.SEEK_STATE_PAUSE:
 			self.show()
 		else:
