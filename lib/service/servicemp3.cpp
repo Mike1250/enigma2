@@ -2454,17 +2454,18 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 				if (local_video_sink)
 				{
 					GObjectClass *klass = G_OBJECT_GET_CLASS(local_video_sink);
-					/* DreamTwoLocalV2: opt-in clock pacing of the native video sink.
+					/* DreamTwoLocalV4: clock pacing enabled for local movies.
 					 * The vendor's internal queue/pause implementation is not in E2.
 					 * Leave audio sync and preroll configuration alone. */
-					const bool paced = g_file_test("/tmp/openbh_local_video_clock_sync", G_FILE_TEST_EXISTS);
+					const bool paced = isDreamTwoLocalMovie() ||
+						g_file_test("/tmp/openbh_local_video_clock_sync", G_FILE_TEST_EXISTS);
 					GParamSpec *e2sync = g_object_class_find_property(klass, "e2-sync");
 					GParamSpec *sync = g_object_class_find_property(klass, "sync");
 					if (e2sync && G_IS_PARAM_SPEC_BOOLEAN(e2sync) && (e2sync->flags & G_PARAM_WRITABLE))
 						g_object_set(G_OBJECT(local_video_sink), "e2-sync", paced ? TRUE : FALSE, NULL);
-					else if (paced && sync && G_IS_PARAM_SPEC_BOOLEAN(sync) && (sync->flags & G_PARAM_WRITABLE))
+					if (paced && sync && G_IS_PARAM_SPEC_BOOLEAN(sync) && (sync->flags & G_PARAM_WRITABLE))
 						g_object_set(G_OBJECT(local_video_sink), "sync", TRUE, NULL);
-					eDebug("[DreamTwoLocalV2] native video pacing requested=%d e2-sync=%d sync=%d", paced, e2sync != NULL, sync != NULL);
+					eDebug("[DreamTwoLocalV4] native video pacing requested=%d e2-sync=%d sync=%d", paced, e2sync != NULL, sync != NULL);
 					if (g_object_class_find_property(klass, "e2-async"))
 						g_object_set(G_OBJECT(local_video_sink), "e2-async", FALSE, NULL);
 					gst_object_ref_sink(local_video_sink);
