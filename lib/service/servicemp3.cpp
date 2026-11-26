@@ -2346,6 +2346,45 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	if ( m_gst_playbin )
 	{
 #ifdef DREAMNEXTGEN
+		/* DreamTwoLocalV3: use the actual OpenATV DVB media sinks as a pair.
+		 * The OpenATV sinks own the decoder fd and issue FREEZE/CONTINUE
+		 * themselves; do not open a competing decoder fd from ServiceMP3.
+		 * Opt in until the installed plugin and Dream decoder ABI are tested. */
+		bool openatvLocalSinks = false;
+		if (isDreamTwoLocalMovie() &&
+			g_file_test("/tmp/openbh_local_openatv_sinks", G_FILE_TEST_EXISTS) &&
+			!g_file_test("/tmp/openbh_gst_auto_sinks", G_FILE_TEST_EXISTS))
+		{
+			GstElement *a = gst_element_factory_make("dvbaudiosink", NULL);
+			GstElement *v = gst_element_factory_make("dvbvideosink", NULL);
+			if (a) gst_object_ref_sink(a);
+			if (v) gst_object_ref_sink(v);
+			if (a && v)
+			{
+				GstElement *sinks[] = {a, v};
+				const char *properties[] = {"e2-sync", "e2-async"};
+				for (GstElement *sink : sinks)
+				{
+					GObjectClass *klass = G_OBJECT_GET_CLASS(sink);
+					for (const char *name : properties)
+					{
+						GParamSpec *p = g_object_class_find_property(klass, name);
+						if (p && G_IS_PARAM_SPEC_BOOLEAN(p) && (p->flags & G_PARAM_WRITABLE))
+							g_object_set(G_OBJECT(sink), name, FALSE, NULL);
+					}
+				}
+				g_object_set(G_OBJECT(m_gst_playbin), "audio-sink", a,
+					"video-sink", v, NULL);
+				g_object_set_data(G_OBJECT(m_gst_playbin), "openbh-local-openatv-sinks", GINT_TO_POINTER(1));
+				openatvLocalSinks = true;
+				eDebug("[DreamTwoLocalV3] selected actual dvbaudiosink + dvbvideosink");
+			}
+			else
+				eWarning("[DreamTwoLocalV3] DVB sink pair unavailable; retaining V2 sinks");
+			if (a) gst_object_unref(a);
+			if (v) gst_object_unref(v);
+		}
+
 		/* OPENBH_DREAMTWO_OPENATV_LOCAL_SINKS_V1
 		 * OpenATV assigns native audio/video sinks directly to playbin.
 		 * This DreamTwo image provides dreamaudiosink/dreamvideosink instead
@@ -2354,7 +2393,7 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 		 * /tmp/openbh_gst_use_alsa marker for unsupported native audio caps.
 		 * /tmp/openbh_gst_auto_sinks disables this port for A/B testing.
 		 */
-		if (!m_sourceinfo.is_streaming &&
+		if (!openatvLocalSinks && !m_sourceinfo.is_streaming &&
 			!g_file_test("/tmp/openbh_gst_auto_sinks", G_FILE_TEST_EXISTS))
 		{
 			const bool force_alsa =
@@ -3299,6 +3338,8 @@ RESULT eServiceMP3::setDreamTwoLocalMoviePaused(bool paused)
 		}
 	}
 	const GstState target = paused ? GST_STATE_PAUSED : GST_STATE_PLAYING;
+	const bool openatvLocalSinks = g_object_get_data(G_OBJECT(m_gst_playbin),
+		"openbh-local-openatv-sinks") != NULL;
 	const GstStateChangeReturn ret = gst_element_set_state(m_gst_playbin, target);
 	eDebug("[DreamTwoLocalV2] %s before=%s pending=%s result=%s call_ms=%lld",
 		paused ? "PAUSE" : "RESUME", gst_element_state_get_name(before),
@@ -3315,9 +3356,21 @@ RESULT eServiceMP3::setDreamTwoLocalMoviePaused(bool paused)
 		return -1;
 	}
 	setHDAudioAuxState(m_gst_playbin, target);
+	GstStateChangeReturn settled = ret;
+	if (openatvLocalSinks)
+	{
+		/* Match OpenATV DREAMNEXTGEN: no wait or seek on Pause; on
+		 * Resume give the sinks up to 2s to finish their state change. */
+		GstState actual = GST_STATE_NULL, next = GST_STATE_VOID_PENDING;
+		settled = gst_element_get_state(m_gst_playbin, &actual, &next,
+			paused ? 0 : 2 * GST_SECOND);
+		eDebug("[DreamTwoLocalV3] %s state=%s pending=%s result=%s",
+			paused ? "PAUSE" : "RESUME", gst_element_state_get_name(actual),
+			gst_element_state_get_name(next), gst_element_state_change_return_get_name(settled));
+	}
 	/* SUCCESS can mean a rapid PAUSE/PLAY cancelled the first transition:
 	 * no new bus transition is required in this case. */
-	if (!paused && ret == GST_STATE_CHANGE_SUCCESS)
+	if (!paused && settled == GST_STATE_CHANGE_SUCCESS)
 	{
 		GstState state = GST_STATE_NULL, next = GST_STATE_VOID_PENDING;
 		if (gst_element_get_state(m_gst_playbin, &state, &next, 0) == GST_STATE_CHANGE_SUCCESS &&
