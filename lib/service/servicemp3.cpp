@@ -2454,18 +2454,17 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 				if (local_video_sink)
 				{
 					GObjectClass *klass = G_OBJECT_GET_CLASS(local_video_sink);
-					/* DreamTwoLocalV4: clock pacing enabled for local movies.
+					/* DreamTwoLocalV5: preserve native hardware video timing.
 					 * The vendor's internal queue/pause implementation is not in E2.
 					 * Leave audio sync and preroll configuration alone. */
-					const bool paced = isDreamTwoLocalMovie() ||
-						g_file_test("/tmp/openbh_local_video_clock_sync", G_FILE_TEST_EXISTS);
+					const bool paced = g_file_test("/tmp/openbh_local_video_clock_sync", G_FILE_TEST_EXISTS);
 					GParamSpec *e2sync = g_object_class_find_property(klass, "e2-sync");
 					GParamSpec *sync = g_object_class_find_property(klass, "sync");
 					if (e2sync && G_IS_PARAM_SPEC_BOOLEAN(e2sync) && (e2sync->flags & G_PARAM_WRITABLE))
 						g_object_set(G_OBJECT(local_video_sink), "e2-sync", paced ? TRUE : FALSE, NULL);
-					if (paced && sync && G_IS_PARAM_SPEC_BOOLEAN(sync) && (sync->flags & G_PARAM_WRITABLE))
+					else if (paced && sync && G_IS_PARAM_SPEC_BOOLEAN(sync) && (sync->flags & G_PARAM_WRITABLE))
 						g_object_set(G_OBJECT(local_video_sink), "sync", TRUE, NULL);
-					eDebug("[DreamTwoLocalV4] native video pacing requested=%d e2-sync=%d sync=%d", paced, e2sync != NULL, sync != NULL);
+					eDebug("[DreamTwoLocalV5] native video pacing requested=%d e2-sync=%d sync=%d", paced, e2sync != NULL, sync != NULL);
 					if (g_object_class_find_property(klass, "e2-async"))
 						g_object_set(G_OBJECT(local_video_sink), "e2-async", FALSE, NULL);
 					gst_object_ref_sink(local_video_sink);
@@ -5135,6 +5134,15 @@ bool pipelineSettledInPlaying(GstElement *pipeline)
 /* See applySubtitleStreamSwitch()'s own header comment in the .h. */
 void eServiceMP3::applySubtitleStreamSwitch()
 {
+	if (!m_gst_playbin || m_state != stRunning)
+		return;
+	if (isDreamTwoLocalMovie())
+	{
+		m_subtitle_switch_needs_flush = false;
+		g_object_set(G_OBJECT(m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
+		eDebug("[DreamTwoLocalV5] Subtitle switched to %d without decoder flush", m_currentSubtitleStream);
+		return;
+	}
 	g_object_set(G_OBJECT(m_gst_playbin), "current-text", m_currentSubtitleStream, NULL);
 	if (m_subtitle_switch_needs_flush)
 	{
@@ -7485,7 +7493,8 @@ RESULT eServiceMP3::enableSubtitles(iSubtitleUser *user, struct SubtitleTrack &t
 	const bool wasAlreadyShowingSubtitles = (m_currentSubtitleStream >= 0);
 
 	if (m_subtitle_widget) m_subtitle_widget->clearPage();
-	g_object_set (G_OBJECT (m_gst_playbin), "current-text", -1, NULL);
+	if (!isDreamTwoLocalMovie())
+		g_object_set (G_OBJECT (m_gst_playbin), "current-text", -1, NULL);
 	m_subtitle_sync_timer->stop();
 	m_dvb_subtitle_sync_timer->stop();
 	m_dvb_subtitle_pages.clear();
@@ -7496,7 +7505,7 @@ RESULT eServiceMP3::enableSubtitles(iSubtitleUser *user, struct SubtitleTrack &t
 	m_cachedSubtitleStream = m_currentSubtitleStream;
 	setCacheEntry(false, track.pid - 1);
 
-	m_subtitle_switch_needs_flush = wasAlreadyShowingSubtitles;
+	m_subtitle_switch_needs_flush = wasAlreadyShowingSubtitles && !isDreamTwoLocalMovie();
 
 	/* Bump first: any subtitle buffer already captured under the previous
 	 * generation and still in flight to gstPoll() (queued in m_pump - see
